@@ -1,0 +1,48 @@
+name: Test and publish release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source and vendor
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-mac.txt
+
+      - name: Apply maintained vendor integration
+        run: python tools/prepare_vendor.py
+
+      - name: Run test suite
+        run: python -m unittest discover -s app -p '*tests.py' -v
+
+      - name: Build update package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python tools/package_release.py --tag "$GITHUB_REF_NAME" --output-dir dist
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 小红书发布软件 ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/xhs-assistant-mac.zip
+            dist/xhs-assistant-mac.zip.sha256

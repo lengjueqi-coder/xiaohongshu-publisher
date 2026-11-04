@@ -1,0 +1,1541 @@
+diff --git a/extension/content.js b/extension/content.js
+index e0f2904..9fa5110 100644
+--- a/extension/content.js
++++ b/extension/content.js
+@@ -157,34 +157,60 @@ function cmdClickElement({ selector }) {
+ function cmdInputText({ selector, text }) {
+   const el = document.querySelector(selector);
+   if (!el) throw new Error(`元素不存在: ${selector}`);
++  return typeIntoInput(el, text);
++}
++
++// 模拟真人逐字输入 input 元素：随机键入间隔 + 偶尔思考停顿
++async function typeIntoInput(el, text) {
+   el.focus();
+-  el.value = text;
+-  el.dispatchEvent(new Event("input", { bubbles: true }));
++  const proto = Object.getPrototypeOf(el);
++  const desc = Object.getOwnPropertyDescriptor(proto, "value");
++  let current = "";
++  for (const ch of text) {
++    current += ch;
++    if (desc && desc.set) desc.set.call(el, current);
++    else el.value = current;
++    el.dispatchEvent(new Event("input", { bubbles: true }));
++    await sleep(randInt(30, 120));
++    if (Math.random() < 0.12) await sleep(randInt(180, 550));
++  }
+   el.dispatchEvent(new Event("change", { bubbles: true }));
+   return null;
+ }
+ 
+-async function cmdInputContentEditable({ selector, text }) {
+-  const el = document.querySelector(selector);
+-  if (!el) throw new Error(`元素不存在: ${selector}`);
++// 模拟真人逐字输入 contentEditable：随机键入间隔 + 偶尔停顿 + 换行按 Enter
++async function typeIntoEditable(el, text) {
+   el.focus();
+-  // 全选清空
+   document.execCommand("selectAll", false, null);
+   document.execCommand("delete", false, null);
+-  await sleep(80);
+-  // 逐行插入（换行转为 Enter 键事件）
++  await sleep(randInt(150, 400));
+   const lines = text.split("\n");
+   for (let i = 0; i < lines.length; i++) {
+-    if (lines[i]) document.execCommand("insertText", false, lines[i]);
++    for (const ch of lines[i]) {
++      document.execCommand("insertText", false, ch);
++      await sleep(randInt(25, 100));
++      if (Math.random() < 0.1) await sleep(randInt(150, 500));
++    }
+     if (i < lines.length - 1) {
+       el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+       el.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+-      await sleep(40);
++      document.execCommand("insertText", false, "\n");
++      await sleep(randInt(120, 400));
+     }
+   }
+   return null;
+ }
+ 
++async function cmdInputContentEditable({ selector, text }) {
++  const el = document.querySelector(selector);
++  if (!el) throw new Error(`元素不存在: ${selector}`);
++  return typeIntoEditable(el, text);
++}
++
++function randInt(min, max) {
++  return Math.floor(Math.random() * (max - min + 1)) + min;
++}
++
+ async function cmdSetFileInput({ selector, files }) {
+   const el = document.querySelector(selector);
+   if (!el) throw new Error(`文件输入框不存在: ${selector}`);
+diff --git a/scripts/cli.py b/scripts/cli.py
+index 20c459f..178800b 100644
+--- a/scripts/cli.py
++++ b/scripts/cli.py
+@@ -14,6 +14,7 @@ import json
+ import logging
+ import os
+ import sys
++from typing import Any
+ 
+ # Windows 控制台默认编码（如 cp1252）不支持中文，强制 UTF-8
+ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+@@ -436,6 +437,23 @@ def cmd_user_profile(args: argparse.Namespace) -> None:
+         browser.close()
+ 
+ 
++def cmd_creator_profile(args: argparse.Namespace) -> None:
++    """读取创作平台：本账号近 N 条笔记 + 数据中心画像文本（账号画像功能的数据源）。"""
++    from xhs.creator import get_creator_notes, get_datacenter_snapshot
++
++    browser, page = _connect(args)
++    try:
++        result: dict[str, Any] = {"success": False}
++        notes_result = get_creator_notes(page, max_count=getattr(args, "max_count", 20) or 20)
++        result["notes"] = notes_result
++        if not args.skip_datacenter:
++            result["datacenter"] = get_datacenter_snapshot(page)
++        result["success"] = bool(notes_result.get("success"))
++        _output(result)
++    finally:
++        browser.close()
++
++
+ def cmd_post_comment(args: argparse.Namespace) -> None:
+     """发表评论。"""
+     from xhs.comment import post_comment
+@@ -524,6 +542,11 @@ def cmd_publish(args: argparse.Namespace) -> None:
+                 schedule_time=args.schedule_at,
+                 is_original=args.original,
+                 visibility=args.visibility or "",
++                album=args.album or "",
++                location=args.location or "",
++                topic_template=args.topic_template or "",
++                shooting_date=args.shooting_date or "",
++                shooting_location=args.shooting_location or "",
+             ),
+         )
+         _output({"success": True, "title": title, "images": len(image_paths), "status": "发布完成"})
+@@ -558,6 +581,11 @@ def cmd_fill_publish(args: argparse.Namespace) -> None:
+                 schedule_time=args.schedule_at,
+                 is_original=args.original,
+                 visibility=args.visibility or "",
++                album=args.album or "",
++                location=args.location or "",
++                topic_template=args.topic_template or "",
++                shooting_date=args.shooting_date or "",
++                shooting_location=args.shooting_location or "",
+             ),
+         )
+         _output({"success": True, "title": title, "images": len(image_paths), "status": "表单已填写，等待确认发布"})
+@@ -599,8 +627,8 @@ def cmd_click_publish(args: argparse.Namespace) -> None:
+ 
+     browser, page = _connect_existing(args)
+     try:
+-        click_publish_button(page)
+-        _output({"success": True, "status": "发布完成"})
++        confirmation = click_publish_button(page)
++        _output({"success": True, "status": "发布完成", **confirmation})
+     finally:
+         browser.close()
+ 
+@@ -781,6 +809,12 @@ def build_parser() -> argparse.ArgumentParser:
+     sub.add_argument("--xsec-token", required=True)
+     sub.set_defaults(func=cmd_user_profile)
+ 
++    # creator-profile：读创作平台本账号笔记+数据中心（账号画像数据源）
++    sub = subparsers.add_parser("creator-profile", help="读取创作平台近 N 条笔记及数据中心画像")
++    sub.add_argument("--max-count", type=int, default=20)
++    sub.add_argument("--skip-datacenter", action="store_true")
++    sub.set_defaults(func=cmd_creator_profile)
++
+     # post-comment
+     sub = subparsers.add_parser("post-comment", help="发表评论")
+     sub.add_argument("--feed-id", required=True)
+@@ -820,6 +854,11 @@ def build_parser() -> argparse.ArgumentParser:
+     sub.add_argument("--schedule-at")
+     sub.add_argument("--original", action="store_true")
+     sub.add_argument("--visibility")
++    sub.add_argument("--album", default="")
++    sub.add_argument("--location", default="")
++    sub.add_argument("--topic-template", default="")
++    sub.add_argument("--shooting-date", default="")
++    sub.add_argument("--shooting-location", default="")
+     sub.set_defaults(func=cmd_publish)
+ 
+     # publish-video
+@@ -841,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
+     sub.add_argument("--schedule-at")
+     sub.add_argument("--original", action="store_true")
+     sub.add_argument("--visibility")
++    sub.add_argument("--album", default="")
++    sub.add_argument("--location", default="")
++    sub.add_argument("--topic-template", default="")
++    sub.add_argument("--shooting-date", default="")
++    sub.add_argument("--shooting-location", default="")
+     sub.set_defaults(func=cmd_fill_publish)
+ 
+     # fill-publish-video
+diff --git a/scripts/xhs/publish.py b/scripts/xhs/publish.py
+index 3863d67..c83cbb4 100644
+--- a/scripts/xhs/publish.py
++++ b/scripts/xhs/publish.py
+@@ -9,6 +9,7 @@ import re
+ import time
+ 
+ from .cdp import Page
++from .human import sleep_random
+ from .errors import ContentTooLongError, PublishError, TitleTooLongError, UploadTimeoutError
+ from .selectors import (
+     CONTENT_EDITOR,
+@@ -75,7 +76,7 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
+ 
+     # 点击"上传图文" TAB
+     _click_publish_tab(page, "上传图文")
+-    time.sleep(1)
++    sleep_random(700, 1400)
+ 
+     # 上传图片
+     _upload_images(page, content.image_paths)
+@@ -86,13 +87,18 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
+         logger.warning("标签数量超过10，截取前10个")
+ 
+     logger.info(
+-        "发布内容: title=%s, images=%d, tags=%d, schedule=%s, original=%s, visibility=%s",
++        "发布内容: title=%s, images=%d, tags=%d, schedule=%s, original=%s, visibility=%s, album=%s, location=%s, topic_template=%s, shooting_date=%s, shooting_location=%s",
+         content.title,
+         len(content.image_paths),
+         len(tags),
+         content.schedule_time,
+         content.is_original,
+         content.visibility,
++        content.album,
++        content.location,
++        content.topic_template,
++        content.shooting_date,
++        content.shooting_location,
+     )
+ 
+     # 填写表单（不点击发布）
+@@ -104,39 +110,105 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
+         content.schedule_time,
+         content.is_original,
+         content.visibility,
++        content.album,
++        content.location,
++        content.topic_template,
++        content.shooting_date,
++        content.shooting_location,
+     )
+ 
+ 
+-def click_publish_button(page: Page) -> None:
+-    """点击发布按钮。
++def _publish_page_state(page: Page, initial_url: str) -> dict:
++    """读取发布后的页面状态，避免把事件发出误判为平台已接收。"""
++    state = page.evaluate(
++        f"""
++        (() => {{
++            const url = location.href;
++            const alerts = Array.from(document.querySelectorAll(
++                '[role="alert"], .d-toast, .semi-toast, .d-message, .toast'
++            )).map((el) => (el.innerText || el.textContent || '').trim()).filter(Boolean);
++            const publishedUrl = (() => {{
++                try {{ return new URL(url).searchParams.get('published') === 'true'; }}
++                catch (_) {{ return false; }}
++            }})();
++            const successText = /(发布成功|提交成功|笔记已发布|审核中)/.test(alerts.join('\\n'));
++            const changedToManager = url !== {json.dumps(initial_url)} && /note-manager/.test(url);
++            return {{
++                url,
++                confirmed: publishedUrl || successText || changedToManager,
++                alerts,
++                title: document.querySelector('div.d-input input')?.value || '',
++                publishHost: Boolean(document.querySelector('xhs-publish-btn')),
++            }};
++        }})()
++        """
++    )
++    return state if isinstance(state, dict) else {"url": "", "confirmed": False, "alerts": []}
++
+ 
+-    用文本内容精确匹配，避免点到旁边的"发布笔记"下拉按钮。
++def click_publish_button(page: Page) -> dict:
++    """触发平台真实发布事件，并等待平台确认。
++
++    新版创作平台的提交按钮是 closed-shadow custom element，普通 DOM 文本
++    搜索只能找到“定时发布”开关，不能代表真正提交。因此优先派发组件公开
++    的 ``publish`` 事件，再兼容旧版普通按钮。
+ 
+     Raises:
+-        PublishError: 点击失败。
++        PublishError: 找不到提交控件、提交被拒绝或平台未返回确认。
+     """
+-    clicked = page.evaluate(
++    initial_url = str(page.evaluate("location.href") or "")
++    dispatched = page.evaluate(
+         """
+         (() => {
+-            // 找文本内容精确为"发布"的 bg-red 按钮（排除"发布笔记"等）
+-            const btns = document.querySelectorAll('button.bg-red');
+-            for (const btn of btns) {
+-                const span = btn.querySelector('span');
+-                const text = (span ? span.textContent : btn.textContent).trim();
+-                if (text === '发布') {
+-                    btn.scrollIntoView({block: 'center'});
+-                    btn.click();
+-                    return true;
++            const host = document.querySelector('xhs-publish-btn');
++            if (host) {
++                if (host.getAttribute('submit-disabled') === 'true') {
++                    return {clicked: false, reason: '发布按钮当前不可用'};
+                 }
++                host.scrollIntoView({block: 'center'});
++                host.dispatchEvent(new CustomEvent('publish', {bubbles: true, composed: true}));
++                return {clicked: true, method: 'custom-event'};
+             }
+-            return false;
++
++            const visible = (el) => {
++                const rect = el.getBoundingClientRect();
++                const style = window.getComputedStyle(el);
++                return rect.width > 0 && rect.height > 0 &&
++                    style.display !== 'none' && style.visibility !== 'hidden';
++            };
++            const buttons = Array.from(document.querySelectorAll('button.bg-red, button'));
++            for (const button of buttons) {
++                const text = (button.innerText || button.textContent || '').trim();
++                if (!visible(button) || button.disabled || !['发布', '定时发布'].includes(text)) continue;
++                button.scrollIntoView({block: 'center'});
++                button.click();
++                return {clicked: true, method: 'button'};
++            }
++            return {clicked: false, reason: '未找到发布按钮'};
+         })()
+         """
+     )
+-    if not clicked:
+-        raise PublishError("未找到发布按钮")
+-    time.sleep(3)
+-    logger.info("发布完成")
++    if not isinstance(dispatched, dict) or not dispatched.get("clicked"):
++        raise PublishError((dispatched or {}).get("reason") or "未找到发布按钮")
++
++    deadline = time.monotonic() + 35.0
++    last_state: dict = {}
++    while time.monotonic() < deadline:
++        time.sleep(random.uniform(0.45, 0.9))
++        last_state = _publish_page_state(page, initial_url)
++        if last_state.get("confirmed"):
++            logger.info("平台已确认发布: %s", last_state.get("url", ""))
++            return {
++                "confirmed": True,
++                "method": dispatched.get("method"),
++                "url": last_state.get("url", ""),
++                "alerts": last_state.get("alerts", []),
++            }
++
++    detail = "; ".join(last_state.get("alerts") or [])
++    raise PublishError(
++        f"已触发发布但未收到平台确认，状态不明{(': ' + detail) if detail else ''}"
++    )
+ 
+ 
+ def save_as_draft(page: Page) -> None:
+@@ -156,7 +228,7 @@ def save_as_draft(page: Page) -> None:
+         """
+     )
+     if clicked:
+-        time.sleep(2)
++        sleep_random(1600, 2600)
+         logger.info("已点击「暂存离开」，内容已保存到草稿箱")
+     else:
+         logger.warning("未找到「暂存离开」按钮")
+@@ -170,9 +242,9 @@ def _navigate_to_publish_page(page: Page) -> None:
+     """导航到发布页面。"""
+     page.navigate(PUBLISH_URL)
+     page.wait_for_load(timeout=300)
+-    time.sleep(3)
++    sleep_random(2400, 3800)
+     page.wait_dom_stable()
+-    time.sleep(2)
++    sleep_random(1600, 2600)
+ 
+ 
+ def _click_publish_tab(page: Page, tab_name: str) -> None:
+@@ -183,26 +255,35 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
+         found = page.evaluate(
+             f"""
+             (() => {{
+-                // 策略1: 查找 div.creator-tab（过滤隐藏元素）
++                function isVisible(el) {{
++                    const rect = el.getBoundingClientRect();
++                    const style = window.getComputedStyle(el);
++                    if (rect.width === 0 || rect.height === 0) return false;
++                    if (rect.left < 0 || rect.top < 0) return false;
++                    if (style.display === 'none' || style.visibility === 'hidden') return false;
++                    if (Number(style.opacity || 1) < 0.01) return false;
++                    if (el.getAttribute('aria-hidden') === 'true') return false;
++                    return true;
++                }}
++
++                function realClick(el) {{
++                    el.scrollIntoView({{ block: 'center', inline: 'center' }});
++                    el.dispatchEvent(new MouseEvent('mouseover', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
++                }}
++
++                // 策略1: 查找真实 div.creator-tab（过滤隐藏/埋点诱饵元素）
+                 let tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
+                 for (const tab of tabs) {{
+                     const titleSpan = tab.querySelector('span.title');
+                     const tabText = titleSpan ? titleSpan.textContent.trim() : tab.textContent.trim();
+                     if (tabText === {json.dumps(tab_name)}) {{
+-                        const rect = tab.getBoundingClientRect();
+-                        const style = window.getComputedStyle(tab);
+-                        // 跳过隐藏或被移出视口的元素
+-                        if (rect.width === 0 || rect.height === 0) continue;
+-                        if (rect.left < 0 || rect.top < 0) continue;
+-                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+-                        const x = rect.left + rect.width / 2;
+-                        const y = rect.top + rect.height / 2;
+-                        const target = document.elementFromPoint(x, y);
+-                        if (target === tab || tab.contains(target)) {{
+-                            tab.click();
+-                            return 'clicked';
+-                        }}
+-                        return 'blocked';
++                        if (tab.hasAttribute('button-hp-installed')) continue;
++                        if (!isVisible(tab)) continue;
++                        realClick(tab);
++                        return 'clicked';
+                     }}
+                 }}
+                 
+@@ -210,12 +291,8 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
+                 const allElements = document.querySelectorAll('*');
+                 for (const el of allElements) {{
+                     if (el.children.length === 0 && el.textContent.trim() === {json.dumps(tab_name)}) {{
+-                        const rect = el.getBoundingClientRect();
+-                        const style = window.getComputedStyle(el);
+-                        if (rect.width === 0 || rect.height === 0) continue;
+-                        if (rect.left < 0 || rect.top < 0) continue;
+-                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+-                        el.click();
++                        if (!isVisible(el)) continue;
++                        realClick(el);
+                         return 'clicked';
+                     }}
+                 }}
+@@ -232,7 +309,7 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
+             # 尝试移除弹窗
+             _remove_pop_cover(page)
+ 
+-        time.sleep(0.2)
++        sleep_random(120, 260)
+ 
+     # 调试：输出页面信息
+     debug_info = page.evaluate("""
+@@ -277,7 +354,7 @@ def _upload_images(page: Page, image_paths: list[str]) -> None:
+ 
+         page.set_file_input(selector, [path])
+         _wait_for_upload_complete(page, i + 1)
+-        time.sleep(1)
++        sleep_random(700, 1400)
+ 
+ 
+ def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
+@@ -290,7 +367,7 @@ def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
+         if count >= expected_count:
+             logger.info("图片上传完成: %d", count)
+             return
+-        time.sleep(0.5)
++        sleep_random(350, 700)
+ 
+     raise UploadTimeoutError(f"第{expected_count}张图片上传超时(60s)")
+ 
+@@ -334,6 +411,11 @@ def _fill_publish_form(
+     schedule_time: str | None,
+     is_original: bool,
+     visibility: str,
++    album: str = "",
++    location: str = "",
++    topic_template: str = "",
++    shooting_date: str = "",
++    shooting_location: str = "",
+ ) -> None:
+     """填写表单（不点击发布）。"""
+     # 从正文末尾提取 hashtag 并合并到 tags
+@@ -347,24 +429,36 @@ def _fill_publish_form(
+         raise TitleTooLongError(str(title_len), "20")
+ 
+     page.input_text(TITLE_INPUT, title)
+-    time.sleep(0.5)
++    sleep_random(350, 700)
+     _check_title_max_length(page)
+     logger.info("标题长度检查通过")
+-    time.sleep(1)
++    sleep_random(700, 1400)
+ 
+     # 正文
+     content_selector = _find_content_element(page)
+     page.input_content_editable(content_selector, content)
+ 
+     # 回点标题（增强稳定性）
+-    time.sleep(1)
++    sleep_random(700, 1400)
+     page.click_element(TITLE_INPUT)
+     logger.info("已回点标题输入框")
+ 
++    # 话题模板优先使用小红书官方功能；失败时再回退到逐个输入 tags。
++    template_applied = False
++    if topic_template:
++        try:
++            template_applied = _apply_topic_template_best_effort(page, topic_template)
++            if template_applied:
++                logger.info("已应用官方话题模板: %s", topic_template)
++            else:
++                logger.warning("未能应用官方话题模板，回退到逐个输入话题: %s", topic_template)
++        except Exception as e:
++            logger.warning("应用官方话题模板失败，回退到逐个输入话题: %s", e)
++
+     # 标签
+-    if tags:
++    if tags and not template_applied:
+         _input_tags(page, content_selector, tags)
+-    time.sleep(1)
++    sleep_random(700, 1400)
+     _check_content_max_length(page)
+     logger.info("正文长度检查通过")
+ 
+@@ -375,6 +469,15 @@ def _fill_publish_form(
+     # 可见范围
+     _set_visibility(page, visibility)
+ 
++    # 专辑/合集和地点是网页端频繁改版区域；这里做 best-effort，失败只写日志，不中断核心填表。
++    if album:
++        _set_album_best_effort(page, album)
++    if location:
++        _set_location_best_effort(page, location)
++    if album or location:
++        sleep_random(1300, 2400)
++        _restore_title_if_needed(page, title)
++
+     # 原创声明
+     if is_original:
+         try:
+@@ -383,9 +486,195 @@ def _fill_publish_form(
+         except Exception as e:
+             logger.warning("设置原创声明失败: %s", e)
+ 
++    if shooting_date or shooting_location:
++        try:
++            _set_content_source_declaration_best_effort(page, shooting_date, shooting_location)
++            _restore_title_if_needed(page, title)
++        except Exception as e:
++            logger.warning("设置内容来源声明失败: %s", e)
++
+     logger.info("表单填写完成，等待确认发布")
+ 
+ 
++def _restore_title_if_needed(page: Page, expected_title: str) -> None:
++    """Protect title from optional-field best-effort selectors."""
++    current = page.evaluate(
++        f"""
++        (() => {{
++            const input = document.querySelector({json.dumps(TITLE_INPUT)});
++            return input ? input.value : '';
++        }})()
++        """
++    )
++    if current == expected_title:
++        return
++    logger.warning("标题被可选字段流程改动，恢复标题: %s -> %s", current, expected_title)
++    page.select_all_text(TITLE_INPUT)
++    page.input_text(TITLE_INPUT, expected_title)
++    sleep_random(200, 450)
++
++
++def _set_album_best_effort(page: Page, album: str) -> None:
++    """尽力选择合集：点开面板 -> 搜索合集名 -> 勾选结果 -> 确定。分步执行，每步校验。"""
++    js_open = """
++        (() => {
++            const visible = (el) => {
++                if (!el) return false;
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            };
++            const realClick = (el) => {
++                el.scrollIntoView({block: 'center', inline: 'center'});
++                el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
++                el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
++                el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
++            };
++            const texts = ['加入合集', '添加到合集', '选择合集', '合集', '加入专辑', '专辑'];
++            const entry = Array.from(document.querySelectorAll('button, span, div, [role="button"]'))
++                .filter(visible)
++                .filter(el => !el.closest('[contenteditable="true"]'))
++                .filter(el => {
++                    const t = (el.innerText || '').trim();
++                    return t && t.length < 15 && texts.some(k => t.includes(k));
++                })
++                .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
++            if (!entry) return false;
++            realClick(entry);
++            return true;
++        })()
++    """
++    if not page.evaluate(js_open):
++        logger.warning("未找到合集入口，请手动选择合集: %s", album)
++        return
++    sleep_random(900, 1600)
++
++    js_search = f"""
++        (() => {{
++            const value = {json.dumps(album)};
++            const visible = (el) => {{
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            }};
++            const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
++            const input = inputs.find(el => (el.placeholder || '').includes('搜索'))
++                || inputs.find(el => (el.placeholder || '').includes('合集'))
++                || inputs.find(el => el.type === 'text' || el.type === 'search');
++            if (!input) return false;
++            const proto = Object.getPrototypeOf(input);
++            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
++            if (desc && desc.set) desc.set.call(input, value);
++            else input.value = value;
++            input.dispatchEvent(new Event('input', {{ bubbles: true }}));
++            input.dispatchEvent(new Event('change', {{ bubbles: true }}));
++            return true;
++        }})()
++    """
++    if not page.evaluate(js_search):
++        logger.info("合集面板无搜索框，直接在列表中查找: %s", album)
++    sleep_random(1100, 2000)
++
++    js_pick = f"""
++        (() => {{
++            const value = {json.dumps(album)};
++            const visible = (el) => {{
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            }};
++            const realClick = (el) => {{
++                el.scrollIntoView({{block: 'center', inline: 'center'}});
++                el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, view: window}}));
++                el.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true, cancelable: true, view: window}}));
++                el.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, view: window}}));
++            }};
++            const target = Array.from(document.querySelectorAll('li, label, div, span'))
++                .filter(visible)
++                .filter(el => !el.closest('[contenteditable="true"]'))
++                .filter(el => el.tagName !== 'INPUT')
++                .filter(el => {{
++                    const t = (el.innerText || '').trim();
++                    return t && t.length < 50 && t.includes(value) && !/搜索|管理|创建|新建/.test(t);
++                }})
++                .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
++            if (!target) return false;
++            realClick(target);
++            return true;
++        }})()
++    """
++    if not page.evaluate(js_pick):
++        logger.warning("合集面板中未找到 %r，请手动选择", album)
++        try:
++            page.keyboard.press("Escape")
++        except Exception:
++            pass
++        return
++    sleep_random(550, 1000)
++
++    page.evaluate(
++        """
++        (() => {
++            const visible = (el) => {
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            };
++            const realClick = (el) => {
++                el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
++                el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
++                el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
++            };
++            const confirm = Array.from(document.querySelectorAll('button, [role="button"]'))
++                .filter(visible)
++                .find(el => ['确定', '完 成', '完成'].includes((el.innerText || '').trim()));
++            if (confirm) { realClick(confirm); return true; }
++            return false;
++        })()
++        """
++    )
++    sleep_random(350, 700)
++    logger.info("已尝试选择合集: %s", album)
++
++
++def _set_location_best_effort(page: Page, location: str) -> None:
++    """尽力填写地点/位置，不因页面改版阻塞发布表单。"""
++    result = page.evaluate(
++        f"""
++        (() => {{
++            const value = {json.dumps(location)};
++            const keywords = ['地点', '位置', '添加地点', '添加位置', '所在位置'];
++            const visible = (el) => {{
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            }};
++            const realClick = (el) => {{
++                el.scrollIntoView({{block: 'center', inline: 'center'}});
++                el.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true, cancelable: true, view: window}}));
++                el.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true, cancelable: true, view: window}}));
++                el.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, view: window}}));
++            }};
++            const candidates = Array.from(document.querySelectorAll('button, input, [role=button], .d-select, .d-input, div, span'))
++                .filter(visible)
++                .filter(el => keywords.some(k => (el.innerText || el.textContent || el.placeholder || '').includes(k)));
++            if (!candidates.length) return 'not_found';
++            realClick(candidates[0]);
++            setTimeout(() => {{
++                const opts = Array.from(document.querySelectorAll('div, li, span')).filter(visible);
++                const target = opts.find(el => (el.innerText || el.textContent || '').trim().includes(value));
++                if (target) realClick(target);
++            }}, 1200);
++            return 'attempted';
++        }})()
++        """
++    )
++    if result == "attempted":
++        logger.info("已尝试填写地点/位置: %s", location)
++    else:
++        logger.warning("未找到地点/位置控件，请手动选择: %s", location)
++
++
+ def _find_content_element(page: Page) -> str:
+     """查找内容输入框（兼容两种 UI）。"""
+     if page.has_element(CONTENT_EDITOR):
+@@ -444,7 +733,7 @@ def _check_content_max_length(page: Page) -> None:
+ 
+ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+     """输入标签。"""
+-    time.sleep(1)
++    sleep_random(700, 1400)
+ 
+     # 先记录当前段落数（insertParagraph 之前），之后用于精确定位正文最后一段
+     # 注意：必须在 insertParagraph 之前记录，否则 para_count_before 会包含新增的 tags 行
+@@ -470,7 +759,7 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+         }})()
+         """
+     )
+-    time.sleep(0.5)
++    sleep_random(350, 700)
+ 
+     for tag in tags:
+         tag = tag.lstrip("#")
+@@ -498,14 +787,14 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+         }})()
+         """
+     )
+-    time.sleep(0.3)
++    sleep_random(200, 450)
+ 
+ 
+ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
+     """输入单个标签。"""
+     # 输入 #
+     page.type_text("#", delay_ms=0)
+-    time.sleep(0.3)
++    sleep_random(200, 450)
+ 
+     # 逐字输入标签（随机间隔模拟真实输入）
+     for char in tag:
+@@ -516,7 +805,7 @@ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
+     deadline = time.monotonic() + 3.0
+     clicked = False
+     while time.monotonic() < deadline:
+-        time.sleep(0.5)
++        sleep_random(350, 700)
+         if page.has_element(TAG_TOPIC_CONTAINER):
+             item_selector = f"{TAG_TOPIC_CONTAINER} {TAG_FIRST_ITEM}"
+             if page.has_element(item_selector):
+@@ -530,7 +819,252 @@ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
+         logger.warning("未找到标签联想，直接输入空格: %s", tag)
+         page.type_text(" ", delay_ms=0)
+ 
+-    time.sleep(0.8)
++    sleep_random(550, 1000)
++
++
++# ========== 官方话题模板 ==========
++
++
++def _apply_topic_template_best_effort(page: Page, template_name: str) -> bool:
++    """应用官方话题模板：打开弹窗 -> 滚动收集所有模板行 -> 精确/包含/相似度匹配 -> 点应用 -> 关弹窗。
++
++    用户可能只输入模板名的一部分（如"艺考"匹配"艺考录制"），按最相近的匹配。
++    """
++    template_name = template_name.strip()
++    if not template_name:
++        return False
++
++    if not _click_topic_template_entry(page):
++        return False
++    sleep_random(550, 1000)
++
++    # JS：收集弹窗内所有"模板行"（每行含一个 应用 按钮），给按钮打上标记并返回行名列表。
++    js_collect = """
++        (() => {
++            const visible = (el) => {
++                if (!el) return false;
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            };
++            const modals = Array.from(document.querySelectorAll('[role="dialog"], .d-modal, .d-dialog, .semi-modal, .modal, div, section'))
++                .filter(visible)
++                .filter(el => {
++                    const t = el.innerText || '';
++                    return t.includes('话题模板') && t.length < 3000;
++                })
++                .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
++            const modal = modals[0];
++            if (!modal) return { found: false };
++            document.querySelectorAll('[data-tpl-btn]').forEach(el => el.removeAttribute('data-tpl-btn'));
++            const applyTexts = ['应用', '使用', '使用模板'];
++            const btns = Array.from(modal.querySelectorAll('button, [role="button"], a, span, div'))
++                .filter(visible)
++                .filter(el => {
++                    const t = (el.innerText || '').trim();
++                    return applyTexts.includes(t);
++                });
++            const rows = [];
++            btns.forEach((btn, idx) => {
++                let row = btn;
++                for (let i = 0; i < 5; i++) {
++                    const parent = row.parentElement;
++                    if (!parent || parent === modal) break;
++                    const t = (parent.innerText || '').trim();
++                    if (t && t.length < 120 && applyTexts.some(a => t.includes(a))) { row = parent; continue; }
++                    break;
++                }
++                const name = (row.innerText || '')
++                    .replace(/应用|使用模板|使用/g, '')
++                    .replace(/\\s+/g, '')
++                    .trim();
++                if (!name) return;
++                btn.setAttribute('data-tpl-btn', String(idx));
++                rows.push({ idx, name });
++            });
++            const scrollers = [modal, ...Array.from(modal.querySelectorAll('*'))]
++                .filter(visible)
++                .filter(el => el.scrollHeight > el.clientHeight + 40);
++            return { found: true, rows, scrollable: scrollers.length > 0 };
++        })()
++    """
++
++    def pick_best(rows: list[dict]) -> dict | None:
++        import difflib
++
++        wanted = "".join(template_name.split())
++        best: dict | None = None
++        best_score = 0.0
++        for r in rows:
++            name = r["name"]
++            if name == wanted:
++                score = 1.0
++            elif name in wanted or wanted in name:
++                score = 0.8
++            else:
++                score = difflib.SequenceMatcher(None, name, wanted).ratio()
++            if score > best_score:
++                best_score = score
++                best = r
++        if best and best_score >= 0.45:
++            return best
++        return None
++
++    found: dict | None = None
++    scrollable = False
++    for _attempt in range(14):
++        state = page.evaluate(js_collect)
++        if not state.get("found"):
++            logger.warning("话题模板弹窗未找到")
++            return False
++        found = pick_best(state.get("rows") or [])
++        if found:
++            break
++        scrollable = bool(state.get("scrollable"))
++        if not scrollable:
++            break
++        moved = page.evaluate(
++            """
++            (() => {
++                const visible = (el) => {
++                    if (!el) return false;
++                    const r = el.getBoundingClientRect();
++                    const s = getComputedStyle(el);
++                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++                };
++                const modal = Array.from(document.querySelectorAll('div, section'))
++                    .filter(visible)
++                    .filter(el => {
++                        const t = el.innerText || '';
++                        return t.includes('话题模板') && t.length < 3000;
++                    })
++                    .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
++                if (!modal) return false;
++                const scrollers = [modal, ...Array.from(modal.querySelectorAll('*'))]
++                    .filter(visible)
++                    .filter(el => el.scrollHeight > el.clientHeight + 40);
++                const sc = scrollers[scrollers.length - 1];
++                if (!sc) return false;
++                const before = sc.scrollTop;
++                sc.scrollTop = before + 240;
++                return Math.abs(sc.scrollTop - before) > 2;
++            })()
++            """
++        )
++        if not moved:
++            break
++        sleep_random(200, 450)
++
++    if not found:
++        logger.warning("话题模板中未找到与 %r 相近的模板，跳过（正文话题已由 AI 生成）", template_name)
++        return False
++
++    clicked = page.evaluate(
++        """
++        (() => {
++            const btn = document.querySelector('[data-tpl-btn]');
++            if (!btn) return false;
++            const realClick = (el) => {
++                el.scrollIntoView({ block: 'center', inline: 'center' });
++                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
++                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
++                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
++            };
++            realClick(btn);
++            return true;
++        })()
++        """
++    )
++    if not clicked:
++        return False
++    sleep_random(700, 1400)
++
++    # 关闭弹窗：找 完成/关闭/收起 按钮，找不到按 Escape，避免弹窗挡住后续填表。
++    closed = page.evaluate(
++        """
++        (() => {
++            const visible = (el) => {
++                if (!el) return false;
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            };
++            const realClick = (el) => {
++                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
++                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
++                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
++            };
++            const texts = ['完成', '关闭', '收起', '确定'];
++            const closer = Array.from(document.querySelectorAll('button, [role="button"], .d-icon, span, i'))
++                .filter(visible)
++                .find(el => {
++                    const t = (el.innerText || '').trim();
++                    if (t && texts.includes(t)) return true;
++                    const label = String(el.getAttribute('aria-label') || '') + String(el.className || '');
++                    return /close|icon_close/i.test(label) && t === '';
++                });
++            if (closer) { realClick(closer); return 'clicked'; }
++            return 'none';
++        })()
++        """
++    )
++    if closed != "clicked":
++        try:
++            page.keyboard.press("Escape")
++        except Exception:
++            pass
++    sleep_random(350, 700)
++    logger.info("已应用话题模板: %s（匹配到 %r）", template_name, found["name"])
++    return True
++
++
++def _click_topic_template_entry(page: Page) -> bool:
++    opened_topic_menu = page.evaluate(
++        """
++        (() => {
++            const visible = (el) => {
++                if (!el) return false;
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            };
++            const realClick = (el) => {
++                el.scrollIntoView({ block: 'center', inline: 'center' });
++                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
++                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
++                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
++            };
++            const direct = Array.from(document.querySelectorAll('.topicTemplate')).find(visible);
++            if (direct) {
++                realClick(direct);
++                return true;
++            }
++            const topic = Array.from(document.querySelectorAll('#topicBtn, button'))
++                .filter(visible)
++                .find(el => (el.innerText || el.textContent || '').includes('话题'));
++            const sibling = topic?.parentElement?.querySelector('.topicTemplate');
++            if (sibling && visible(sibling)) {
++                realClick(sibling);
++                return true;
++            }
++            return false;
++        })()
++        """
++    )
++    if not opened_topic_menu:
++        opened_topic_menu = _click_visible_text_best_effort(page, "话题")
++    if not opened_topic_menu:
++        return False
++    sleep_random(350, 700)
++    managed = _click_visible_text_best_effort(page, "使用/管理话题模板")
++    if not managed:
++        managed = _click_visible_text_best_effort(page, "使用/管理话题模版")
++    if managed:
++        return True
++    created = _click_visible_text_best_effort(page, "话题模板")
++    if not created:
++        created = _click_visible_text_best_effort(page, "话题模版")
++    return bool(created)
+ 
+ 
+ # ========== 定时发布 ==========
+@@ -546,15 +1080,99 @@ def _set_schedule_publish(page: Page, schedule_time: str) -> None:
+     except ValueError as e:
+         raise PublishError(f"定时发布时间格式错误: {e}") from e
+ 
+-    # 点击定时发布开关
+-    page.click_element(SCHEDULE_SWITCH)
+-    time.sleep(0.8)
++    # 点击定时发布开关；页面改版时退回到文本查找。
++    try:
++        page.click_element(SCHEDULE_SWITCH)
++    except Exception:
++        clicked = _click_visible_text_best_effort(page, "定时发布")
++        if not clicked:
++            raise PublishError("未找到定时发布开关")
++    sleep_random(550, 1000)
++
++    # Native ``datetime-local`` inputs only accept the ``T`` separator.  Older
++    # custom inputs accept a space, so try both and verify the value the page
++    # actually retained instead of trusting a successful typing call.
++    datetime_str = dt.strftime("%Y-%m-%dT%H:%M")
++    legacy_datetime_str = dt.strftime("%Y-%m-%d %H:%M")
++    expected_prefix = legacy_datetime_str
++
++    def read_datetime_value() -> str:
++        value = page.evaluate(
++            f"""
++            (() => {{
++                const selector = {json.dumps(DATETIME_INPUT)};
++                const visible = (el) => {{
++                    const r = el.getBoundingClientRect();
++                    const s = getComputedStyle(el);
++                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++                }};
++                const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
++                const input = document.querySelector(selector)
++                    || inputs.find((el) => el.type === 'datetime-local' || el.type === 'date')
++                    || inputs.find((el) => /日期|时间/.test(el.placeholder || ''))
++                    || inputs.at(-1);
++                return input ? (input.value || '') : '';
++            }})()
++            """
++        )
++        return str(value or "")
++
++    def matches_expected(value: str) -> bool:
++        return value.replace("T", " ").startswith(expected_prefix)
+ 
+-    # 设置日期时间
+-    datetime_str = dt.strftime("%Y-%m-%d %H:%M")
+-    page.select_all_text(DATETIME_INPUT)
+-    page.input_text(DATETIME_INPUT, datetime_str)
+-    time.sleep(0.5)
++    def set_datetime_with_script(value: str) -> bool:
++        result = page.evaluate(
++            f"""
++            (() => {{
++                const selector = {json.dumps(DATETIME_INPUT)};
++                const visible = (el) => {{
++                    const r = el.getBoundingClientRect();
++                    const s = getComputedStyle(el);
++                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++                }};
++                const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
++                const input = document.querySelector(selector)
++                    || inputs.find((el) => el.type === 'datetime-local' || el.type === 'date')
++                    || inputs.find((el) => /日期|时间/.test(el.placeholder || ''))
++                    || inputs.at(-1);
++                if (!input) return false;
++                const nextValue = {json.dumps(value)};
++                const proto = Object.getPrototypeOf(input);
++                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
++                if (desc && desc.set) desc.set.call(input, nextValue);
++                else input.value = nextValue;
++                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
++                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
++                return true;
++            }})()
++            """
++        )
++        return bool(result)
++
++    input_written = False
++    for value, use_script in (
++        (datetime_str, False),
++        (datetime_str, True),
++        (legacy_datetime_str, False),
++        (legacy_datetime_str, True),
++    ):
++        try:
++            if use_script:
++                set_datetime_with_script(value)
++            else:
++                page.select_all_text(DATETIME_INPUT)
++                page.input_text(DATETIME_INPUT, value)
++        except Exception:
++            continue
++        if matches_expected(read_datetime_value()):
++            input_written = True
++            break
++    if not input_written:
++        actual = read_datetime_value()
++        raise PublishError(
++            f"定时发布时间未写入输入框（期望 {datetime_str}，实际 {actual or '空'}）"
++        )
++    sleep_random(350, 700)
+ 
+     logger.info("已设置定时发布: %s", datetime_str)
+ 
+@@ -576,7 +1194,7 @@ def _set_visibility(page: Page, visibility: str) -> None:
+ 
+     # 点击下拉框
+     page.click_element(VISIBILITY_DROPDOWN)
+-    time.sleep(0.5)
++    sleep_random(350, 700)
+ 
+     # 查找并点击目标选项
+     clicked = page.evaluate(
+@@ -598,7 +1216,219 @@ def _set_visibility(page: Page, visibility: str) -> None:
+         raise PublishError(f"未找到可见范围选项: {visibility}")
+ 
+     logger.info("已设置可见范围: %s", visibility)
+-    time.sleep(0.2)
++    sleep_random(120, 260)
++
++
++# ========== 内容来源声明 ==========
++
++
++def _set_content_source_declaration_best_effort(
++    page: Page,
++    shooting_date: str = "",
++    shooting_location: str = "",
++) -> None:
++    """尽力设置「添加内容类型声明 -> 内容来源声明 -> 自主拍摄」。"""
++    clicked_menu = _click_visible_text_best_effort(page, "添加内容类型声明")
++    if not clicked_menu:
++        logger.warning("未找到添加内容类型声明控件")
++        return
++    time.sleep(0.6)
++
++    clicked_source = _click_visible_text_best_effort(page, "内容来源声明")
++    if not clicked_source:
++        logger.warning("未找到内容来源声明选项")
++        return
++    time.sleep(0.6)
++
++    clicked_self_shot = _click_visible_text_best_effort(page, "自主拍摄")
++    if not clicked_self_shot:
++        logger.warning("未找到自主拍摄选项")
++        return
++    sleep_random(550, 1000)
++
++    result = _fill_self_shot_modal(page, shooting_date, shooting_location)
++    logger.info("内容来源声明设置结果: %s", result)
++    sleep_random(350, 700)
++
++
++def _fill_self_shot_modal(page: Page, shooting_date: str = "", shooting_location: str = "") -> object:
++    if shooting_location:
++        page.evaluate(
++            f"""
++            (() => {{
++                const shootingLocation = {json.dumps(shooting_location)};
++                const visible = (el) => {{
++                    if (!el) return false;
++                    const r = el.getBoundingClientRect();
++                    const s = getComputedStyle(el);
++                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++                }};
++                const realClick = (el) => {{
++                    el.scrollIntoView({{ block: 'center', inline: 'center' }});
++                    el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
++                }};
++                const dialogs = Array.from(document.querySelectorAll('[role="dialog"], .d-modal, .d-dialog, .semi-modal, .modal, body'))
++                    .filter(visible)
++                    .filter(el => (el.innerText || el.textContent || '').includes('拍摄地点') && (el.innerText || el.textContent || '').includes('拍摄日期'));
++                const dialog = dialogs[0];
++                if (!dialog) return false;
++                const controls = Array.from(dialog.querySelectorAll('input, [role="button"], .d-select, .d-input, div'))
++                    .filter(visible)
++                    .filter(el => (el.placeholder || el.innerText || el.textContent || '').includes('地点') || (el.innerText || el.textContent || '').includes('下拉选择地点'));
++                const control = controls[0] || Array.from(dialog.querySelectorAll('input')).find(visible);
++                if (control) realClick(control);
++                const input = Array.from(document.querySelectorAll('input')).filter(visible).find(el => (el.placeholder || '').includes('地点') || (el.placeholder || '').includes('搜索'));
++                if (input) {{
++                    const proto = Object.getPrototypeOf(input);
++                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
++                    if (desc && desc.set) desc.set.call(input, shootingLocation);
++                    else input.value = shootingLocation;
++                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
++                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
++                }}
++                return true;
++            }})()
++            """
++        )
++        sleep_random(900, 1600)
++        page.evaluate(
++            f"""
++            (() => {{
++                const value = {json.dumps(shooting_location)};
++                const visible = (el) => {{
++                    if (!el) return false;
++                    const r = el.getBoundingClientRect();
++                    const s = getComputedStyle(el);
++                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++                }};
++                const realClick = (el) => {{
++                    el.scrollIntoView({{ block: 'center', inline: 'center' }});
++                    el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
++                    el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
++                }};
++                const options = Array.from(document.querySelectorAll('li, div, span, [role="option"]')).filter(visible);
++                const exact = options.find(el => (el.innerText || el.textContent || '').trim() === value);
++                const fuzzy = options.find(el => (el.innerText || el.textContent || '').includes(value));
++                const target = exact || fuzzy;
++                if (!target) return false;
++                realClick(target);
++                return true;
++            }})()
++            """
++        )
++        sleep_random(350, 700)
++
++    result = page.evaluate(
++        f"""
++        (() => {{
++            const shootingDate = {json.dumps(shooting_date)};
++            const shootingLocation = {json.dumps(shooting_location)};
++            const visible = (el) => {{
++                if (!el) return false;
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            }};
++            const setNativeValue = (el, value) => {{
++                if (!el || !value) return false;
++                const proto = Object.getPrototypeOf(el);
++                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
++                if (desc && desc.set) desc.set.call(el, value);
++                else el.value = value;
++                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
++                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
++                return true;
++            }};
++            const realClick = (el) => {{
++                el.scrollIntoView({{ block: 'center', inline: 'center' }});
++                el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
++                el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
++                el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
++            }};
++            const dialogs = Array.from(document.querySelectorAll('[role="dialog"], .d-modal, .d-dialog, .semi-modal, .modal, body'))
++                .filter(visible)
++                .filter(el => (el.innerText || el.textContent || '').includes('拍摄地点') && (el.innerText || el.textContent || '').includes('拍摄日期'));
++            const dialog = dialogs[0];
++            if (!dialog) return {{ found: false, reason: 'modal_not_found' }};
++
++            function rowByLabel(label) {{
++                const els = Array.from(dialog.querySelectorAll('*')).filter(visible);
++                const labelEl = els.find(el => (el.innerText || el.textContent || '').trim() === label);
++                if (!labelEl) return null;
++                return labelEl.closest('div')?.parentElement || labelEl.parentElement;
++            }}
++
++            let dateSet = false;
++            const dateRow = rowByLabel('拍摄日期');
++            if (dateRow && shootingDate) {{
++                const input = Array.from(dateRow.querySelectorAll('input')).find(visible);
++                if (input) dateSet = setNativeValue(input, shootingDate);
++            }}
++            if (!dateSet && shootingDate) {{
++                const candidates = Array.from(dialog.querySelectorAll('input')).filter(visible);
++                const dateInput = candidates.find(input => (input.placeholder || '').includes('日期')) || candidates[1];
++                dateSet = setNativeValue(dateInput, shootingDate);
++            }}
++
++            let locationSet = Boolean(shootingLocation);
++            const locationRow = rowByLabel('拍摄地点');
++            if (!locationSet && locationRow && shootingLocation) {{
++                const control = Array.from(locationRow.querySelectorAll('input, [role="button"], .d-select, .d-input')).find(visible);
++                if (control) {{
++                    realClick(control);
++                    if (control.tagName === 'INPUT') locationSet = setNativeValue(control, shootingLocation);
++                    else locationSet = true;
++                }}
++            }}
++            if (!locationSet && shootingLocation) {{
++                const candidates = Array.from(dialog.querySelectorAll('input')).filter(visible);
++                const locationInput = candidates.find(input => (input.placeholder || '').includes('地点')) || candidates[0];
++                locationSet = setNativeValue(locationInput, shootingLocation);
++            }}
++
++            const confirm = Array.from(dialog.querySelectorAll('button, [role="button"]'))
++                .filter(visible)
++                .find(el => (el.innerText || el.textContent || '').trim() === '确认');
++            if (confirm && !confirm.disabled && !confirm.classList.contains('disabled')) realClick(confirm);
++            return {{ found: true, dateSet, locationSet, confirmed: Boolean(confirm) }};
++        }})()
++        """
++    )
++    return result
++
++
++def _click_visible_text_best_effort(page: Page, text: str) -> bool:
++    result = page.evaluate(
++        f"""
++        (() => {{
++            const targetText = {json.dumps(text)};
++            const visible = (el) => {{
++                if (!el) return false;
++                const r = el.getBoundingClientRect();
++                const s = getComputedStyle(el);
++                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
++            }};
++            const realClick = (el) => {{
++                el.scrollIntoView({{ block: 'center', inline: 'center' }});
++                el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true, cancelable: true, view: window }}));
++                el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true, cancelable: true, view: window }}));
++                el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true, view: window }}));
++            }};
++            const els = Array.from(document.querySelectorAll('button, [role="button"], li, div, span'))
++                .filter(visible)
++                .filter(el => (el.innerText || el.textContent || '').trim().includes(targetText));
++            const exact = els.find(el => (el.innerText || el.textContent || '').trim() === targetText);
++            const target = exact || els[0];
++            if (!target) return false;
++            realClick(target);
++            return true;
++        }})()
++        """
++    )
++    return bool(result)
+ 
+ 
+ # ========== 原创声明 ==========
+@@ -632,7 +1462,7 @@ def _set_original(page: Page) -> None:
+     if result == "not_found":
+         raise PublishError("未找到原创声明选项")
+ 
+-    time.sleep(0.5)
++    sleep_random(350, 700)
+ 
+     # 处理确认弹窗
+     _confirm_original_declaration(page)
+@@ -640,7 +1470,7 @@ def _set_original(page: Page) -> None:
+ 
+ def _confirm_original_declaration(page: Page) -> None:
+     """处理原创声明确认弹窗。"""
+-    time.sleep(0.8)
++    sleep_random(550, 1000)
+ 
+     # 勾选 checkbox
+     page.evaluate(
+@@ -656,7 +1486,7 @@ def _confirm_original_declaration(page: Page) -> None:
+         })()
+         """
+     )
+-    time.sleep(0.5)
++    sleep_random(350, 700)
+ 
+     # 点击声明原创按钮
+     result = page.evaluate(
+@@ -687,4 +1517,4 @@ def _confirm_original_declaration(page: Page) -> None:
+         raise PublishError("声明原创按钮仍处于禁用状态")
+ 
+     logger.info("已成功点击声明原创按钮")
+-    time.sleep(0.3)
++    sleep_random(200, 450)
+diff --git a/scripts/xhs/types.py b/scripts/xhs/types.py
+index d14fbd5..67484a4 100644
+--- a/scripts/xhs/types.py
++++ b/scripts/xhs/types.py
+@@ -421,6 +421,11 @@ class PublishImageContent:
+     schedule_time: str | None = None  # ISO8601 格式，None 表示立即发布
+     is_original: bool = False
+     visibility: str = ""  # 公开可见(默认)|仅自己可见|仅互关好友可见
++    album: str = ""
++    location: str = ""
++    topic_template: str = ""
++    shooting_date: str = ""
++    shooting_location: str = ""
+ 
+ 
+ @dataclass
+diff --git a/scripts/xhs/creator.py b/scripts/xhs/creator.py
+new file mode 100644
+index 0000000..e3ec4f5
+--- /dev/null
++++ b/scripts/xhs/creator.py
+@@ -0,0 +1,121 @@
++"""创作平台数据中心：读取本账号近 N 条笔记 + 首页数据总览，用于账号画像自动生成。
++
++2026-10 实测（新版创作平台，路由已改为 /new/ 前缀）：
++- 笔记管理：https://creator.xiaohongshu.com/new/note-manager
++  列表元素 [class*="note-card"]，innerText 结构：
++    [置顶]\n[仅自己可见]\n标题\nYYYY-MM-DD HH:MM\n浏览\n评论\n点赞\n收藏\n分享
++- 首页 https://creator.xiaohongshu.com/new/home 正文含：
++  账号名/粉丝数/获赞与收藏/近7日数据总览/最新笔记标题
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import time
++from typing import Any
++
++from .cdp import Page
++
++logger = logging.getLogger(__name__)
++
++NOTE_MANAGER_URL = "https://creator.xiaohongshu.com/new/note-manager"
++HOME_URL = "https://creator.xiaohongshu.com/new/home"
++
++# 从 note-card DOM 提取笔记列表
++_EXTRACT_NOTES_JS = """
++(() => {
++    const cards = document.querySelectorAll('[class*="note-card"]');
++    const notes = [];
++    const seen = new Set();
++    cards.forEach(card => {
++        const text = (card.innerText || '').trim();
++        if (!text || seen.has(text)) return;
++        seen.add(text);
++        const lines = text.split('\\n').map(s => s.trim()).filter(Boolean);
++        if (lines.length < 3) return;
++        // 过滤掉"置顶"/"仅自己可见"标记，找到日期行定位标题
++        let pinned = false, private_ = false;
++        const rest = [];
++        for (const ln of lines) {
++            if (ln === '置顶') { pinned = true; continue; }
++            if (ln === '仅自己可见') { private_ = true; continue; }
++            rest.push(ln);
++        }
++        // 找日期行（YYYY-MM-DD）
++        const di = rest.findIndex(l => /^\\d{4}-\\d{2}-\\d{2}/.test(l));
++        if (di < 1) return;
++        const title = rest.slice(0, di).join(' ');
++        const nums = rest.slice(di + 1).filter(l => /^[\\d,]+$/.test(l)).map(l => parseInt(l.replace(/,/g, ''), 10));
++        notes.push({
++            title: title.slice(0, 60),
++            time: rest[di],
++            pinned: pinned,
++            private: private_,
++            views: nums[0] !== undefined ? nums[0] : '',
++            likes: nums[2] !== undefined ? nums[2] : '',
++            collects: nums[3] !== undefined ? nums[3] : '',
++            comments: nums[4] !== undefined ? nums[4] : '',
++        });
++    });
++    // 按 标题+日期 去重（同一条笔记可能因"仅自己可见"标记被解析成两条）
++    const dedup = new Map();
++    for (const n of notes) {
++        const key = n.title + '|' + n.time;
++        if (!dedup.has(key) || n.private) dedup.set(key, n);
++    }
++    const final = Array.from(dedup.values());
++    return JSON.stringify({ count: final.length, notes: final.slice(0, 60) });
++})()
++"""
++
++_EXTRACT_HOME_JS = """
++(() => {
++    const text = (document.body.innerText || '').slice(0, 8000);
++    return JSON.stringify({ url: location.href, text: text });
++})()
++"""
++
++
++def get_creator_notes(page: Page, max_count: int = 20, scroll_rounds: int = 5) -> dict[str, Any]:
++    """读取创作平台笔记管理页，返回近 N 条笔记及数据。"""
++    try:
++        page.navigate(NOTE_MANAGER_URL)
++        page.wait_for_load(timeout=40)
++        time.sleep(4)
++
++        for _ in range(scroll_rounds):
++            page.evaluate("window.scrollBy(0, 1500)")
++            time.sleep(1.2)
++
++        raw = page.evaluate(_EXTRACT_NOTES_JS)
++        data = json.loads(raw or "{}")
++        notes = (data.get("notes") or [])[:max_count]
++        if notes:
++            return {"success": True, "url": NOTE_MANAGER_URL, "total": data.get("count"), "notes": notes}
++        return {"success": False, "error": "笔记管理页未提取到笔记（页面结构可能已变化）"}
++    except Exception as e:  # noqa: BLE001
++        logger.warning("笔记管理页读取失败: %s", e)
++        return {"success": False, "error": str(e)}
++
++
++def get_home_snapshot(page: Page) -> dict[str, Any]:
++    """读取创作平台首页正文（账号名/粉丝/获赞收藏/近7日数据总览），供 AI 总结。"""
++    try:
++        page.navigate(HOME_URL)
++        page.wait_for_load(timeout=40)
++        time.sleep(4)
++        raw = page.evaluate(_EXTRACT_HOME_JS)
++        data = json.loads(raw or "{}")
++        text = (data.get("text") or "").strip()
++        if text and "创作服务平台" in text:
++            return {"success": True, "url": data.get("url"), "text": text}
++        return {"success": False, "error": "首页内容异常"}
++    except Exception as e:  # noqa: BLE001
++        logger.warning("首页读取失败: %s", e)
++        return {"success": False, "error": str(e)}
++
++
++def get_datacenter_snapshot(page: Page) -> dict[str, Any]:
++    """兼容旧接口名：数据中心现以首页数据总览代替。"""
++    return get_home_snapshot(page)

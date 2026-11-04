@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>小红书发布助手</title>
+    <link rel="stylesheet" href="/static/styles.css?v=2026.11.4" />
+  </head>
+  <body>
+    <div class="app-shell" id="appShell">
+      <!-- ========== 左栏：创作服务平台导航 ========== -->
+      <aside class="sidebar" id="sidebar">
+        <div class="platform-box">
+          <button id="platformBtn" class="platform-btn" type="button">
+            <span class="xhs-badge">小红书</span>
+            <span class="platform-title">创作服务平台</span>
+            <svg class="caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <div id="platformMenu" class="platform-menu" style="display:none">
+            <div class="platform-option active"><span class="xhs-badge">小红书</span> 已选择</div>
+            <div class="platform-option disabled">抖音（暂未开放）</div>
+            <div class="platform-option disabled">视频号（暂未开放）</div>
+            <div class="platform-option disabled">B站（暂未开放）</div>
+          </div>
+        </div>
+
+        <button id="navPublish" class="publish-note-btn" data-nav="publish" type="button">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+          发布笔记
+        </button>
+
+        <nav class="side-nav">
+          <button class="side-item" data-nav="records" type="button">
+            <svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 9h8M8 13h8M8 17h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            笔记记录
+          </button>
+          <button class="side-item" data-nav="follow" type="button">
+            <svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M8 15v-4M12 15V8M16 15v-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            关注账号热度笔记
+          </button>
+          <button class="side-item" data-nav="hot" type="button">
+            <svg viewBox="0 0 24 24"><path d="M12 3c1 3-2 4.5-2 7a2 2 0 104 0c0-1 .5-2 .5-2 2 1.5 3.5 3.5 3.5 6a4 4 0 11-8 0c0-3.5 2-5 2-8z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            行业热点
+          </button>
+        </nav>
+
+        <div class="side-foot">
+          <button id="sidebarToggle" class="sidebar-toggle" type="button">
+            <svg viewBox="0 0 24 24"><path d="M14 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            收起
+          </button>
+        </div>
+      </aside>
+
+      <div class="resizer" id="resizerLeft" data-resize="left"></div>
+
+      <!-- ========== 中栏：主工作区 ========== -->
+      <main class="main-area">
+        <div id="updateBanner" class="update-banner" role="status" hidden>
+          <div class="update-copy">
+            <strong id="updateTitle"></strong>
+            <p id="updateNotes"></p>
+          </div>
+          <div class="update-actions">
+            <button id="installUpdateBtn" class="primary" type="button">下载并重启</button>
+            <button id="dismissUpdateBtn" class="icon-tool ghost" type="button" title="暂时关闭更新提示" aria-label="暂时关闭更新提示">
+              <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- ---------- 发布视图 ---------- -->
+        <div id="pagePublish">
+          <!-- 任务队列条 -->
+          <div class="queue-bar">
+            <div id="queueList" class="queue-list">
+              <span class="queue-num current">1</span>
+            </div>
+            <span class="queue-label">后台任务队列</span>
+            <span id="bridgeStatus" class="bridge-pill">Bridge 未检测</span>
+            <div class="queue-actions">
+              <button id="nextQueueBtn" class="mini-text ghost" type="button">下一条</button>
+              <button id="pauseQueueBtn" class="mini-text ghost" type="button" style="display:none">暂停队列</button>
+              <button id="startQueueBtn" class="primary" type="button" style="display:none">开始提交（<span id="readyCount">0</span> 条已确认）</button>
+            </div>
+          </div>
+
+          <!-- 图文 / 视频 -->
+          <div class="media-switch">
+            <button id="mediaTabImage" class="media-btn active" type="button">图文</button>
+            <button id="mediaTabVideo" class="media-btn" type="button">视频</button>
+          </div>
+
+          <!-- 批量计划条 -->
+          <div class="plan-bar">
+            <span class="plan-title">批量计划</span>
+            <label class="plan-item">本次发布
+              <input id="planTotal" type="number" min="1" max="30" value="15" /> 条
+            </label>
+            <i class="plan-sep"></i>
+            <label class="plan-item">每日上限
+              <input id="dailyLimit" type="number" min="1" max="5" value="3" /> 条
+            </label>
+            <i class="plan-sep"></i>
+            <span class="plan-calc">自动分配 <b id="planDays">5</b> 天 · 已排 <b id="planProgress">0</b>/<b id="planTotalView">15</b> 条</span>
+          </div>
+
+          <div id="videoPanel" style="display:none" class="video-box">
+            <div class="video-placeholder">
+              <div class="video-icon">🎬</div>
+              <h2>视频发布即将支持</h2>
+              <p>视频上传与发布功能正在开发中，当前请使用「图文」。</p>
+            </div>
+          </div>
+
+          <div id="imagePanel">
+            <!-- 图片编辑卡 -->
+            <section class="card">
+              <header class="card-head img-head">
+                <h2 class="card-title">图片编辑</h2>
+                <span id="imageCountTotal" class="count-badge">共 0 张</span>
+
+                <div class="main-group">
+                  <button id="recommendBtn" class="primary" type="button">推荐一组</button>
+                  <button id="changeGroupBtn" class="ghost" type="button">换一组</button>
+                  <button id="batchEditBtn" class="ghost" type="button" title="用编辑软件打开整组图片">批量编辑</button>
+                </div>
+
+                <span id="candidateCount" class="muted scan-count"></span>
+
+                <div class="minor-group" title="辅助操作">
+                  <button id="checkLoginBtn" class="icon-tool ghost" type="button" title="检测小红书登录状态">
+                    <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 20c.6-3.4 3.6-5 7-5s6.4 1.6 7 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                  </button>
+                  <button id="checkUpdatesBtn" class="icon-tool ghost" type="button" title="检查软件更新" aria-label="检查软件更新">
+                    <svg viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <button id="refreshImagesBtn" class="icon-tool ghost" type="button" title="刷新缩略图（修图保存后点此）">
+                    <svg viewBox="0 0 24 24"><path d="M20 11A8 8 0 006.6 6.6L4 9M4 4v5h5M4 13a8 8 0 0013.4 4.4L20 15M20 20v-5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                  <button id="clearImagesBtn" class="icon-tool ghost" type="button" title="清空全部图片">
+                    <svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7.5 7l.8 12.5h7.4l.8-12.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                  </button>
+                </div>
+              </header>
+
+              <div id="recommendation" class="empty recommend-empty">尚未加载素材。点「推荐一组」自动推荐，或点下方 + 号手动指定文件夹。</div>
+
+              <div id="thumbGrid" class="thumb-strip"></div>
+
+              <div class="card-foot-line">
+                <button id="editorPathBtn" class="editor-link" type="button" title="选择用于编辑图片的本地软件（如 Photoshop）">
+                  <svg viewBox="0 0 24 24"><path d="M4 17l-1 4 4-1L20 7l-3-3L4 17z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+                  编辑软件：<b id="editorPathName">未设置，点击选择</b>
+                </button>
+                <input type="hidden" id="editorAppPath" />
+                <button id="collapseImagesBtn" class="collapse-btn" type="button">收起图片
+                  <svg viewBox="0 0 24 24"><path d="M6 14l6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
+            </section>
+
+            <!-- 文案卡 -->
+            <section class="card">
+              <div class="copy-head">
+                <input id="titleInput" class="title-input" maxlength="20" placeholder="填写标题会有更多赞（0-20字）" />
+                <div class="style-tabs" id="styleTabs">
+                  <button class="style-tab" data-style="praise" type="button">夸赞型</button>
+                  <button class="style-tab selected" data-style="professional" type="button">专业展示</button>
+                  <button class="style-tab" data-style="process" type="button">过程分享</button>
+                  <button class="style-tab" data-style="opinion" type="button">观点讨论</button>
+                  <button class="style-tab" data-style="story" type="button">案例故事</button>
+                </div>
+                <label class="random-line"><input type="checkbox" id="randomStyleChk" /> 随机</label>
+                <button id="generateBtn" class="mini-text ghost" type="button" title="强制重新生成文案">重新生成</button>
+              </div>
+
+              <textarea id="contentInput" class="content-input" rows="9" placeholder="填写正文描述，分享你的拍摄故事…&#10;推荐素材后 5 种风格文案会自动生成，点上方风格名切换。"></textarea>
+
+              <div class="tag-preview" id="tagPreview"></div>
+
+              <div class="editor-bar">
+                <button class="editor-tool" type="button"># 话题</button>
+                <button class="editor-tool" type="button">@ 用户</button>
+                <button class="editor-tool" type="button">😊 表情</button>
+                <span class="char-count"><span id="contentCount">0</span>/1000</span>
+              </div>
+
+              <label class="plain-field">
+                <span>话题（发布时自动带上 #）</span>
+                <input id="tagsInput" placeholder="用空格或逗号分隔，例如：艺考照 北京写真" />
+              </label>
+              <div class="engine-line">当前文案引擎：<span id="copyEngine">本地模板</span></div>
+            </section>
+
+            <!-- 拍摄信息卡 -->
+            <section class="card">
+              <h2 class="block-title">拍摄信息</h2>
+              <div class="two-cols">
+                <label class="plain-field">
+                  <span>模特名</span>
+                  <input id="modelName" placeholder="从文件夹名自动识别，可手动改" />
+                </label>
+                <label class="plain-field">
+                  <span>拍摄日期</span>
+                  <input id="shootingDate" type="date" />
+                </label>
+              </div>
+              <label class="plain-field">
+                <span>拍摄备注（道具、场景、服装亮点）</span>
+                <input id="notes" placeholder="例如：白裙、窗边自然光、舞蹈生" />
+              </label>
+              <div class="two-cols">
+                <label class="plain-field">
+                  <span>话题模板</span>
+                  <select id="topicTemplate"></select>
+                </label>
+                <label class="plain-field">
+                  <span>合集（自动加入）</span>
+                  <input id="defaultAlbum" placeholder="如：女生艺考照" />
+                </label>
+              </div>
+              <label class="plain-field">
+                <span>地点</span>
+                <input id="defaultLocation" placeholder="如：北京通州区宋庄镇" />
+              </label>
+            </section>
+
+            <!-- 内容设置卡 -->
+            <section class="card">
+              <h2 class="block-title">内容设置</h2>
+
+              <div class="setting-group">
+                <div class="setting-label">可见范围</div>
+                <div class="radio-list" id="visibilityList">
+                  <label class="radio-item">
+                    <input type="radio" name="visibilityRadio" value="公开可见" checked />
+                    <span><b>公开可见</b><i>所有人都能看到你的笔记</i></span>
+                  </label>
+                  <label class="radio-item">
+                    <input type="radio" name="visibilityRadio" value="仅自己可见" />
+                    <span><b>仅自己可见</b><i>只有你自己能看到</i></span>
+                  </label>
+                  <label class="radio-item">
+                    <input type="radio" name="visibilityRadio" value="仅互关好友可见" />
+                    <span><b>仅互关好友可见</b><i>仅相互关注的好友能看到</i></span>
+                  </label>
+                </div>
+                <select id="visibility" class="hidden-select">
+                  <option>公开可见</option>
+                  <option>仅自己可见</option>
+                  <option>仅互关好友可见</option>
+                </select>
+              </div>
+
+              <div class="setting-group">
+                <div class="setting-label">发布时间</div>
+                <div class="radio-list">
+                  <label class="radio-item">
+                    <input type="radio" name="publishRadio" value="immediate" />
+                    <span><b>立即发布</b><i>提交后马上发布</i></span>
+                  </label>
+                  <label class="radio-item">
+                    <input type="radio" name="publishRadio" value="scheduled" checked />
+                    <span><b>定时发布</b><i>在选定时间段内随机时间发布</i></span>
+                  </label>
+                </div>
+                <select id="publishMode" class="hidden-select">
+                  <option value="scheduled">定时发布</option>
+                  <option value="immediate">立即发布</option>
+                </select>
+                <div class="two-cols schedule-fields">
+                  <label class="plain-field">
+                    <span>选择时间段</span>
+                    <select id="scheduleWindow"></select>
+                  </label>
+                  <label class="plain-field">
+                    <span>本条实际发布时间</span>
+                    <input id="schedulePreview" readonly placeholder="入队时自动生成" />
+                  </label>
+                </div>
+              </div>
+
+              <label class="switch-line">
+                <input type="checkbox" id="originalChk" checked />
+                <span><b>声明原创</b><i>勾选后发布时自动开启原创保护</i></span>
+              </label>
+            </section>
+
+            <!-- 发布确认清单（默认折叠，点标题展开） -->
+            <section class="card checklist-card collapsed" id="checklistCard">
+              <button id="checklistToggle" class="card-head as-toggle" type="button">
+                <h2 class="block-title">发布确认清单</h2>
+                <span class="muted" id="checklistSummary">已折叠 · 确认入队后由后台串行提交</span>
+                <svg class="chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <ul id="checklist" class="checklist"></ul>
+            </section>
+
+            <!-- 默认设置卡（长页面下方，设置一次长期沿用） -->
+            <section class="card">
+              <div class="card-head">
+                <h2 class="block-title">默认设置</h2>
+                <span class="muted">按当前 Chrome 账号保存，后续笔记自动沿用</span>
+              </div>
+
+              <div class="setting-group">
+                <div class="setting-label">账号画像</div>
+                <button id="genProfileBtn" class="ghost" type="button">一键生成画像</button>
+                <div class="two-cols profile-inputs">
+                  <label class="plain-field">
+                    <span>账号关键词</span>
+                    <input id="profileKeywords" placeholder="如：艺考照、演员资料照、摄影工作室" />
+                  </label>
+                  <label class="plain-field">
+                    <span>长期话题</span>
+                    <input id="profileTopics" placeholder="如：艺考照 北京写真 演员资料" />
+                  </label>
+                </div>
+                <label class="plain-field">
+                  <span>账号补充说明</span>
+                  <textarea id="profileNotes" rows="2" placeholder="手动说明账号服务对象、语气、不能写什么等"></textarea>
+                </label>
+                <div id="profileBox" class="empty profile-box">尚未生成。生成后文案会按账号定位/赛道/受众自动定制（约需 1-2 分钟）。</div>
+              </div>
+
+              <div class="setting-group">
+                <div class="setting-label">话题模板管理（每行一个）</div>
+                <textarea id="topicTemplates" rows="3" placeholder="演员资料&#10;艺考录制"></textarea>
+              </div>
+
+              <div class="setting-group">
+                <div class="setting-label">发布时间段（软件在区间内随机挑时间）</div>
+                <div id="scheduleWindowList" class="sw-list"></div>
+                <button id="addWindowBtn" class="mini-text ghost" type="button">+ 添加时间段</button>
+              </div>
+            </section>
+          </div>
+        </div>
+
+        <!-- ---------- 笔记记录视图 ---------- -->
+        <div id="pageRecords" style="display:none">
+          <section class="card">
+            <div class="card-head">
+              <h2 class="block-title">笔记记录</h2>
+              <button id="refreshHistoryBtn" class="ghost" type="button">刷新</button>
+            </div>
+            <div id="historyList" class="history-grid"></div>
+          </section>
+        </div>
+
+        <!-- ---------- 后台设置视图 ---------- -->
+        <div id="pageSettings" style="display:none">
+          <section class="card">
+            <div class="card-head">
+              <h2 class="block-title">后台设置</h2>
+              <button id="saveConfigBtn" class="primary" type="button">保存设置</button>
+            </div>
+
+            <label class="plain-field">
+              <span>素材根目录（自动递归识别年份 / 月份 / 发布子文件夹）</span>
+              <input id="rootPath" placeholder="选择素材文件夹路径" />
+            </label>
+
+            <div class="setting-group">
+              <div class="setting-label">文案 AI（DeepSeek）</div>
+              <div class="two-cols">
+                <label class="plain-field">
+                  <span>模型</span>
+                  <select id="deepseekModel">
+                    <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+                    <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                  </select>
+                </label>
+                <label class="plain-field">
+                  <span>API Key</span>
+                  <input id="deepseekKey" type="password" placeholder="已保存则可留空" />
+                </label>
+              </div>
+              <label class="plain-field">
+                <span>文案策略</span>
+                <select id="copyEngineSelect">
+                  <option value="auto">自动：AI 优先，失败用模板</option>
+                  <option value="local">本地模板</option>
+                  <option value="anthropic">Anthropic 兼容接口</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="setting-group">
+              <div class="setting-label">AI 封面 / 图生图平台密钥</div>
+              <p class="muted explain">平台、模型、分辨率在发布页右侧「封面效果预览」中选择；密钥与接入地址在此配置一次。</p>
+              <div class="key-grid">
+                <label class="plain-field">
+                  <span>API易 接入地址</span>
+                  <input id="apiyiBase" placeholder="https://api.xxx.com/v1" />
+                </label>
+                <label class="plain-field">
+                  <span>API易 Key</span>
+                  <input id="apiyiKey" type="password" placeholder="NanoBanana / GPT Image 可用" />
+                </label>
+                <label class="plain-field">
+                  <span>OAIHK 接入地址</span>
+                  <input id="oaihkBase" placeholder="fal / gpt-image 线路" />
+                </label>
+                <label class="plain-field">
+                  <span>OAIHK Key</span>
+                  <input id="oaihkKey" type="password" />
+                </label>
+              </div>
+            </div>
+
+            <div class="setting-group">
+              <div class="setting-label">朋友圈同步</div>
+              <div class="empty">即将支持，当前版本暂未开放。</div>
+              <input type="hidden" id="momentsTag" />
+              <button id="momentsBtn" style="display:none"></button>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <div class="resizer" id="resizerRight" data-resize="right"></div>
+
+      <!-- ========== 右栏：封面 / 水印 / LOGO / 拼图 ========== -->
+      <aside class="right-panel" id="rightPanel">
+        <div class="right-tabs">
+          <button class="right-tab active" data-rtab="cover" type="button">封面效果预览</button>
+          <button class="right-tab" data-rtab="watermark" type="button">水印预览</button>
+          <button class="right-tab" data-rtab="logo" type="button">LOGO预览</button>
+          <button class="right-tab" data-rtab="collage" type="button">封面拼图</button>
+          <div class="account-bar">
+            <button id="accountBtn" class="account-btn" type="button" title="切换账号">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 19c1.2-3.2 3.8-4.8 7-4.8s5.8 1.6 7 4.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+              <span id="accountName">账号</span>
+              <span id="accountDot" class="account-dot"></span>
+              <svg class="caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div id="accountMenu" class="account-menu" style="display:none"></div>
+          </div>
+        </div>
+
+        <div class="right-preview" id="rightPreview">
+          <img id="coverPreviewImg" class="cover-preview-img" alt="封面预览" style="display:none" />
+          <div id="previewPlaceholder" class="preview-placeholder">
+            <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="9" cy="10" r="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4 18l5-5 4 4 3-3 4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+            <p>推荐素材后，第一张图默认作为封面显示在这里</p>
+          </div>
+
+          <div id="collageEditor" class="collage-editor" style="display:none"></div>
+
+          <!-- Logo / 水印 实时预览：第一张图做底图，按图片真实比例显示 -->
+          <div id="fxPreviewBox" class="fx-preview-box" style="display:none">
+            <img id="fxBaseImg" class="fx-base" alt="" />
+            <div id="fxWatermarkLayer" class="fx-wm-layer" style="display:none"></div>
+            <img id="fxLogoLayer" class="fx-logo-layer" style="display:none" alt="" />
+            <p id="fxHint" class="fx-hint muted"></p>
+          </div>
+        </div>
+
+        <!-- 控制区：封面 AI -->
+        <div class="right-controls" data-rc="cover">
+          <div class="tpl-bar">
+            <div id="coverTplList" class="tpl-list"></div>
+            <button id="coverTplMore" class="tpl-more" type="button" title="更多模板">•••</button>
+          </div>
+          <textarea id="coverPrompt" rows="4" placeholder="输入封面修改提示词，例如：保留人物与构图，整体调成暖调胶片感…"></textarea>
+          <div class="three-rows">
+            <label class="mini-field"><span>平台</span>
+              <select id="coverPlatform">
+                <option value="apiyi">API易</option>
+                <option value="oaihk">OAIHK</option>
+              </select>
+            </label>
+            <label class="mini-field"><span>模型</span>
+              <select id="coverModel"></select>
+            </label>
+            <label class="mini-field"><span>分辨率</span>
+              <select id="coverResolution">
+                <option value="1k">1K</option>
+                <option value="2k">2K</option>
+                <option value="4k" selected>4K</option>
+              </select>
+            </label>
+          </div>
+          <button id="coverGenerateBtn" class="primary full" type="button">生成 AI 封面</button>
+          <label class="check-line small"><input type="checkbox" id="coverSaveChk" /> 保存到素材同路径（AI封面 文件夹）</label>
+        </div>
+
+        <!-- 控制区：水印 -->
+        <div class="right-controls" data-rc="watermark" style="display:none">
+          <label class="mini-field">
+            <span>水印文字（自动生成斜45°网格虚线水印）</span>
+            <input type="text" id="watermarkTextInput" placeholder="输入水印文字，如：摄影师唐唐" />
+          </label>
+          <label class="mini-field">
+            <span>网格密度 <b id="watermarkScaleVal">120%</b></span>
+            <input type="range" id="watermarkScale" min="30" max="300" value="120" />
+          </label>
+          <label class="mini-field">
+            <span>透明度 <b id="watermarkOpacityVal">40%</b></span>
+            <input type="range" id="watermarkOpacity" min="1" max="100" value="40" />
+          </label>
+          <label class="check-line small"><input type="checkbox" id="watermarkSaveChk" /> 保存到本地（原名-logo水印 文件夹）</label>
+        </div>
+
+        <!-- 控制区：LOGO -->
+        <div class="right-controls" data-rc="logo" style="display:none">
+          <label class="drop-zone" id="logoDrop">
+            <input type="file" id="logoFile" accept="image/png,image/jpeg" hidden />
+            <b>拖入或点击上传 LOGO PNG</b>
+            <span>固定叠加在每张图的指定位置</span>
+          </label>
+          <label class="mini-field">
+            <span>大小 <b id="logoScaleVal">18%</b></span>
+            <input type="range" id="logoScale" min="2" max="100" value="18" />
+          </label>
+          <label class="mini-field">
+            <span>透明度 <b id="logoOpacityVal">100%</b></span>
+            <input type="range" id="logoOpacityNew" min="5" max="100" value="100" />
+          </label>
+          <label class="mini-field">
+            <span>垂直位置 <b id="logoVPosVal">92%</b></span>
+            <input type="range" id="logoVPos" min="5" max="95" value="92" />
+          </label>
+          <label class="param">
+            <span>水平位置 <b id="logoHPosVal">92%</b></span>
+            <input type="range" id="logoHPos" min="5" max="95" value="92" />
+          </label>
+          <label class="check-line small"><input type="checkbox" id="logoSaveChk" /> 保存到本地（原名-logo水印 文件夹）</label>
+        </div>
+
+        <!-- 控制区：拼图 -->
+        <div class="right-controls" data-rc="collage" style="display:none">
+          <div class="collage-type-row">
+            <button class="collage-type-btn selected" data-ctype="2x2" type="button">2×2 四宫格</button>
+            <button class="collage-type-btn" data-ctype="3x3" type="button">3×3 九宫格</button>
+            <button id="collageAutoFillBtn" class="collage-type-btn" type="button" title="按顺序填入图片列表前 4/9 张，空格合成时白底填充">一键填入前 9 张</button>
+          </div>
+          <p class="muted explain">从左侧图片列表拖图到宫格；拖到已有宫格=替换；格子之间互拖=对调；单击选中后滚轮缩放，按住拖动调整画面。空格允许留空，合成时以白底填充。</p>
+          <button id="collageConfirmBtn" class="primary full" type="button">确认拼图（加入封面）</button>
+        </div>
+      </aside>
+    </div>
+
+    <!-- 左栏展开悬浮按钮（收起后显示） -->
+    <button id="sidebarExpand" class="sidebar-expand" type="button" style="display:none" title="展开侧边栏">
+      <svg viewBox="0 0 24 24"><path d="M10 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+
+    <!-- 底部悬浮按钮 -->
+    <div class="bottom-bar" id="bottomBar">
+      <button id="immediatePublishBtn" class="bottom-btn white" type="button">立即发布</button>
+      <button id="schedulePublishBtn" class="bottom-btn red" type="button">定时发布（入队）</button>
+    </div>
+
+    <!-- 定时入队弹窗 -->
+    <div id="scheduleDialog" class="modal" style="display:none">
+      <div class="dialog-box">
+        <h2>设置定时发布时间</h2>
+        <p class="muted dialog-hint">软件已按时间段与每日上限给出建议时间，可手动修改。</p>
+        <label class="plain-field">
+          <span>发布时间</span>
+          <input id="dialogTimeInput" type="datetime-local" />
+        </label>
+        <div class="dialog-actions">
+          <button id="dialogCancelBtn" class="ghost" type="button">取消</button>
+          <button id="dialogConfirmBtn" class="primary" type="button">确认入队，处理下一条</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 大图预览弹窗 -->
+    <div id="previewModal" class="modal" style="display:none">
+      <div class="modal-inner">
+        <div class="modal-bar">
+          <span id="previewModalName" class="muted"></span>
+          <button id="previewCloseBtn" class="ghost">关闭 ✕</button>
+        </div>
+        <img id="previewModalImg" alt="预览" />
+        <p class="muted small-hint">大图已按当前水印/LOGO 设置实时合成，正式发布效果与此一致。</p>
+      </div>
+    </div>
+
+    <div id="runLog" class="run-log">等待操作（版本 2026.11.4）。</div>
+
+    <script src="/static/app.js?v=1010q"></script>
+  </body>
+</html>
