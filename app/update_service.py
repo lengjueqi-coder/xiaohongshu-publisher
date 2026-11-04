@@ -76,18 +76,20 @@ def _release_info(release: dict[str, Any]) -> dict[str, Any]:
     }
     package = assets.get(PACKAGE_ASSET) or {}
     checksum = assets.get(CHECKSUM_ASSET) or {}
-    package_url = str(package.get("browser_download_url") or "")
-    checksum_url = str(checksum.get("browser_download_url") or "")
-    asset_prefix = f"/{GITHUB_REPOSITORY}/releases/download/"
+    package_url = str(package.get("url") or "")
+    checksum_url = str(checksum.get("url") or "")
+    asset_prefix = f"/repos/{GITHUB_REPOSITORY}/releases/assets/"
 
     def valid_asset_url(value: str) -> bool:
         parsed = urlparse(value)
         return (
             parsed.scheme == "https"
-            and parsed.hostname == "github.com"
-            and parsed.path.startswith(asset_prefix)
+            and parsed.hostname == "api.github.com"
+            and re.fullmatch(re.escape(asset_prefix) + r"\d+", parsed.path) is not None
             and not parsed.username
             and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
         )
 
     package_ready = valid_asset_url(package_url) and valid_asset_url(checksum_url)

@@ -12,7 +12,7 @@
 - 调用 `tool-eval/xiaohongshu-skills` 自动填入小红书发布页。
 - 定时发布兼容原生 `datetime-local` 和旧版文本控件，并在提交前校验页面实际保留的时间。
 
-当前版本：`2026.11.5`。自动化测试覆盖目录扫描、SQLite 队列、发布状态确认、定时控件、账号画像和更新包校验。真实小红书页面测试记录单独保留在开发机，不随公开版本发布。
+当前版本：`2026.11.6`。自动化测试覆盖目录扫描、SQLite 队列、发布状态确认、定时控件、账号画像和更新包校验。真实小红书页面测试记录单独保留在开发机，不随公开版本发布。
 
 ## 公开下载与更新
 
@@ -20,7 +20,7 @@
 - 首次安装：从 [Releases](https://github.com/lengjueqi-coder/xiaohongshu-publisher/releases/latest) 下载 `xhs-assistant-mac.zip`，解压后运行 `install.command`，再运行 `start.command`。
 - 后续更新：软件启动时会检查新版本；也可以点工作台的下载图标手动检查。点击“下载并重启”后会验证 SHA-256、保留本机数据、替换应用文件并重启服务。
 - 本仓库和 Release 是公开的，下载不需要 GitHub 账号。公开仓库不包含 `data/`、`config/`、API Key、SQLite 数据库、浏览器登录态、校准数据或发布素材。
-- 每次发布新版本时，先同步更新 `app/server.py`、`start.command` 和本节版本号，提交并推送 `main`，再推送形如 `v2026.11.5` 的版本标签。GitHub Actions 会运行测试、构建 ZIP 与 SHA-256 文件并创建 Release。旧版安装包首次升级仍需手动安装一次带更新器的版本。
+- 每次发布新版本时，先同步更新 `app/server.py`、`start.command` 和本节版本号，提交并推送 `main`，再推送形如 `v2026.11.7` 的版本标签。GitHub Actions 会运行测试、构建 ZIP 与 SHA-256 文件并创建 Release。`2026.11.6` 之前安装的版本须手动安装一次 `2026.11.6`，之后即可在软件内更新。
 
 安全边界：
 

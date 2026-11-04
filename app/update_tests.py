@@ -33,16 +33,16 @@ from tools import package_release
 
 
 REPOSITORY = "lengjueqi-coder/xiaohongshu-publisher"
-ASSET_URL = f"https://github.com/{REPOSITORY}/releases/download/v2026.11.5/xhs-assistant-mac.zip"
-CHECKSUM_URL = f"https://github.com/{REPOSITORY}/releases/download/v2026.11.5/xhs-assistant-mac.zip.sha256"
+ASSET_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/assets/123"
+CHECKSUM_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/assets/124"
 
 
 def release_payload(version: str = "v2026.11.5", include_assets: bool = True) -> dict:
     assets = []
     if include_assets:
         assets = [
-            {"name": "xhs-assistant-mac.zip", "browser_download_url": ASSET_URL},
-            {"name": "xhs-assistant-mac.zip.sha256", "browser_download_url": CHECKSUM_URL},
+            {"name": "xhs-assistant-mac.zip", "url": ASSET_URL},
+            {"name": "xhs-assistant-mac.zip.sha256", "url": CHECKSUM_URL},
         ]
     return {
         "tag_name": version,
@@ -94,7 +94,7 @@ class UpdateServiceTests(unittest.TestCase):
         with self.assertRaises(UpdateInstallError):
             validate_asset_url("https://example.com/xhs-assistant-mac.zip")
         with self.assertRaises(UpdateInstallError):
-            validate_asset_url(f"https://github.com/other/repo/releases/download/v1/{'xhs-assistant-mac.zip'}")
+            validate_asset_url("https://api.github.com/repos/other/repo/releases/assets/123")
 
 
 class UpdaterArchiveTests(unittest.TestCase):

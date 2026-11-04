@@ -25,6 +25,11 @@ GITHUB_REPOSITORY = "lengjueqi-coder/xiaohongshu-publisher"
 PACKAGE_ASSET = "xhs-assistant-mac.zip"
 MAX_PACKAGE_BYTES = 200 * 1024 * 1024
 MAX_UNPACKED_BYTES = 500 * 1024 * 1024
+ALLOWED_ASSET_HOSTS = {
+    "api.github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+}
 ALLOWED_ROOTS = {"app", "moments"}
 ALLOWED_ROOT_FILES = {
     "README.md",
@@ -55,32 +60,45 @@ def log(message: str) -> None:
 
 def validate_asset_url(url: str) -> None:
     parsed = urlparse(str(url))
-    expected_path = f"/{GITHUB_REPOSITORY}/releases/download/"
+    expected_path = f"/repos/{GITHUB_REPOSITORY}/releases/assets/"
     if (
         parsed.scheme != "https"
-        or parsed.hostname != "github.com"
-        or not parsed.path.startswith(expected_path)
+        or parsed.hostname != "api.github.com"
+        or re.fullmatch(re.escape(expected_path) + r"\d+", parsed.path) is None
         or parsed.username
         or parsed.password
+        or parsed.query
+        or parsed.fragment
     ):
-        raise UpdateInstallError("更新下载地址不是本软件的 GitHub Release 资源")
+        raise UpdateInstallError("更新下载地址不是本软件的 GitHub Release API 资产")
 
 
 def download(url: str, target: Path, max_bytes: int = MAX_PACKAGE_BYTES) -> None:
     validate_asset_url(url)
-    request = urllib.request.Request(url, headers={"User-Agent": "XHS-Publish-Assistant-Updater"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "XHS-Publish-Assistant-Updater",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
     try:
         context = ssl.create_default_context(cafile=certifi.where())
-        with urllib.request.urlopen(request, timeout=45, context=context) as response, target.open("wb") as out:
-            total = 0
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise UpdateInstallError("更新包超过允许大小")
-                out.write(chunk)
+        with urllib.request.urlopen(request, timeout=45, context=context) as response:
+            final_url = urlparse(response.geturl())
+            if final_url.scheme != "https" or final_url.hostname not in ALLOWED_ASSET_HOSTS:
+                raise UpdateInstallError("GitHub 更新资产重定向到了不受信任的主机")
+            with target.open("wb") as out:
+                total = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise UpdateInstallError("更新包超过允许大小")
+                    out.write(chunk)
     except UpdateInstallError:
         raise
     except urllib.error.HTTPError as exc:
