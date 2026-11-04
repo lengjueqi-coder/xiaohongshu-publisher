@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
@@ -16,6 +17,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 from urllib.parse import urlparse
+
+import certifi
 
 
 GITHUB_REPOSITORY = "lengjueqi-coder/xiaohongshu-publisher"
@@ -67,7 +70,8 @@ def download(url: str, target: Path, max_bytes: int = MAX_PACKAGE_BYTES) -> None
     validate_asset_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": "XHS-Publish-Assistant-Updater"})
     try:
-        with urllib.request.urlopen(request, timeout=45) as response, target.open("wb") as out:
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=45, context=context) as response, target.open("wb") as out:
             total = 0
             while True:
                 chunk = response.read(1024 * 1024)

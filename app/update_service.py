@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -10,6 +11,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+import certifi
 
 
 GITHUB_REPOSITORY = "lengjueqi-coder/xiaohongshu-publisher"
@@ -43,7 +46,8 @@ def _get_json(url: str) -> dict[str, Any]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=15, context=context) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:

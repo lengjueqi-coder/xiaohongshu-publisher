@@ -41,7 +41,7 @@ PREPARED_DIR = APP_ROOT / "data" / "prepared"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
-APP_VERSION = "2026.11.4"
+APP_VERSION = "2026.11.5"
 
 
 COPY_STYLES = {
