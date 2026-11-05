@@ -220,6 +220,11 @@ class UpdaterArchiveTests(unittest.TestCase):
 
 
 class UpdateQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.plan_patch = patch.object(server, "has_active_plans", return_value=False)
+        self.plan_patch.start()
+        self.addCleanup(self.plan_patch.stop)
+
     def test_updates_are_blocked_while_queue_is_enabled_or_submitting(self) -> None:
         with patch.object(server, "db_get_setting", return_value=True):
             self.assertIn("暂停", server.update_install_block_reason())

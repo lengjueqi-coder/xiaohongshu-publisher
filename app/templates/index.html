@@ -4,9 +4,42 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>小红书发布助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=2026.11.4" />
+    <link rel="stylesheet" href="/static/styles.css?v=2026.11.6-automation" />
+    <link rel="stylesheet" href="/static/automation.css?v=1" />
   </head>
   <body>
+    <header class="workspace-header">
+      <span class="workspace-title">小红书发布助手</span>
+      <button id="automationAlertBtn" type="button" class="ghost" hidden>有待处理提醒</button>
+      <div class="workspace-updates">
+        <button id="checkUpdatesBtn" class="update-check-btn" type="button" title="检查 GitHub 上的软件新版本" aria-controls="updateBanner">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0111.5-1L20 9M4 15l2.4 3A7 7 0 0018 17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span id="updateButtonLabel">检查更新</span>
+        </button>
+        <span id="updateStatus" class="update-status" role="status" aria-live="polite">正在读取版本…</span>
+      </div>
+      <div class="account-bar">
+        <button id="accountBtn" class="account-btn" type="button" title="切换运营账号" aria-expanded="false" aria-controls="accountMenu">
+          <span class="account-avatar" id="accountAvatar" aria-hidden="true"></span>
+          <span class="account-names"><span id="accountName" class="account-chrome">读取账号中…</span><span id="accountNickname" class="account-nickname">小红书账号待识别</span></span>
+          <span id="accountDot" class="account-dot"></span>
+          <svg class="caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div id="accountMenu" class="account-menu" style="display:none"></div>
+      </div>
+    </header>
+        <div id="updateBanner" class="update-banner" role="status" aria-live="polite" hidden>
+          <div class="update-copy">
+            <strong id="updateTitle"></strong>
+            <p id="updateNotes"></p>
+          </div>
+          <div class="update-actions">
+            <button id="installUpdateBtn" class="primary" type="button">一键更新并重启</button>
+            <button id="dismissUpdateBtn" class="icon-tool ghost" type="button" title="暂时关闭更新提示" aria-label="暂时关闭更新提示">
+              <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
     <div class="app-shell" id="appShell">
       <!-- ========== 左栏：创作服务平台导航 ========== -->
       <aside class="sidebar" id="sidebar">
@@ -42,6 +75,11 @@
             <svg viewBox="0 0 24 24"><path d="M12 3c1 3-2 4.5-2 7a2 2 0 104 0c0-1 .5-2 .5-2 2 1.5 3.5 3.5 3.5 6a4 4 0 11-8 0c0-3.5 2-5 2-8z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
             行业热点
           </button>
+          <button class="side-item" data-nav="profile" type="button">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5 21v-2a7 7 0 0114 0v2M17 4h5M19.5 1.5v5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            账号画像
+          </button>
+          <button class="side-item" data-nav="automation" type="button"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v5l3 2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>自动发布</button>
         </nav>
 
         <div class="side-foot">
@@ -56,18 +94,7 @@
 
       <!-- ========== 中栏：主工作区 ========== -->
       <main class="main-area">
-        <div id="updateBanner" class="update-banner" role="status" hidden>
-          <div class="update-copy">
-            <strong id="updateTitle"></strong>
-            <p id="updateNotes"></p>
-          </div>
-          <div class="update-actions">
-            <button id="installUpdateBtn" class="primary" type="button">下载并重启</button>
-            <button id="dismissUpdateBtn" class="icon-tool ghost" type="button" title="暂时关闭更新提示" aria-label="暂时关闭更新提示">
-              <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
-            </button>
-          </div>
-        </div>
+
 
         <!-- ---------- 发布视图 ---------- -->
         <div id="pagePublish">
@@ -132,9 +159,7 @@
                   <button id="checkLoginBtn" class="icon-tool ghost" type="button" title="检测小红书登录状态">
                     <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 20c.6-3.4 3.6-5 7-5s6.4 1.6 7 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
                   </button>
-                  <button id="checkUpdatesBtn" class="icon-tool ghost" type="button" title="检查软件更新" aria-label="检查软件更新">
-                    <svg viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 17v3h14v-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  </button>
+
                   <button id="refreshImagesBtn" class="icon-tool ghost" type="button" title="刷新缩略图（修图保存后点此）">
                     <svg viewBox="0 0 24 24"><path d="M20 11A8 8 0 006.6 6.6L4 9M4 4v5h5M4 13a8 8 0 0013.4 4.4L20 15M20 20v-5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
                   </button>
@@ -173,6 +198,7 @@
                 </div>
                 <label class="random-line"><input type="checkbox" id="randomStyleChk" /> 随机</label>
                 <button id="generateBtn" class="mini-text ghost" type="button" title="强制重新生成文案">重新生成</button>
+                <button id="polishBtn" class="mini-text ghost" type="button" title="用 AI 润色当前标题和正文">更自然</button>
               </div>
 
               <textarea id="contentInput" class="content-input" rows="9" placeholder="填写正文描述，分享你的拍摄故事…&#10;推荐素材后 5 种风格文案会自动生成，点上方风格名切换。"></textarea>
@@ -181,7 +207,7 @@
 
               <div class="editor-bar">
                 <button class="editor-tool" type="button"># 话题</button>
-                <button class="editor-tool" type="button">@ 用户</button>
+                <button class="editor-tool" id="mentionFocusBtn" type="button">@ 用户</button>
                 <button class="editor-tool" type="button">😊 表情</button>
                 <span class="char-count"><span id="contentCount">0</span>/1000</span>
               </div>
@@ -190,6 +216,7 @@
                 <span>话题（发布时自动带上 #）</span>
                 <input id="tagsInput" placeholder="用空格或逗号分隔，例如：艺考照 北京写真" />
               </label>
+              <label class="plain-field"><span>@ 用户（可选，每行：昵称|小红书用户ID）</span><textarea id="mentionsInput" rows="2" placeholder="用于准确识别同名用户，留空不艾特"></textarea></label>
               <div class="engine-line">当前文案引擎：<span id="copyEngine">本地模板</span></div>
             </section>
 
@@ -305,26 +332,6 @@
               </div>
 
               <div class="setting-group">
-                <div class="setting-label">账号画像</div>
-                <button id="genProfileBtn" class="ghost" type="button">一键生成画像</button>
-                <div class="two-cols profile-inputs">
-                  <label class="plain-field">
-                    <span>账号关键词</span>
-                    <input id="profileKeywords" placeholder="如：艺考照、演员资料照、摄影工作室" />
-                  </label>
-                  <label class="plain-field">
-                    <span>长期话题</span>
-                    <input id="profileTopics" placeholder="如：艺考照 北京写真 演员资料" />
-                  </label>
-                </div>
-                <label class="plain-field">
-                  <span>账号补充说明</span>
-                  <textarea id="profileNotes" rows="2" placeholder="手动说明账号服务对象、语气、不能写什么等"></textarea>
-                </label>
-                <div id="profileBox" class="empty profile-box">尚未生成。生成后文案会按账号定位/赛道/受众自动定制（约需 1-2 分钟）。</div>
-              </div>
-
-              <div class="setting-group">
                 <div class="setting-label">话题模板管理（每行一个）</div>
                 <textarea id="topicTemplates" rows="3" placeholder="演员资料&#10;艺考录制"></textarea>
               </div>
@@ -336,6 +343,26 @@
               </div>
             </section>
           </div>
+        </div>
+
+        <!-- ---------- 账号画像视图 ---------- -->
+        <section id="pageAutomation" style="display:none" aria-label="自动发布计划"></section>
+        <div id="pageProfile" style="display:none">
+          <section class="card account-profile-card">
+            <div class="card-head">
+              <h2 class="block-title">账号画像</h2>
+              <span class="muted">按 Chrome 用户资料独立保存</span>
+            </div>
+            <div class="profile-account-context"><span class="account-avatar" id="profileAvatar" aria-hidden="true"></span><div><strong id="profileAccountName">当前账号</strong><p id="profileAccountStatus" class="muted"></p></div></div>
+            <p class="muted explain">填写账号定位，也可结合最近 20 条笔记生成画像。生成成功后自动保存，后续 AI 文案会沿用此账号的定位。</p>
+            <div class="two-cols profile-inputs">
+              <label class="plain-field"><span>账号关键词</span><input id="profileKeywords" placeholder="如：艺考照、演员资料照、摄影工作室" /></label>
+              <label class="plain-field"><span>长期话题</span><input id="profileTopics" placeholder="如：艺考照 北京写真 演员资料" /></label>
+            </div>
+            <label class="plain-field"><span>账号补充说明</span><textarea id="profileNotes" rows="4" placeholder="手动说明账号服务对象、语气、不能写什么等"></textarea></label>
+            <div class="profile-actions"><button id="genProfileBtn" class="primary" type="button">生成并保存画像</button><span id="profileStatus" class="muted" role="status"></span></div>
+            <div id="profileBox" class="empty profile-box">尚未生成。生成后文案会按账号定位/赛道/受众自动定制（约需 1-2 分钟）。</div>
+          </section>
         </div>
 
         <!-- ---------- 笔记记录视图 ---------- -->
@@ -369,7 +396,7 @@
                   <span>模型</span>
                   <select id="deepseekModel">
                     <option value="deepseek-v4-pro">deepseek-v4-pro</option>
-                    <option value="deepseek-v4-flash">deepseek-v4-flash</option>
+                    <option value="deepseek-flash">deepseek-flash</option>
                   </select>
                 </label>
                 <label class="plain-field">
@@ -381,6 +408,7 @@
                 <span>文案策略</span>
                 <select id="copyEngineSelect">
                   <option value="auto">自动：AI 优先，失败用模板</option>
+                  <option value="deepseek">DeepSeek：失败时保留当前文案并提示</option>
                   <option value="local">本地模板</option>
                   <option value="anthropic">Anthropic 兼容接口</option>
                 </select>
@@ -393,19 +421,11 @@
               <div class="key-grid">
                 <label class="plain-field">
                   <span>API易 接入地址</span>
-                  <input id="apiyiBase" placeholder="https://api.xxx.com/v1" />
+                  <input id="apiyiBase" placeholder="https://api.apiyi.com" />
                 </label>
                 <label class="plain-field">
                   <span>API易 Key</span>
                   <input id="apiyiKey" type="password" placeholder="NanoBanana / GPT Image 可用" />
-                </label>
-                <label class="plain-field">
-                  <span>OAIHK 接入地址</span>
-                  <input id="oaihkBase" placeholder="fal / gpt-image 线路" />
-                </label>
-                <label class="plain-field">
-                  <span>OAIHK Key</span>
-                  <input id="oaihkKey" type="password" />
                 </label>
               </div>
             </div>
@@ -429,15 +449,6 @@
           <button class="right-tab" data-rtab="watermark" type="button">水印预览</button>
           <button class="right-tab" data-rtab="logo" type="button">LOGO预览</button>
           <button class="right-tab" data-rtab="collage" type="button">封面拼图</button>
-          <div class="account-bar">
-            <button id="accountBtn" class="account-btn" type="button" title="切换账号">
-              <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 19c1.2-3.2 3.8-4.8 7-4.8s5.8 1.6 7 4.8" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-              <span id="accountName">账号</span>
-              <span id="accountDot" class="account-dot"></span>
-              <svg class="caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-            <div id="accountMenu" class="account-menu" style="display:none"></div>
-          </div>
         </div>
 
         <div class="right-preview" id="rightPreview">
@@ -469,7 +480,6 @@
             <label class="mini-field"><span>平台</span>
               <select id="coverPlatform">
                 <option value="apiyi">API易</option>
-                <option value="oaihk">OAIHK</option>
               </select>
             </label>
             <label class="mini-field"><span>模型</span>
@@ -484,6 +494,7 @@
             </label>
           </div>
           <button id="coverGenerateBtn" class="primary full" type="button">生成 AI 封面</button>
+          <button id="coverSaveBtn" class="full" type="button" hidden>保存本次 AI 封面</button>
           <label class="check-line small"><input type="checkbox" id="coverSaveChk" /> 保存到素材同路径（AI封面 文件夹）</label>
         </div>
 
@@ -550,6 +561,7 @@
 
     <!-- 底部悬浮按钮 -->
     <div class="bottom-bar" id="bottomBar">
+      <button id="prefillPublishBtn" class="bottom-btn white" type="button">仅填入发布页</button>
       <button id="immediatePublishBtn" class="bottom-btn white" type="button">立即发布</button>
       <button id="schedulePublishBtn" class="bottom-btn red" type="button">定时发布（入队）</button>
     </div>
@@ -584,6 +596,7 @@
 
     <div id="runLog" class="run-log">等待操作（版本 2026.11.4）。</div>
 
-    <script src="/static/app.js?v=1010q"></script>
+    <script src="/static/app.js?v=automation1"></script>
+    <script src="/static/automation.js?v=1"></script>
   </body>
 </html>

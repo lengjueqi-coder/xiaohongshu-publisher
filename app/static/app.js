@@ -6,6 +6,7 @@ const state = {
   generated: null,
   styleCopies: {}, // 5 种风格预生成结果 { style: {title, content, tags} }
   styleLoading: {},
+  copyEpoch: 0,
   collageSelection: [],
   previewDebounce: null,
   excluded: new Set(), // 单张垃圾桶：本次发布排除
@@ -16,6 +17,12 @@ const state = {
   queueEnabled: false,
   scheduleSuggestion: "",
   activeProfile: "Default",
+  accounts: [],
+  accountBusy: false,
+  profileDrafts: new Map(),
+  profiles: new Map(),
+  profileRequests: new Set(),
+  profileLoadId: 0,
   viewedGroups: new Set(),
   logo: { enabled: false, path: "", scale: 18, opacity: 100, vpos: 92, hpos: 92 },
   watermark: { enabled: false, path: "", scale: 120, opacity: 40, tiled: true },
@@ -53,33 +60,69 @@ function setBridge(status, ok = null) {
   el.classList.toggle("bad", ok === false);
 }
 
+const UPDATE_POLL_MS = 10 * 60 * 1000;
+const UPDATE_FOCUS_MIN_MS = 2 * 60 * 1000;
+
 function renderUpdateBanner(release) {
   const banner = $("updateBanner");
   state.latestUpdate = release;
-  $("updateTitle").textContent = `发现新版本 ${release.version}`;
+  $("updateTitle").textContent = `发现新版本 ${release.version}，是否更新？`;
   $("updateNotes").textContent = release.notes || "包含软件功能和问题修复。";
   $("installUpdateBtn").disabled = !release.package_ready;
   $("installUpdateBtn").title = release.package_ready ? "下载更新并重启软件" : "此版本暂缺少完整更新包";
+  $("installUpdateBtn").textContent = release.package_ready ? "一键更新并重启" : "更新包准备中";
+  $("updateButtonLabel").textContent = "有新版本";
+  $("checkUpdatesBtn").classList.toggle("has-update", true);
+  $("updateStatus").textContent = `可更新至 ${release.version}`;
+  $("updateStatus").classList.toggle("is-error", false);
   banner.hidden = false;
 }
 
 async function checkForUpdates(silent = false) {
+  if (state.updateCheckPending) return state.updateCheckPending;
   const button = $("checkUpdatesBtn");
-  if (button) button.disabled = true;
-  try {
-    const data = await api("/api/update/check");
-    if (data.update_available) {
-      renderUpdateBanner(data.release);
-      if (!silent) log(`发现新版本 ${data.latest_version}。`);
-    } else {
-      $("updateBanner").hidden = true;
-      if (!silent) log(`当前已是最新版本 ${data.current_version}。`);
+  button.disabled = true;
+  $("updateButtonLabel").textContent = "正在检查…";
+  $("updateStatus").classList.toggle("is-error", false);
+  state.lastUpdateCheckAt = Date.now();
+  state.updateCheckPending = (async () => {
+    try {
+      const data = await api("/api/update/check");
+      if (data.update_available) {
+        renderUpdateBanner(data.release);
+        if (!silent) log(`发现新版本 ${data.latest_version}，可在顶部一键更新。`);
+      } else {
+        state.latestUpdate = null;
+        $("updateBanner").hidden = true;
+        $("updateButtonLabel").textContent = "检查更新";
+        button.classList.toggle("has-update", false);
+        $("updateStatus").textContent = `v${data.current_version} · 已是最新`;
+        if (!silent) log(`当前已是最新版本 ${data.current_version}。`);
+      }
+    } catch (error) {
+      $("updateButtonLabel").textContent = state.latestUpdate ? "有新版本" : "重试检查更新";
+      $("updateStatus").textContent = "检查失败 · 点击重试";
+      $("updateStatus").classList.toggle("is-error", true);
+      if (!silent) log(error.message);
+    } finally {
+      button.disabled = false;
     }
-  } catch (error) {
-    if (!silent) log(error.message);
-  } finally {
-    if (button) button.disabled = false;
-  }
+  })();
+  try { return await state.updateCheckPending; }
+  finally { state.updateCheckPending = null; }
+}
+
+function maybeCheckForUpdates(minInterval = UPDATE_FOCUS_MIN_MS) {
+  if (document.visibilityState === "hidden" || state.updateCheckPending) return;
+  if (Date.now() - (state.lastUpdateCheckAt || 0) >= minInterval) checkForUpdates(true);
+}
+
+function startUpdateChecks() {
+  if (state.updatePollTimer) return;
+  checkForUpdates(true);
+  state.updatePollTimer = setInterval(() => maybeCheckForUpdates(UPDATE_POLL_MS), UPDATE_POLL_MS);
+  document.addEventListener("visibilitychange", () => maybeCheckForUpdates());
+  window.addEventListener("focus", () => maybeCheckForUpdates());
 }
 
 async function waitForUpdatedServer(expectedVersion) {
@@ -121,7 +164,7 @@ async function installUpdate() {
     await waitForUpdatedServer(result.version);
   } catch (error) {
     button.disabled = false;
-    button.textContent = "下载并重启";
+    button.textContent = "一键更新并重启";
     log(error.message);
   }
 }
@@ -229,9 +272,11 @@ function currentPayload() {
     shooting_location: $("defaultLocation").value.trim(),
     publish_mode: publishMode,
     schedule_window: publishMode === "scheduled" ? $("scheduleWindow").value : "",
-    schedule_time: $("schedulePreview").value.replace(" ", "T"),
+    schedule_time: publishMode === "scheduled" ? $("schedulePreview").value.replace(" ", "T") : "",
     profile_dir: state.activeProfile || "Default",
-    original: true,
+    original: $("originalChk").checked,
+    fx_params: fxParamsFromUI(),
+    mentions: ($("mentionsInput")?.value || "").split(/\n+/).map((s) => s.trim()).filter(Boolean),
     visibility: $("visibility").value,
   };
 }
@@ -285,7 +330,11 @@ function imageUrl(path) {
 function renderRecommendation(item) {
   state.current = item;
   state.excluded = new Set();
-  state.styleCopies = {};
+  invalidateCopies();
+  ["titleInput", "contentInput", "tagsInput"].forEach(id => { $(id).value = ""; });
+  $("contentCount").textContent = "0";
+  $("copyEngine").textContent = "等待生成";
+  $("tagPreview").innerHTML = "";
   $("modelName").value = item.model_name || "";
   $("shootingDate").value = item.shooting_date || "";
   $("recommendation").className = "recommend-card collapsed";
@@ -322,41 +371,22 @@ function renderRecommendation(item) {
 }
 
 // 推荐后自动生成全部 5 种风格文案：当前风格立即应用，其余后台静默生成
+function invalidateCopies() {
+  state.copyEpoch += 1;
+  state.styleCopies = {};
+  state.styleLoading = {};
+  const button = $("generateBtn");
+  if (button) { button.disabled = false; button.textContent = "重新生成"; }
+}
+
 function prefetchAllStyles() {
-  const all = ["praise", "professional", "process", "opinion", "story"];
-  const initial = all.includes(state.style) ? state.style : "professional";
-  log("正在自动生成 5 种风格文案，你可以先检查图片与封面…");
-  document.querySelectorAll("[data-style]").forEach((b) => {
-    b.classList.remove("is-ready");
-    b.classList.add("is-loading");
-  });
-  const markReady = (style) => {
-    document.querySelectorAll(`[data-style="${style}"]`).forEach((b) => {
-      b.classList.remove("is-loading");
-      b.classList.add("is-ready");
-    });
-  };
-  let finished = 0;
-  const afterOne = (style) => {
-    markReady(style);
-    finished += 1;
-    if (finished === all.length) log("5 种风格文案已全部生成，点风格名即可切换。");
-  };
-  generateCopy(initial, { apply: true })
-    .then(() => afterOne(initial))
-    .catch((e) => log(`文案生成失败：${e.message}（可检查后台设置中的 AI Key）`));
-  all
-    .filter((s) => s !== initial)
-    .forEach((s, i) => {
-      setTimeout(() => {
-        generateCopy(s, { apply: false })
-          .then(() => afterOne(s))
-          .catch(() => markReady(s));
-      }, 500 * (i + 1));
-    });
+  // Generate the selected style only; other styles are generated when selected.
+  // This avoids five simultaneous paid requests and stale background results.
+  generateCopy(state.style, {apply:true, randomize:false}).catch((e) => log(e.message));
 }
 
 function renderThumbStrip(selected) {
+  $("imageCountTotal").textContent = `共 ${selected.filter(p => !state.excluded.has(p)).length} 张`;
   const addBtn = (pos) => `
     <button class="add-thumb" data-addpos="${pos}" type="button" title="手动指定图片/文件夹">+</button>`;
   const cells = selected
@@ -474,7 +504,7 @@ async function changeGroup() {
     log("所有素材组都看过了。可点 + 手动指定文件夹。");
     return;
   }
-  state.styleCopies = {}; // 换组后文案缓存失效
+  invalidateCopies(); // 换组后文案缓存失效
   renderRecommendation({ ...next, selected_images: next.images.slice(0, 9).sort() });
   state.viewedGroups.add(next.path);
   log(`已换组：${next.name}`);
@@ -484,7 +514,7 @@ function clearImages() {
   if (!window.confirm("确定清空全部图片吗？\n原图文件保留，仅清空本次编辑区。")) return;
   state.current = null;
   state.excluded = new Set();
-  state.styleCopies = {};
+  invalidateCopies();
   $("thumbGrid").innerHTML = "";
   $("imageCountTotal").textContent = "共 0 张";
   $("recommendation").className = "empty recommend-empty";
@@ -544,7 +574,7 @@ async function pickImagesManual() {
     if (!data.path) return;
     const folder = state.candidates.find((c) => c.path === data.path);
     if (folder) {
-      state.styleCopies = {};
+      invalidateCopies();
       renderRecommendation({ ...folder, selected_images: folder.images.slice(0, 9).sort() });
       state.viewedGroups.add(folder.path);
     } else {
@@ -552,7 +582,7 @@ async function pickImagesManual() {
       const scanData = await api("/api/scan", { root_path: data.path });
       if (scanData.items[0]) {
         const item = scanData.items[0];
-        state.styleCopies = {};
+        invalidateCopies();
         renderRecommendation({ ...item, selected_images: item.images.slice(0, 9).sort() });
       }
     }
@@ -571,17 +601,15 @@ function updateCoverPreview(path = null) {
   if (activeRightTab !== "cover") {
     img.style.display = "none";
     ph.style.display = "none";
+    updateFxPreview();
     return;
   }
-  let cover = path;
-  if (!cover && state.current) {
-    const isCollageOutput = (p) => /[/\\](四宫格_|九宫格_)/.test(p);
-    const pool = (state.current.selected_images || []).filter((p) => !state.excluded.has(p));
-    cover = pool.find((p) => !isCollageOutput(p)) || pool[0] || "";
-  }
+  const cover = path || firstUsableImage();
   if (cover) {
     img.onload = () => applyExplicitSize(img, 600); // 显示比例=原图比例
-    img.src = imageUrl(cover); // 不带时间戳，浏览器缓存直接命中不闪白
+    const draft = state.coverDraft;
+    const src = !path && draft?.group === state.current?.path && draft.source === cover ? draft.src : fxQueryParams(cover);
+    if (img.getAttribute("src") !== src) img.src = src;
     img.style.display = "";
     ph.style.display = "none";
   } else {
@@ -596,7 +624,7 @@ function updateCoverPreview(path = null) {
 function renderQueue() {
   const list = $("queueList");
   const statusClass = (status) => ({ submitted: "done", submitting: "running", reviewed_page: "running", unknown: "unknown", failed: "failed" }[status] || "ready");
-  const statusText = (status) => ({ submitted: "已提交", submitting: "提交中", reviewed_page: "页面已填入", unknown: "状态不明", failed: "失败" }[status] || "待提交");
+  const statusText = (status) => ({ submitted: "平台已接收", submitting: "提交中", reviewed_page: "页面已填入", unknown: "状态不明", failed: "失败", draft: "待审核", paused: "已暂停", cancelled: "已取消" }[status] || "待提交");
   list.innerHTML = state.queue.length
     ? state.queue
         .map(
@@ -704,19 +732,24 @@ function loadQueueItem(idx) {
   const q = state.queue[idx];
   if (!q) return;
   const p = q.payload;
-  showPage("publish");
-  state.current = { path: p.folder_path, name: p.folder_name, selected_images: p.images };
+  showView("publish");
+  const images = p.source_images || p.images || [];
+  state.current = { path: p.folder_path, name: p.folder_name, selected_images: images };
   state.excluded = new Set();
-  renderThumbStrip(p.images);
-  $("titleInput").value = p.title;
-  $("contentInput").value = p.content;
-  $("contentCount").textContent = p.content.length;
-  $("tagsInput").value = p.tags.map((t) => `#${t}`).join("");
-  $("modelName").value = p.model_name;
-  $("shootingDate").value = p.shooting_date;
-  $("defaultAlbum").value = p.album;
-  $("defaultLocation").value = p.location;
-  $("schedulePreview").value = q.schedule_time.replace("T", " ");
+  renderThumbStrip(images);
+  $("titleInput").value = p.title || "";
+  $("contentInput").value = p.content || "";
+  $("contentCount").textContent = (p.content || "").length;
+  $("tagsInput").value = (p.tags || []).map((t) => `#${t}`).join("");
+  $("modelName").value = p.model_name || "";
+  $("shootingDate").value = p.shooting_date || "";
+  $("defaultAlbum").value = p.album || "";
+  $("defaultLocation").value = p.location || "";
+  $("originalChk").checked = p.original !== false;
+  $("visibility").value = p.visibility || "仅自己可见";
+  $("publishMode").value = p.publish_mode || (q.schedule_time ? "scheduled" : "immediate");
+  $("mentionsInput").value = (p.mentions || []).join("\n");
+  $("schedulePreview").value = (q.schedule_time || "").replace("T", " ");
   state.scheduleSuggestion = "";
   updateCoverPreview();
   updateChecklist();
@@ -748,6 +781,7 @@ async function loadConfig() {
 
 async function saveConfig() {
   const payload = {
+    profile_dir: state.activeProfile,
     root_path: $("rootPath").value.trim(),
     default_album: $("defaultAlbum").value.trim(),
     default_location: $("defaultLocation").value.trim(),
@@ -758,11 +792,17 @@ async function saveConfig() {
     copy_engine: $("copyEngineSelect").value,
     deepseek_model: $("deepseekModel").value,
     moments_tag: $("momentsTag").value.trim(),
+    apiyi_base: $("apiyiBase")?.value.trim() || "",
   };
   if ($("deepseekKey").value.trim()) {
     payload.deepseek_api_key = $("deepseekKey").value.trim();
   }
+  if ($("apiyiKey")?.value.trim()) payload.apiyi_key = $("apiyiKey").value.trim();
   await api("/api/config", payload);
+  if ($("apiyiKey")) {
+    if (payload.apiyi_key) $("apiyiKey").placeholder = "已保存，留空保留当前 Key";
+    $("apiyiKey").value = "";
+  }
   refreshScheduleWindowOptions(payload.schedule_windows);
   refreshTopicTemplateOptions(payload.topic_templates);
   log("设置已保存。");
@@ -809,36 +849,77 @@ async function recommend() {
   log(`已推荐：${data.item.name}`);
 }
 
+function copyContext() {
+  return `${state.activeProfile}|${state.current?.path || state.current?.name || ""}|${state.copyEpoch}`;
+}
+
+function currentText() {
+  return JSON.stringify([$("titleInput").value, $("contentInput").value, $("tagsInput").value]);
+}
+
 async function generateCopy(style = state.style, opts = { apply: true }) {
-  if (!state.current) {
-    throw new Error("请先推荐一组素材");
+  if ($("randomStyleChk").checked && opts.apply && opts.randomize !== false) {
+    const styles = ["praise", "professional", "process", "opinion", "story"];
+    style = styles[Math.floor(Math.random() * styles.length)];
   }
+  if (!state.current) throw new Error("请先推荐一组素材");
+  if (opts.apply) state.style = style;
   if (state.styleCopies[style]) {
     if (opts.apply) applyCopy(style);
     return state.styleCopies[style];
   }
-  if (state.styleLoading[style]) throw new Error("该风格正在生成中");
-  state.styleLoading[style] = true;
-  log(`正在生成「${styleLabel(style)}」文案...`);
-  try {
+  if (state.styleLoading[style]) return state.styleLoading[style];
+  const origin = copyContext();
+  const before = currentText();
+  const button = $("generateBtn");
+  if (opts.apply && button) { button.disabled = true; button.textContent = "生成中…"; }
+  const pending = (async () => {
+    log(`正在调用文案引擎生成「${styleLabel(style)}」…`);
     const data = await api("/api/generate", {
-      style,
-      model_name: $("modelName").value.trim(),
-      folder_name: state.current.name,
-      notes: $("notes").value.trim(),
-      album: $("defaultAlbum").value.trim(),
-      location: $("defaultLocation").value.trim(),
-      copy_engine: $("copyEngineSelect").value,
-      deepseek_model: $("deepseekModel").value,
+      style, profile_dir: state.activeProfile,
+      model_name: $("modelName").value.trim(), notes: $("notes").value.trim(),
+      copy_engine: $("copyEngineSelect").value, deepseek_model: $("deepseekModel").value,
+      previous_title: $("titleInput").value,
     });
+    if (copyContext() !== origin) return null;
     state.generated = data.copy;
-    state.styleCopies[style] = { ...data.copy, _style: style };
-    if (opts.apply) applyCopy(style);
-    log(`文案已生成：${data.copy.style_label}`);
+    state.styleCopies[style] = {...data.copy, _style:style};
+    if (opts.apply && state.style === style && currentText() === before) applyCopy(style);
+    log(data.copy.warning || `文案已生成：${data.copy.engine} · ${styleLabel(style)}`);
     return data.copy;
-  } finally {
-    delete state.styleLoading[style];
+  })();
+  state.styleLoading[style] = pending;
+  try { return await pending; }
+  finally {
+    if (state.styleLoading[style] === pending) delete state.styleLoading[style];
+    if (opts.apply && button && copyContext() === origin) { button.disabled = false; button.textContent = "重新生成"; }
   }
+}
+
+async function polishCurrentCopy() {
+  if (!$("titleInput").value.trim() || !$("contentInput").value.trim()) throw new Error("请先填写当前标题和正文");
+  const origin = copyContext();
+  const before = currentText();
+  const style = state.style;
+  const button = $("polishBtn");
+  button.disabled = true; button.textContent = "润色中…";
+  try {
+    const data = await api("/api/polish", {
+      title: $("titleInput").value, content: $("contentInput").value,
+      tags: $("tagsInput").value.split(/[#\s]+/).filter(Boolean),
+      profile_dir:state.activeProfile, deepseek_model:$("deepseekModel").value, style:state.style,
+    });
+    if (copyContext() !== origin || currentText() !== before || state.style !== style) {
+      log("当前内容或账号已变化，已保留你的编辑；本次润色未覆盖。"); return;
+    }
+    state.styleCopies[state.style] = {...data.copy, _style:state.style};
+    $("titleInput").value = data.copy.title;
+    $("contentInput").value = data.copy.content;
+    $("contentCount").textContent = data.copy.content.length;
+    $("copyEngine").textContent = data.copy.engine;
+    updateChecklist();
+    log("已润色当前标题和正文；话题保持原样。");
+  } finally { button.disabled = false; button.textContent = "更自然"; }
 }
 
 function styleLabel(style) {
@@ -869,7 +950,7 @@ async function selectStyle(style) {
     applyCopy(style);
     return;
   }
-  await generateCopy(style);
+  await generateCopy(style, {apply:true, randomize:false});
 }
 
 async function checkLogin() {
@@ -884,6 +965,7 @@ async function checkLogin() {
     setBridge("需要扫码登录", false);
     log("未登录：请在小红书页面扫码登录后再试。");
   }
+  await refreshAccountLabel();
 }
 
 async function fillPublish() {
@@ -905,18 +987,35 @@ async function fillPublish() {
     $("schedulePreview").value = data.manual_fields.schedule_time.replace("T", " ");
   }
   const warnings = data.warnings?.length ? `\n提醒：${data.warnings.join("；")}` : "";
-  log(`已填入小红书发布页，历史记录 #${data.history_id}。${warnings}\n${manual}\n请在小红书页面检查后手动点击发布。`);
+  const timing = data.result?.elapsed_seconds;
+  log(`已填入小红书发布页${timing ? `，耗时 ${timing} 秒` : ""}，历史记录 #${data.history_id}。${warnings}\n${manual}\n请在小红书页面检查后手动点击发布。`);
   await refreshHistory();
+}
+
+async function loadNextQueue() {
+  await loadQueue();
+  if (!state.queue.length) { log("队列中暂无任务。"); return; }
+  state.queueIndex = (state.queueIndex + 1) % state.queue.length;
+  loadQueueItem(state.queueIndex);
+}
+
+async function publishNow() {
+  const payload = { ...currentPayload(), publish_mode: "immediate", schedule_time: "" };
+  if (!payload.title || !payload.content || !payload.images.length) throw new Error("请先确认图片、标题和正文");
+  if (!confirm(`立即发布到当前账号？\n${payload.title}\n${payload.images.length} 张图片 · ${payload.visibility}`)) return;
+  await api("/api/xhs/publish-now", payload);
+  await loadQueue();
+  log("立即发布任务已确认，后台会校验账号与设置后提交；异常时会通知你。");
 }
 
 function renderProfile(profile) {
   const box = $("profileBox");
   if (!profile) {
-    box.className = "empty";
+    box.className = "empty profile-box";
     box.textContent = "尚未生成。生成后文案会按账号定位/赛道/受众自动定制（约需 1-2 分钟）。";
     return;
   }
-  box.className = "recommend-card";
+  box.className = "recommend-card profile-box";
   const topics = (profile.topics || []).map((t) => `#${t}`).join(" ");
   box.innerHTML = `
     <strong>${escapeHtml(profile.positioning || "")}</strong>
@@ -936,35 +1035,54 @@ function renderProfile(profile) {
 }
 
 async function loadProfile() {
-  const data = await api("/api/profile");
-  state.activeProfile = data.profile_dir || state.activeProfile;
-  if (data.profile) {
-    $("profileKeywords").value = data.profile.manual_keywords || "";
-    $("profileTopics").value = data.profile.manual_topics || "";
-    $("profileNotes").value = data.profile.manual_notes || "";
-  }
-  renderProfile(data.profile);
+  const origin = state.activeProfile;
+  const requestId = ++state.profileLoadId;
+  const data = await api(`/api/profile?profile_dir=${encodeURIComponent(origin)}`);
+  if (requestId !== state.profileLoadId || origin !== state.activeProfile || data.profile_dir !== origin) return;
+  state.profiles.set(origin, data.profile || null);
+  displayProfile();
+}
+
+function profileFields() {
+  return { manual_keywords: $("profileKeywords").value, manual_topics: $("profileTopics").value, manual_notes: $("profileNotes").value };
+}
+
+function displayProfile() {
+  const origin = state.activeProfile;
+  const profile = state.profiles.get(origin);
+  const draft = state.profileDrafts.get(origin) || profile || {};
+  $("profileKeywords").value = draft.manual_keywords || "";
+  $("profileTopics").value = draft.manual_topics || "";
+  $("profileNotes").value = draft.manual_notes || "";
+  const pending = state.profileRequests.has(origin);
+  $("genProfileBtn").disabled = pending || state.accountBusy;
+  $("genProfileBtn").textContent = pending ? "生成中（约1-2分钟）…" : "生成并保存画像";
+  $("profileStatus").textContent = pending ? "正在生成，此结果将保存到当前账号" : state.profileDrafts.has(origin) ? "有未保存的修改，生成成功后保存" : profile ? "已保存，后续 AI 文案会自动使用" : "尚未生成画像";
+  renderProfile(profile);
+  if (pending) $("profileBox").textContent = "正在读取创作平台数据并生成画像…";
 }
 
 async function generateProfile() {
-  const btn = $("genProfileBtn");
-  btn.disabled = true;
-  btn.textContent = "生成中（约1-2分钟）…";
-  $("profileBox").className = "empty";
-  $("profileBox").textContent = "正在读取创作平台数据并生成画像，请勿操作浏览器…";
+  const origin = state.activeProfile;
+  if (state.profileRequests.has(origin) || state.accountBusy) return;
+  const fields = profileFields();
+  state.profileDrafts.set(origin, fields);
+  state.profileRequests.add(origin);
+  displayProfile();
   log("正在生成账号画像，需要 1-2 分钟...");
   try {
     const data = await api("/api/profile", {
       max_count: 20,
-      manual_keywords: $("profileKeywords").value.trim(),
-      manual_topics: $("profileTopics").value.trim(),
-      manual_notes: $("profileNotes").value.trim(),
+      profile_dir: origin,
+      ...fields,
     });
-    renderProfile(data.profile);
+    if (data.profile_dir !== origin) throw new Error("账号画像归属不一致，请重新加载");
+    state.profiles.set(origin, data.profile);
+    if (JSON.stringify(state.profileDrafts.get(origin)) === JSON.stringify(fields)) state.profileDrafts.delete(origin);
     log("账号画像已生成，后续文案将按画像定制。");
   } finally {
-    btn.disabled = false;
-    btn.textContent = "一键生成画像";
+    state.profileRequests.delete(origin);
+    if (state.activeProfile === origin) displayProfile();
   }
 }
 
@@ -1023,6 +1141,7 @@ function fxParamsFromUI() {
     logo_position: `${state.logo.vpos ?? 92}%,${state.logo.hpos ?? 92}%`,
     logo_margin: 3,
     logo_scale: state.logo.scale,
+    logo_opacity: state.logo.opacity,
     watermark_enabled: !!String(state.watermark.text || "").trim(),
     watermark_text: String(state.watermark.text || "").trim(),
     watermark_position: "center",
@@ -1036,8 +1155,8 @@ function fxQueryParams(path) {
   const p = fxParamsFromUI();
   const q = new URLSearchParams();
   q.set("path", path);
+  q.set("profile_dir", state.activeProfile);
   Object.entries(p).forEach(([k, v]) => q.set(k, v));
-  q.set("t", Date.now());
   return `/api/image/preview?${q.toString()}`;
 }
 
@@ -1054,7 +1173,7 @@ function closePreview() {
 
 async function saveFxSettings() {
   try {
-    await api("/api/logo/settings", fxParamsFromUI());
+    await api("/api/logo/settings", {...fxParamsFromUI(),profile_dir:state.activeProfile});
   } catch (e) {
     log(`保存 Logo/水印设置失败：${e.message}`);
   }
@@ -1099,9 +1218,10 @@ function syncFxStateFromUI() {
 function scheduleFxUpdate() {
   syncFxStateFromUI();
   updateChecklist();
-  updateFxPreview(); // 右栏水印/LOGO 预览实时联动
   clearTimeout(state.previewDebounce);
   state.previewDebounce = setTimeout(async () => {
+    if (activeRightTab === "cover") updateCoverPreview();
+    else updateFxPreview();
     await saveFxSettings();
     const current = $("previewModalImg").src;
     const match = current.match(/path=([^&]+)/);
@@ -1117,7 +1237,7 @@ function uploadOverlay(kind, input) {
   const reader = new FileReader();
   reader.onload = async () => {
     try {
-      const data = await api("/api/logo/upload", { kind, data_base64: reader.result });
+      const data = await api("/api/logo/upload", { kind, data_base64: reader.result, profile_dir:state.activeProfile });
       if (kind === "logo") {
         state.logo.enabled = true;
         state.logo.path = data.path;
@@ -1139,10 +1259,15 @@ function uploadOverlay(kind, input) {
 
 async function loadFxSettings() {
   try {
-    const data = await api("/api/logo/settings");
+    const data = await api(`/api/logo/settings?profile_dir=${encodeURIComponent(state.activeProfile)}`);
     const s = data.settings || {};
+    state.logo.enabled = !!s.logo_enabled;
+    state.logo.path = s.logo_path || "";
+    state.watermark.text = s.watermark_text || "";
+    state.watermark.path = s.watermark_path || "";
+    state.watermark.enabled = !!s.watermark_enabled;
     const setVal = (id, v) => { const el = $(id); if (el && v != null) el.value = v; };
-    if (s.logo_path) { state.logo.path = s.logo_path; state.logo.enabled = true; }
+    setVal("watermarkTextInput", state.watermark.text);
     if (s.watermark_text) {
       state.watermark.text = s.watermark_text;
       state.watermark.enabled = true;
@@ -1151,9 +1276,16 @@ async function loadFxSettings() {
       state.watermark.path = s.watermark_path; // 旧 PNG 水印仅保留路径，不再启用
     }
     state.logo.scale = s.logo_scale ?? 18;
+    state.logo.opacity = s.logo_opacity ?? 100;
+    const pos = String(s.logo_position || "").match(/^([\d.]+)%,([\d.]+)%$/);
+    const anchors = {tl:[8,8],tc:[8,50],tr:[8,92],ml:[50,8],center:[50,50],mr:[50,92],bl:[92,8],bc:[92,50],br:[92,92]};
+    [state.logo.vpos, state.logo.hpos] = pos ? [Number(pos[1]),Number(pos[2])] : (anchors[s.logo_position] || [92,92]);
     state.watermark.scale = s.watermark_scale ?? 120;
     state.watermark.opacity = s.watermark_opacity ?? 40;
     setVal("logoScale", state.logo.scale);
+    setVal("logoOpacityNew", state.logo.opacity);
+    setVal("logoVPos", state.logo.vpos);
+    setVal("logoHPos", state.logo.hpos);
     setVal("watermarkScale", state.watermark.scale);
     setVal("watermarkOpacity", state.watermark.opacity);
     syncFxStateFromUI();
@@ -1189,6 +1321,7 @@ function collageN() {
 function initCollage(type = "2x2") {
   collage.type = type;
   const n = collageN();
+  $("collageAutoFillBtn").textContent = `一键填入前 ${n*n} 张`;
   collage.cells = Array.from({ length: n * n }, () => null);
   collage.selected = -1;
   document.querySelectorAll("[data-ctype]").forEach((b) => {
@@ -1575,16 +1708,24 @@ async function confirmCollage() {
 // ---------- 视图切换 / 导航 ----------
 
 function showView(name) {
-  ["publish", "records", "settings"].forEach((v) => {
+  $("appShell").classList.toggle("automation-view", name === "automation");
+  ["publish", "records", "settings", "profile", "automation"].forEach((v) => {
     const el = $(`page${v[0].toUpperCase()}${v.slice(1)}`);
     if (el) el.style.display = v === name ? "" : "none";
   });
+  $("bottomBar").hidden = name !== "publish";
+  document.querySelectorAll("[data-nav]").forEach((el) => {
+    el.classList.toggle("active", el.dataset.nav === name);
+    if (el.dataset.nav === name) el.setAttribute("aria-current", "page");
+    else el.removeAttribute("aria-current");
+  });
   const main = document.querySelector(".main-area");
   if (main) main.scrollTop = 0;
+  if (name === "automation") window.loadAutomation?.();
 }
 
 function handleNav(target) {
-  if (target === "publish" || target === "settings" || target === "records") {
+  if (["publish", "settings", "records", "profile", "automation"].includes(target)) {
     showView(target);
   } else if (target === "follow") {
     log("「关注账号热度笔记」正在接入官方数据，当前版本先占位。");
@@ -1609,6 +1750,7 @@ function savePaneWidths() {
 function applyPaneWidths() {
   const shell = $("appShell");
   const lw = paneWidths.collapsed ? 0 : paneWidths.left;
+  shell.style.setProperty("--auto-sidebar-width", `${lw}px`);
   shell.style.gridTemplateColumns = `${lw}px ${paneWidths.collapsed ? 0 : 6}px minmax(0,1fr) 6px ${paneWidths.right}px`;
   $("resizerLeft").style.display = paneWidths.collapsed ? "none" : "";
   $("sidebarExpand").style.display = paneWidths.collapsed ? "" : "none";
@@ -1671,7 +1813,7 @@ function updatePlanBar() {
   $("dailyLimit").value = perDay;
   $("planDays").textContent = Math.ceil(total / perDay);
   $("planTotalView").textContent = total;
-  $("planProgress").textContent = Math.min(state.queue.length, total);
+  $("planProgress").textContent = Math.min(state.queue.filter(q => q.status !== "cancelled").length, total);
 }
 
 function showMedia(kind) {
@@ -1688,12 +1830,7 @@ let activeRightTab = "cover"; // 当前右栏 tab，防止预览图抢占拼图�
 // 底图=第一张图（保持真实宽高比），滑杆调整即时叠加，所见即所得
 function firstUsableImage() {
   if (!state.current) return null;
-  const isCollageOutput = (p) => /[/\\](四宫格_|九宫格_)/.test(p); // 历史拼图合成品不当预览底图
-  return (
-    (state.current.selected_images || []).find((p) => !state.excluded.has(p) && !isCollageOutput(p)) ||
-    (state.current.selected_images || []).find((p) => !state.excluded.has(p)) ||
-    null
-  );
+  return (state.current.selected_images || []).find((p) => !state.excluded.has(p)) || null;
 }
 
 // 显式计算图片显示尺寸：显示比例严格等于原图比例。
@@ -1705,7 +1842,7 @@ function applyExplicitSize(img, maxH = 560, maxWCAP = 420) {
     const nh = img.naturalHeight;
     if (!nw || !nh) return;
     const parent = img.closest(".right-preview") || img.parentElement;
-    const maxW = Math.min(Math.max(160, ((parent && parent.clientWidth) || 420) - 14), maxWCAP);
+    const maxW = Math.min(Math.max(1, ((parent && parent.clientWidth) || 420) - 14), maxWCAP);
     const k = Math.min(maxW / nw, maxH / nh); // 等比缩放，比例恒等于原图
     img.style.width = `${Math.round(nw * k)}px`;
     img.style.height = `${Math.round(nh * k)}px`;
@@ -1721,135 +1858,27 @@ function applyExplicitSize(img, maxH = 560, maxWCAP = 420) {
 }
 
 function updateFxPreview() {
-  const tab = activeRightTab;
-  if (tab !== "watermark" && tab !== "logo") return;
+  if (!["watermark", "logo"].includes(activeRightTab)) return;
+  const first = firstUsableImage();
   const box = $("fxPreviewBox");
   const base = $("fxBaseImg");
-  const wmLayer = $("fxWatermarkLayer");
-  const logoLayer = $("fxLogoLayer");
-  const hint = $("fxHint");
-  const first = firstUsableImage();
-  if (!first) {
-    box.style.display = "none";
-    return;
-  }
+  $("fxWatermarkLayer").style.display = "none";
+  $("fxLogoLayer").style.display = "none";
+  if (!first) { box.style.display = "none"; return; }
   box.style.display = "";
-  box.style.aspectRatio = ""; // 图片自适应显示，不再强制容器比例
-  if (base.dataset.src !== first) {
-    base.dataset.src = first;
-    base.onload = () => {
-      applyExplicitSize(base); // 显式像素尺寸：显示比例=原图比例，不受任何样式影响
-      log(`预览底图：${first.split("/").pop()}（${base.naturalWidth}×${base.naturalHeight}，比例 ${(base.naturalWidth / base.naturalHeight).toFixed(2)}）`);
-      updateFxPreview();
-    };
-    base.src = `${imageUrl(first)}&t=${Date.now()}`;
-  } else {
-    applyExplicitSize(base);
-  }
-  const bw = base.naturalWidth || 3;
-  const bh = base.naturalHeight || 4;
-  const short = Math.min(bw, bh);
-
-  if (tab === "watermark") {
-    logoLayer.style.display = "none";
-    const text = (state.watermark.text || "").trim();
-    const on = state.watermark.enabled && !!text;
-    wmLayer.style.display = on ? "" : "none";
-    hint.textContent = on ? "" : "输入水印文字，实时生成斜45°交叉网格虚线水印";
-    if (on) {
-      drawGridWatermarkLayer(wmLayer, base, text, state.watermark.scale, state.watermark.opacity);
-    }
-  } else {
-    wmLayer.style.display = "none";
-    const on = state.logo.enabled && !!state.logo.path;
-    logoLayer.style.display = on ? "" : "none";
-    hint.textContent = on ? "" : "上传 LOGO PNG 后，这里按第一张图实时显示位置与大小";
-    if (on) {
-      const applySize = () => {
-        // 后端规则：LOGO 短边 = 图短边 × scale%（保持 LOGO 原比例）
-        const lw = logoLayer.naturalWidth || 1;
-        const lh = logoLayer.naturalHeight || 1;
-        const target = (short * state.logo.scale) / 100;
-        const k = lw >= lh ? target / lh : target / lw;
-        logoLayer.style.width = `${((lw * k) / bw) * 100}%`;
-      };
-      if (logoLayer.dataset.src !== state.logo.path) {
-        logoLayer.dataset.src = state.logo.path;
-        logoLayer.onload = () => { applySize(); };
-        logoLayer.src = `${imageUrl(state.logo.path)}&t=${Date.now()}`;
-      } else {
-        applySize();
-      }
-      logoLayer.style.left = `${state.logo.hpos}%`;
-      logoLayer.style.top = `${state.logo.vpos}%`;
-      logoLayer.style.opacity = (state.logo.opacity ?? 100) / 100;
-    }
-  }
-}
-
-// ---------- 斜45°交叉网格虚线水印（前端预览绘制，参数映射与后端 imagefx 一致） ----------
-function drawGridWatermarkLayer(wmLayer, base, text, scalePct, opacity) {
-  const dispW = base.clientWidth || 400;
-  const dispH = base.clientHeight || 533;
-  const dpr = 2; // 2x 分辨率保证清晰
-  const canvasKey = `${text}|${scalePct}|${opacity}|${dispW}x${dispH}`;
-  if (wmLayer.dataset.key === canvasKey) return; // 参数未变不重绘
-  wmLayer.dataset.key = canvasKey;
-  const w = dispW * dpr;
-  const h = dispH * dpr;
-  const cv = document.createElement("canvas");
-  cv.width = w;
-  cv.height = h;
-  const d = cv.getContext("2d");
-  const short = Math.min(w, h);
-  const cell = Math.max(60, short * (scalePct / 100) * 0.22); // 与后端一致
-  const fontPx = Math.max(10, cell * 0.13);
-  const alpha = Math.min(100, Math.max(0, opacity)) / 100;
-  d.strokeStyle = `rgba(255,255,255,${alpha * 0.62})`; // 线比字略淡
-  d.fillStyle = `rgba(255,255,255,${alpha})`;
-  d.lineWidth = Math.max(1, cell * 0.004);
-  const dash = cell * 0.045;
-  const gap = cell * 0.032;
-  // 在旋转 -45° 的坐标系里画“水平网格 + 文字踩线”，再整体转回来：
-  // 文字基线=横线（真正踩在虚线上），文字中心=竖线，屏幕上即 45° 交叉网格
-  d.save();
-  d.translate(w / 2, h / 2);
-  d.rotate(-Math.PI / 4);
-  const L = Math.hypot(w, h) + cell * 2;
-  const half = L / 2;
-  const k0 = Math.ceil(-half / cell);
-  const k1 = Math.floor(half / cell);
-  for (let k = k0; k <= k1; k++) {
-    const c = k * cell;
-    for (let p = -half; p < half; p += dash + gap) { // 水平虚线
-      d.beginPath();
-      d.moveTo(p, c);
-      d.lineTo(Math.min(p + dash, half), c);
-      d.stroke();
-    }
-    for (let p = -half; p < half; p += dash + gap) { // 垂直虚线
-      d.beginPath();
-      d.moveTo(c, p);
-      d.lineTo(c, Math.min(p + dash, half));
-      d.stroke();
-    }
-  }
-  d.font = `300 ${fontPx}px "Hiragino Sans GB", "PingFang SC", sans-serif`; // W3 细字重
-  d.textAlign = "center";
-  d.textBaseline = "alphabetic"; // y 参数即基线 → 精确踩线
-  for (let i = k0; i <= k1; i++) {
-    for (let j = k0; j <= k1; j++) {
-      d.fillText(text, i * cell, j * cell);
-    }
-  }
-  d.restore();
-  wmLayer.style.backgroundSize = "100% 100%";
-  wmLayer.style.opacity = "1";
-  wmLayer.style.backgroundImage = `url("${cv.toDataURL("image/png")}")`;
+  box.style.aspectRatio = "";
+  const url = fxQueryParams(first);
+  if (base.getAttribute("src") !== url) {
+    $("fxHint").textContent = "正在合成实际发布效果…";
+    base.onload = () => { applyExplicitSize(base); $("fxHint").textContent = "与发布图片使用相同合成规则"; };
+    base.onerror = () => { $("fxHint").textContent = "预览加载失败，请重试"; };
+    base.src = url;
+  } else applyExplicitSize(base);
 }
 
 function switchRightTab(tab) {
   activeRightTab = tab;
+  $("rightPreview")?.classList.toggle("collage-mode", tab === "collage");
   document.querySelectorAll("[data-rtab]").forEach((b) => b.classList.toggle("active", b.dataset.rtab === tab));
   document.querySelectorAll(".right-controls").forEach((c) => {
     c.style.display = c.dataset.rc === tab ? "" : "none";
@@ -1871,9 +1900,7 @@ function switchRightTab(tab) {
   } else {
     if (collageEditor) collageEditor.style.display = "none";
     if (fxBox) fxBox.style.display = "none";
-    const hasCover = imgEl && imgEl.getAttribute("src");
-    if (imgEl) imgEl.style.display = hasCover ? "" : "none";
-    if (ph) ph.style.display = hasCover ? "none" : "";
+    updateCoverPreview();
   }
 }
 
@@ -1955,7 +1982,11 @@ function bindEvents() {
   });
 
   // 文案：AI 生成 + 风格切换
-  $("generateBtn")?.addEventListener("click", () => generateCopy().catch((e) => log(e.message)));
+  $("generateBtn")?.addEventListener("click", () => { invalidateCopies(); generateCopy().catch((e) => log(e.message)); });
+  $("polishBtn")?.addEventListener("click", () => polishCurrentCopy().catch((e) => log(e.message)));
+  ["notes", "modelName", "copyEngineSelect", "deepseekModel"].forEach((id) => {
+    $(id)?.addEventListener("change", invalidateCopies);
+  });
   document.querySelectorAll("[data-style]").forEach((btn) => {
     btn.addEventListener("click", () => selectStyle(btn.dataset.style).catch((e) => log(e.message)));
   });
@@ -1966,7 +1997,9 @@ function bindEvents() {
   });
 
   // 底栏：立即发布 / 定时入队
-  $("immediatePublishBtn").addEventListener("click", () => fillPublish().catch((e) => log(e.message)));
+  $("immediatePublishBtn").addEventListener("click", () => publishNow().catch((e) => log(e.message)));
+  $("prefillPublishBtn").addEventListener("click", () => fillPublish().catch((e) => log(e.message)));
+  $("mentionFocusBtn").addEventListener("click", () => $("mentionsInput").focus());
   $("schedulePublishBtn").addEventListener("click", () => enqueueCurrent().catch((e) => log(e.message)));
   $("nextQueueBtn").addEventListener("click", () => loadNextQueue().catch((e) => log(e.message)));
   $("startQueueBtn").addEventListener("click", () => runQueue().catch((e) => log(e.message)));
@@ -1978,10 +2011,7 @@ function bindEvents() {
 
   // 历史 / 画像
   $("refreshHistoryBtn").addEventListener("click", () => refreshHistory().catch((e) => log(e.message)));
-  $("genProfileBtn").addEventListener("click", () => generateProfile().catch((e) => {
-    renderProfile(null);
-    log(e.message);
-  }));
+  $("genProfileBtn").addEventListener("click", () => generateProfile().catch((e) => log(e.message)));
   $("momentsBtn").addEventListener("click", () => log("朋友圈同步即将支持。"));
 
   // 拼图（旧入口，阶段3替换为新编辑器）
@@ -2057,6 +2087,11 @@ function bindEvents() {
 
 async function init() {
   bindEvents();
+  startUpdateChecks();
+  ["profileKeywords", "profileTopics", "profileNotes"].forEach((id) => $(id).addEventListener("input", () => {
+    state.profileDrafts.set(state.activeProfile, profileFields());
+    $("profileStatus").textContent = "有未保存的修改，生成成功后保存";
+  }));
   initResizers();
   initCollage("2x2");
   updatePlanBar();
@@ -2067,36 +2102,87 @@ async function init() {
   await previewSchedule().catch(() => {});
   await refreshHistory();
   await loadQueue().catch((e) => log(`读取后台队列失败：${e.message}`));
-  initAccountBar();
+  await initAccountBar();
   initCoverPanel();
   log(`工作台已就绪，当前版本 ${state.config.app_version || "未知"}。`);
-  checkForUpdates(true);
 }
 
 init().catch((err) => log(err.message));
 
 // ---------- 右上角多账号（Chrome Profile 隔离，每个账号独立记住登录态） ----------
 
-function initAccountBar() {
+function closeAccountMenu() {
+  $("accountMenu").style.display = "none";
+  $("accountBtn").setAttribute("aria-expanded", "false");
+}
+
+function identityLabel(identity = {}) {
+  if (identity.status === "logged_out") return "小红书未登录";
+  return identity.nickname || "小红书账号待识别";
+}
+
+function identityStatus(identity = {}) {
+  if (identity.status === "logged_out") return "请在此 Chrome 用户资料中登录小红书";
+  if (identity.status === "unavailable") return identity.nickname ? "昵称为上次识别的缓存，请连接后刷新" : "请打开对应 Chrome 用户资料并连接 XHS Bridge 后刷新";
+  return identity.checked_at ? `上次识别：${identity.checked_at}` : "连接后点「刷新当前账号资料」读取昵称和头像";
+}
+
+function avatarHtml(identity = {}, label = "") {
+  const fallback = escapeHtml((identity.nickname || label || "账").slice(0, 1));
+  return identity.avatar ? `<img src="${escapeHtml(identity.avatar)}" alt="" referrerpolicy="no-referrer" loading="lazy" />` : fallback;
+}
+
+function bindAvatarFallback(root) {
+  root.querySelectorAll(".account-avatar img").forEach((img) => {
+    img.addEventListener("error", () => { img.parentElement.textContent = "账"; }, { once: true });
+  });
+}
+
+function renderCurrentAccount() {
+  const p = state.accounts.find((x) => x.dir === state.activeProfile);
+  const identity = p?.identity || {};
+  const label = p?.label || state.activeProfile;
+  const nickname = identityLabel(identity);
+  $("accountName").textContent = `Chrome · ${label}`;
+  $("accountNickname").textContent = nickname;
+  $("accountAvatar").innerHTML = avatarHtml(identity, label);
+  $("accountDot").classList.toggle("ok", identity.status === "verified");
+  $("accountDot").title = identityStatus(identity);
+  $("accountBtn").title = `${label} → ${nickname}\n${identityStatus(identity)}`;
+  $("profileAvatar").innerHTML = avatarHtml(identity, label);
+  $("profileAccountName").textContent = `${label} → ${nickname}`;
+  $("profileAccountStatus").textContent = identityStatus(identity);
+  bindAvatarFallback(document.querySelector(".workspace-header"));
+  bindAvatarFallback($("pageProfile"));
+}
+
+async function initAccountBar() {
   $("accountBtn").addEventListener("click", async () => {
     const menu = $("accountMenu");
     if (menu.style.display !== "none") {
-      menu.style.display = "none";
+      closeAccountMenu();
       return;
     }
     menu.style.display = "";
+    $("accountBtn").setAttribute("aria-expanded", "true");
     menu.innerHTML = '<div class="account-item muted">读取中…</div>';
     try {
       const data = await api("/api/accounts/list", {});
+      await acceptAccountList(data);
       renderAccountMenu(data);
     } catch (e) {
       menu.innerHTML = `<div class="account-item muted">${escapeHtml(e.message)}</div>`;
     }
   });
   document.addEventListener("click", (ev) => {
-    if (!ev.target.closest(".account-bar")) $("accountMenu").style.display = "none";
+    if (!ev.target.closest(".account-bar")) closeAccountMenu();
   });
-  refreshAccountLabel();
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeAccountMenu();
+  });
+  await refreshAccountLabel();
+  // Read only the connected account; never switch through profiles to populate labels.
+  refreshAccountIdentity(true);
 }
 
 function renderAccountMenu(data) {
@@ -2104,41 +2190,81 @@ function renderAccountMenu(data) {
   const rows = (data.profiles || [])
     .map((p) => {
       const active = p.dir === data.active;
+      const identity = p.identity || {};
       return `
-        <button class="account-item${active ? " is-active" : ""}" data-profile="${escapeHtml(p.dir)}" type="button">
+        <button class="account-item${active ? " is-active" : ""}" data-profile="${escapeHtml(p.dir)}" type="button" ${state.accountBusy ? "disabled" : ""} title="${escapeHtml(identityStatus(identity))}" ${active ? 'aria-current="true"' : ""}>
           <span class="account-check">${active ? "✓" : ""}</span>
-          <span class="account-label">${escapeHtml(p.label)}</span>
-          <span class="account-dir">${escapeHtml(p.dir)}</span>
+          <span class="account-avatar" aria-hidden="true">${avatarHtml(identity, p.label)}</span>
+          <span class="account-names"><span class="account-chrome">Chrome · ${escapeHtml(p.label)}</span><span class="account-nickname">${escapeHtml(identityLabel(identity))}</span></span>
+          <span class="account-dir">${identity.status === "verified" ? "已识别" : identity.nickname ? "已缓存" : ""}</span>
         </button>`;
     })
     .join("");
   menu.innerHTML = `
-    <div class="account-head">Chrome 浏览器账号（每个独立记住登录态）</div>
+    <div class="account-head">Chrome 用户资料 → 小红书运营账号</div>
     ${rows || '<div class="account-item muted">未检测到 Chrome 账号</div>'}
     <div class="account-sep"></div>
-    <button class="account-item" id="accountLogoutBtn" type="button"><span class="account-check">⏻</span><span class="account-label">退出当前账号（清登录态）</span></button>
-    <div class="account-tip">添加新账号：在 Chrome 里新建用户资料并登录小红书，然后重新打开此菜单。</div>
+    <button class="account-item" id="accountRefreshBtn" type="button" ${state.accountBusy ? "disabled" : ""}>刷新当前账号资料</button>
+    <button class="account-item" id="accountProfileBtn" type="button">管理当前账号画像</button>
+    <button class="account-item" id="accountLogoutBtn" type="button" ${state.accountBusy ? "disabled" : ""}>退出当前小红书账号（清登录态）</button>
+    <div class="account-tip">每个 Chrome 用户资料独立保存登录态。未连接的账号显示已缓存资料；在 Chrome 手动更换小红书账号后，请刷新资料。添加账号请先在 Chrome 新建用户资料并登录小红书。</div>
   `;
   menu.querySelectorAll("[data-profile]").forEach((btn) => {
-    btn.addEventListener("click", () => switchAccount(btn.dataset.profile, btn.querySelector(".account-label").textContent));
+    btn.addEventListener("click", () => switchAccount(btn.dataset.profile, state.accounts.find((p) => p.dir === btn.dataset.profile)?.label || btn.dataset.profile));
   });
+  $("accountRefreshBtn").addEventListener("click", () => refreshAccountIdentity());
+  $("accountProfileBtn").addEventListener("click", () => { closeAccountMenu(); showView("profile"); });
   const logout = $("accountLogoutBtn");
   if (logout) logout.addEventListener("click", logoutAccount);
+  bindAvatarFallback(menu);
+}
+
+async function acceptAccountList(data) {
+  const changed = data.active && data.active !== state.activeProfile;
+  state.accounts = data.profiles || [];
+  state.activeProfile = data.active || state.activeProfile;
+  renderCurrentAccount();
+  if (changed) {
+    invalidateCopies();
+    displayProfile();
+    await loadConfig();
+    await loadFxSettings();
+    await loadProfile();
+    window.loadAutomation?.();
+  }
 }
 
 async function refreshAccountLabel() {
+  const data = await api("/api/accounts/list", {});
+  await acceptAccountList(data);
+  return data;
+}
+
+async function refreshAccountIdentity(silent = false) {
+  if (state.accountBusy) return;
+  state.accountBusy = true;
+  displayProfile();
+  if (!silent) log("正在读取当前连接的小红书昵称和头像…");
+  renderAccountMenu({ profiles: state.accounts, active: state.activeProfile });
   try {
-    const data = await api("/api/accounts/list", {});
-    state.activeProfile = data.active || state.activeProfile;
-    const p = (data.profiles || []).find((x) => x.dir === data.active) || (data.profiles || [])[0];
-    $("accountName").textContent = p ? p.label : "账号";
-  } catch {
-    /* 静默 */
+    const data = await api("/api/accounts/refresh", { profile: state.activeProfile });
+    await refreshAccountLabel();
+    if (!silent) log(data.identity?.status === "verified" ? `已识别小红书账号：${data.identity.nickname}` : data.identity?.error || "当前小红书账号未登录");
+  } catch (e) {
+    if (!silent) log(`账号资料刷新失败：${e.message}`);
+  } finally {
+    state.accountBusy = false;
+    displayProfile();
+    renderAccountMenu({ profiles: state.accounts, active: state.activeProfile });
   }
 }
 
 async function switchAccount(profileDir, label) {
-  $("accountMenu").style.display = "none";
+  if (state.accountBusy) return;
+  closeAccountMenu();
+  if (profileDir === state.activeProfile) return;
+  state.accountBusy = true;
+  displayProfile();
   setBridge("切换中：正在重启浏览器…", null);
   log(`正在切换到账号「${label}」：Chrome 将自动重启，约 10-30 秒…`);
   try {
@@ -2150,53 +2276,67 @@ async function switchAccount(profileDir, label) {
       setBridge("扩展未连接", false);
       log(`已切到「${label}」，但该浏览器账号未连上扩展：请确认该 Chrome 用户资料已安装并启用 XHS Bridge 扩展。`);
     }
-    $("accountName").textContent = label;
-    state.activeProfile = profileDir;
-    await loadProfile().catch(() => renderProfile(null));
+    await refreshAccountLabel();
   } catch (e) {
     setBridge("切换失败", false);
     log(`切换账号失败：${e.message}`);
+    await refreshAccountLabel().catch(() => {});
+  } finally {
+    state.accountBusy = false;
+    displayProfile();
   }
 }
 
 async function logoutAccount() {
+  if (state.accountBusy) return;
   if (!confirm("确定退出当前账号？将清除这个浏览器账号的小红书登录状态（其他账号不受影响）。")) return;
-  $("accountMenu").style.display = "none";
+  closeAccountMenu();
+  state.accountBusy = true;
   try {
     await api("/api/accounts/logout", {});
+    await refreshAccountLabel();
     log("已退出当前账号并清除其登录状态。");
   } catch (e) {
     log(`退出失败：${e.message}`);
+  } finally {
+    state.accountBusy = false;
   }
 }
 
-// ---------- AI 封面（API易图生图，配置预填自样片工厂） ----------
+// ---------- AI 封面（API易原生图生图；接入信息保存于本机） ----------
 
 function initCoverPanel() {
   loadCoverConfig();
   $("coverGenerateBtn").addEventListener("click", generateCover);
+  $("coverSaveBtn").addEventListener("click", () => {
+    if (state.coverResult) saveCover(state.coverResult.data, state.coverResult.target);
+  });
 }
 
 async function loadCoverConfig() {
   try {
     const cfg = await api("/api/cover/config", {});
+    $("coverPlatform").innerHTML = cfg.platforms
+      .map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`).join("");
     const modelSel = $("coverModel");
+    const previousModel = modelSel.value;
+    const previousResolution = $("coverResolution").value;
     modelSel.innerHTML = cfg.models
-      .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`)
-      .join("");
-    modelSel.value = cfg.default_model || cfg.models[0]?.id || "";
-    const model = cfg.models.find((m) => m.id === modelSel.value);
-    if (model) $("coverResolution").value = model.default_resolution;
-    modelSel.addEventListener("change", () => {
-      const m = cfg.models.find((x) => x.id === modelSel.value);
-      if (m) $("coverResolution").innerHTML = m.resolutions
-        .map((r) => `<option value="${r}"${r === m.default_resolution ? " selected" : ""}>${r.toUpperCase()}</option>`)
-        .join("");
-    });
+      .map((m) => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.label)}</option>`).join("");
+    modelSel.value = cfg.models.some((m) => m.id === previousModel)
+      ? previousModel : cfg.default_model || cfg.models[0]?.id || "";
+    const updateResolutions = (preferred) => {
+      const model = cfg.models.find((m) => m.id === modelSel.value);
+      if (!model) return;
+      $("coverResolution").innerHTML = model.resolutions
+        .map((r) => `<option value="${r}">${r.toUpperCase()}</option>`).join("");
+      $("coverResolution").value = model.resolutions.includes(preferred) ? preferred : model.default_resolution;
+    };
+    updateResolutions(previousResolution);
+    modelSel.onchange = () => updateResolutions("");
     renderCoverTemplates(cfg.templates || []);
-    // 后台设置显示已预填的接入信息
     if ($("apiyiBase")) $("apiyiBase").value = cfg.base_url || "";
-    if ($("apiyiKey")) $("apiyiKey").placeholder = cfg.key_ready ? `已预填（${cfg.key_masked}），无需修改` : "未配置";
+    if ($("apiyiKey")) $("apiyiKey").placeholder = cfg.key_ready ? "已保存，留空保留当前 Key" : "请填入 API易 Key 并保存";
   } catch (e) {
     log(`AI 封面配置加载失败：${e.message}`);
   }
@@ -2225,42 +2365,45 @@ function renderCoverTemplates(templates) {
   });
 }
 
+function coverTargetIsCurrent(target) {
+  return state.current?.path === target.group && state.activeProfile === target.profile;
+}
+
 async function generateCover() {
   const prompt = $("coverPrompt").value.trim();
-  if (!prompt) {
-    log("请先输入或点选一个封面提示词。");
-    return;
-  }
+  if (!prompt) { log("请先输入或点选一个封面提示词。"); return; }
   const ref = firstUsableImage();
-  if (!ref) {
-    log("请先在中间列表选择素材（需要一张参考图）。");
-    return;
-  }
+  if (!ref || !state.current?.path) { log("请先选择一组素材和参考图。"); return; }
+  const target = {group: state.current.path, profile: state.activeProfile, source: ref};
+  const autoSave = $("coverSaveChk").checked;
   const btn = $("coverGenerateBtn");
+  if (btn.disabled) return;
   btn.disabled = true;
-  btn.textContent = "生成中，约 20-60 秒…";
-  log("AI 封面生成中（模型 " + $("coverModel").value + " / " + $("coverResolution").value.toUpperCase() + "）…");
+  btn.textContent = "正在生成，4K 可能需要数分钟…";
+  log("AI 封面生成中（" + $("coverModel").value + " / " + $("coverResolution").value.toUpperCase() + "），请勿重复点击。");
   try {
     const data = await api("/api/cover/generate", {
-      image_path: ref,
-      prompt,
-      model: $("coverModel").value,
-      resolution: $("coverResolution").value,
-      aspect_ratio: "3:4",
+      platform: $("coverPlatform").value,
+      image_path: ref, prompt, model: $("coverModel").value,
+      resolution: $("coverResolution").value, aspect_ratio: "3:4",
     });
-    const dataUri = `data:${data.mime};base64,${data.b64}`;
-    const img = $("coverPreviewImg");
-    img.onload = null;
-    img.src = dataUri; // 预览 AI 结果（不覆盖素材）
-    img.style.display = "";
-    $("previewPlaceholder").style.display = "none";
-    img.style.width = "";
-    img.style.height = "";
-    img.style.maxWidth = "100%";
-    img.style.maxHeight = "600px";
-    img.style.objectFit = "contain";
-    log(`AI 封面已生成（${data.elapsed_sec}s）。${$("coverSaveChk").checked ? "正在保存…" : "勾选「保存到素材同路径」后重新生成即可保存；或点下方保存。"}`);
-    if ($("coverSaveChk").checked) await saveCover(data);
+    state.coverResult = {data, target};
+    $("coverSaveBtn").hidden = false;
+    $("coverSaveBtn").disabled = false;
+    $("coverSaveBtn").textContent = "保存本次 AI 封面";
+    if (coverTargetIsCurrent(target) && firstUsableImage() === ref) {
+      const dataUri = `data:${data.mime};base64,${data.b64}`;
+      const img = $("coverPreviewImg");
+      state.coverDraft = {group: target.group, source: ref, src: dataUri};
+      img.onload = () => applyExplicitSize(img, 600);
+      img.src = dataUri;
+      img.style.display = "";
+      $("previewPlaceholder").style.display = "none";
+      log(`AI 封面已生成（${data.elapsed_sec}s，${data.width}×${data.height}）。可直接保存本次结果。`);
+    } else {
+      log("AI 封面已生成；你已切换素材或账号，可点击保存本次结果到原素材文件夹。");
+    }
+    if (autoSave) await saveCover(data, target);
   } catch (e) {
     log(`AI 封面生成失败：${e.message}`);
   } finally {
@@ -2269,24 +2412,27 @@ async function generateCover() {
   }
 }
 
-async function saveCover(data) {
-  if (!state.current?.path) return;
-  const ts = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  const stamp = `${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}`;
-  const folder = `${state.current.path}/AI封面`;
+async function saveCover(data, target) {
+  if (!target?.group) return;
+  const btn = $("coverSaveBtn");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   try {
     const result = await api("/api/save-generated", {
       data_base64: `data:${data.mime};base64,${data.b64}`,
-      folder,
-      filename: `AI封面_${stamp}.jpg`,
+      folder: `${target.group}/AI封面`, filename: `AI封面_${stamp}.${data.mime === "image/png" ? "png" : data.mime === "image/webp" ? "webp" : "jpg"}`,
     });
-    state.current.selected_images.unshift(result.path); // 插入第一张
-    $("imageCountTotal").textContent = `共 ${state.current.selected_images.length} 张`;
-    renderThumbStrip(state.current.selected_images);
-    updateCoverPreview(result.path);
-    log(`已保存并设为封面：${result.path}`);
+    if (coverTargetIsCurrent(target)) {
+      state.current.selected_images.unshift(result.path);
+      $("imageCountTotal").textContent = `共 ${state.current.selected_images.length} 张`;
+      renderThumbStrip(state.current.selected_images);
+      updateCoverPreview(result.path);
+    }
+    btn.textContent = "本次 AI 封面已保存";
+    log(`AI 封面已保存：${result.path}`);
   } catch (e) {
-    log(`保存 AI 封面失败：${e.message}`);
+    btn.disabled = false;
+    log(`保存 AI 封面失败：${e.message}。本次生成结果仍保留，可再次点击保存。`);
   }
 }

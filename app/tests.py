@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import server
+from account_identity import IdentityUnavailable, normalize_identity, safe_avatar_url
 from server import (
     choose_image_group,
     content_warnings,
@@ -225,6 +226,60 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(result["profile"]["source_error"], "未登录")
         self.assertIn("演员资料照 摄影工作室", captured["prompt"])
 
+    def test_account_identity_isolated_and_disconnect_preserves_cache(self) -> None:
+        server.db_set_setting("active_chrome_profile", "Default")
+        saved = {"nickname": "摄影师唐唐", "avatar": "https://sns-avatar-qc.xhscdn.com/a.jpg", "status": "verified"}
+        server.db_set_setting("account_identity:Default", saved)
+        server.db_set_setting("account_identity:Profile 1", {"nickname": "其他账号"})
+        with patch.object(server, "read_connected_identity", side_effect=IdentityUnavailable("扩展未连接")):
+            result = server.refresh_account_identity("Default")
+        self.assertEqual(result["identity"]["nickname"], "摄影师唐唐")
+        self.assertEqual(result["identity"]["status"], "unavailable")
+        self.assertEqual(server.account_identity("Profile 1")["nickname"], "其他账号")
+        with self.assertRaises(server.PublishError):
+            server.refresh_account_identity("Profile 1")
+        server.clear_account_identity("Default")
+        self.assertEqual(server.account_identity("Default")["nickname"], "")
+        self.assertEqual(server.account_identity("Default")["status"], "logged_out")
+        self.assertEqual(server.account_identity("Profile 1")["nickname"], "其他账号")
+
+    def test_account_list_returns_cached_identity_without_browser_reads(self) -> None:
+        server.db_set_setting("account_identity:Default", {"nickname": "摄影师唐唐"})
+        with patch.object(server, "chrome_profiles", return_value=[{"dir": "Default", "label": "崛起"}]), patch.object(server, "read_connected_identity") as reader, patch.object(server, "BROWSER_LOCK") as browser_lock:
+            result = server.account_list()
+        reader.assert_not_called()
+        browser_lock.__enter__.assert_not_called()
+        self.assertEqual(result["profiles"][0]["identity"]["nickname"], "摄影师唐唐")
+
+    def test_identity_accepts_only_signed_in_account_and_safe_avatar(self) -> None:
+        self.assertEqual(safe_avatar_url("//sns-avatar-qc.xhscdn.com/a.jpg"), "https://sns-avatar-qc.xhscdn.com/a.jpg")
+        for url in ("javascript:alert(1)", "https://xhscdn.com.evil.test/a", "http://xhscdn.com/a", "https://user:pass@xhscdn.com/a", "https://[bad"):
+            self.assertEqual(safe_avatar_url(url), "")
+        with self.assertRaises(IdentityUnavailable):
+            normalize_identity({"nickname": "被访问的作者", "logged_in": None})
+        identity = normalize_identity({"logged_in": True, "nickname": "摄影师唐唐", "avatar": "https://evil.test/a"})
+        self.assertEqual(identity["avatar"], "")
+        self.assertEqual(normalize_identity({"logged_in": False, "nickname": "旧账号"})["nickname"], "")
+
+    def test_profile_generation_saved_to_origin_when_account_changes_during_ai(self) -> None:
+        server.db_set_setting("active_chrome_profile", "Default")
+        def ai_changes_account(*_args, **_kwargs):
+            server.db_set_setting("active_chrome_profile", "Profile 1")
+            return {"positioning": "摄影工作室", "topics": []}
+        with patch.object(server, "run_xhs_cli", return_value={"ok": False, "stderr": "未连接"}), patch.object(server, "call_deepseek_json", side_effect=ai_changes_account):
+            result = server.generate_account_profile(manual_keywords="摄影", expected_profile="Default")
+        self.assertEqual(result["profile_dir"], "Default")
+        self.assertEqual(server.get_account_profile("Default")["positioning"], "摄影工作室")
+        self.assertIsNone(server.get_account_profile("Profile 1"))
+
+    def test_profile_generation_rejects_stale_account_before_browser_or_ai(self) -> None:
+        server.db_set_setting("active_chrome_profile", "Profile 1")
+        with patch.object(server, "run_xhs_cli") as browser, patch.object(server, "call_deepseek_json") as ai:
+            with self.assertRaises(server.PublishError):
+                server.generate_account_profile(manual_keywords="摄影", expected_profile="Default")
+        browser.assert_not_called()
+        ai.assert_not_called()
+
     def test_init_db_marks_inflight_jobs_unknown_and_pauses_queue(self) -> None:
         job = server.enqueue_job(
             {
@@ -276,7 +331,7 @@ class AssistantTests(unittest.TestCase):
         self.assertTrue(clicked["uncertain"])
         self.assertEqual(server.history_rows(1)[0]["status"], "unknown")
 
-    def test_click_publish_marks_published_after_platform_confirmation(self) -> None:
+    def test_click_publish_marks_accepted_after_platform_confirmation(self) -> None:
         payload = {
             "folder_path": "/tmp/A",
             "folder_name": "A",
@@ -298,7 +353,7 @@ class AssistantTests(unittest.TestCase):
         ):
             clicked = server.click_publish(history_id)
         self.assertTrue(clicked["ok"])
-        self.assertEqual(server.history_rows(1)[0]["status"], "published")
+        self.assertEqual(server.history_rows(1)[0]["status"], "accepted")
 
     def test_queue_processes_private_batch_serially_after_platform_confirmation(self) -> None:
         from PIL import Image
@@ -352,7 +407,7 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual([job["status"] for job in jobs], ["submitted", "submitted", "submitted"])
         history = server.history_rows(10)
         self.assertEqual(len(history), 3)
-        self.assertTrue(all(row["status"] == "published" for row in history))
+        self.assertTrue(all(row["status"] == "scheduled" for row in history))
         self.assertTrue(all(row["visibility"] == "仅自己可见" for row in history))
         self.assertEqual(calls, ["fill-publish", "click-publish"] * 3)
 

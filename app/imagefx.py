@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import os
 import re
 import shutil
+import json
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,7 +49,9 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "logo_position": "br",
     "logo_margin": 3,      # 相对短边百分比
     "logo_scale": 18,      # 相对短边百分比
+    "logo_opacity": 100,
     "watermark_enabled": False,
+    "watermark_text": "",
     "watermark_path": "",
     "watermark_position": "center",
     "watermark_opacity": 40,
@@ -88,8 +93,8 @@ def _paste_at(base: Image.Image, overlay: Image.Image, position: str, margin_px:
     # 自由坐标："垂直%,水平%"（中心点百分比），来自预览滑杆，保证所见即所得
     m = re.match(r"^\s*([\d.]+)\s*%\s*,\s*([\d.]+)\s*%\s*$", str(position))
     if m:
-        fx = _clamp(float(m.group(1)), 0, 100) / 100
-        fy = _clamp(float(m.group(2)), 0, 100) / 100
+        fy = _clamp(float(m.group(1)), 0, 100) / 100
+        fx = _clamp(float(m.group(2)), 0, 100) / 100
         x, y = int(bw * fx - ow / 2), int(bh * fy - oh / 2)
         base.paste(overlay, (x, y), overlay)
         return
@@ -197,7 +202,9 @@ def draw_text_grid_watermark(base: Image.Image, text: str, scale_pct: float, opa
             x = (u - v) / math.sqrt(2)
             y = (u + v) / math.sqrt(2)
             if -step <= x <= w + step and -step <= y <= h + step:
-                layer.paste(text_img, (int(x - rw / 2), int(y - rh / 2)), text_img)
+                # Source-over preserves white RGB; masked paste on transparent
+                # black premultiplied the color and applied alpha a second time.
+                layer.alpha_composite(text_img, (int(x - rw / 2), int(y - rh / 2)))
     base.paste(layer, (0, 0), layer)
 
 
@@ -212,6 +219,7 @@ def _apply_overlays(base: Image.Image, params: dict[str, Any]) -> Image.Image:
             target = max(8, int(short_side * _clamp(float(params.get("logo_scale", 18)), 1, 100) / 100))
             ratio = target / min(logo.size)
             logo = logo.resize((max(1, int(logo.width * ratio)), max(1, int(logo.height * ratio))), Image.LANCZOS)
+            logo = _apply_watermark_alpha(logo, float(params.get("logo_opacity", 100)))
             _paste_at(base, logo, str(params.get("logo_position", "br")), margin)
 
     # 文字网格水印优先：有文字就用软件自动生成，忽略上传的 PNG
@@ -243,16 +251,27 @@ def has_overlays(params: dict[str, Any]) -> bool:
 
 def compose_one(src: Path, params: dict[str, Any], max_dim: int | None = None) -> Image.Image:
     """打开原图 → 叠 logo → 叠水印。返回 PIL Image（不落盘）。"""
-    base = Image.open(src)
+    base = ImageOps.exif_transpose(Image.open(src))
     if base.mode != "RGB":
         base = base.convert("RGB")
+    if has_overlays(params):
+        base = _apply_overlays(base, params)
+    # Render at source resolution for both preview and upload, then scale.
     if max_dim:
         base = ImageOps.contain(base, (max_dim, max_dim))
-    return _apply_overlays(base, params)
+    return base
 
 
 def render_preview(src: str | Path, params: dict[str, Any]) -> bytes:
     """合成预览：最长边 PREVIEW_MAX，JPEG bytes。预览含水印透明度实际效果。"""
+    paths = [Path(src)] + [Path(params[k]) for k in ("logo_path", "watermark_path") if params.get(k)]
+    stamps = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in paths if p.is_file())
+    return _cached_preview(str(src), json.dumps(params, sort_keys=True), stamps)
+
+
+@lru_cache(maxsize=8)
+def _cached_preview(src: str, encoded_params: str, stamps: tuple) -> bytes:
+    params = json.loads(encoded_params)
     img = compose_one(Path(src), params, max_dim=PREVIEW_MAX)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=88)
@@ -265,7 +284,8 @@ def _output_target(src: Path, mode: str, prepared_dir: Path) -> tuple[Path, bool
         return src, True
     if mode == "suffix":
         return src.with_name(f"{src.stem}-logo{src.suffix.lower() if src.suffix.lower() in ('.jpg', '.jpeg') else '.jpg'}"), False
-    return prepared_dir / f"{src.stem}-logo.jpg", False
+    source_key = hashlib.sha256(str(src.resolve()).encode()).hexdigest()[:16]
+    return prepared_dir / f"{src.stem}-{source_key}-logo.jpg", False
 
 
 def apply_for_publish(
@@ -278,9 +298,7 @@ def apply_for_publish(
         return images, ["未安装 Pillow，已跳过 logo/水印合成（pip install Pillow 后可用）"]
     if not params.get("fx_enabled"):
         return images, []
-    has_overlay = (params.get("logo_enabled") and params.get("logo_path")) or (
-        params.get("watermark_enabled") and params.get("watermark_path")
-    )
+    has_overlay = has_overlays(params)
     if not has_overlay:
         return images, []
 

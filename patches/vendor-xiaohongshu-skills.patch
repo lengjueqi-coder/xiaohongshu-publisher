@@ -28,7 +28,7 @@ index e0f2904..9fa5110 100644
    el.dispatchEvent(new Event("change", { bubbles: true }));
    return null;
  }
- 
+
 -async function cmdInputContentEditable({ selector, text }) {
 -  const el = document.querySelector(selector);
 -  if (!el) throw new Error(`元素不存在: ${selector}`);
@@ -59,7 +59,7 @@ index e0f2904..9fa5110 100644
    }
    return null;
  }
- 
+
 +async function cmdInputContentEditable({ selector, text }) {
 +  const el = document.querySelector(selector);
 +  if (!el) throw new Error(`元素不存在: ${selector}`);
@@ -82,13 +82,13 @@ index 20c459f..178800b 100644
  import os
  import sys
 +from typing import Any
- 
+
  # Windows 控制台默认编码（如 cp1252）不支持中文，强制 UTF-8
  if sys.stdout and hasattr(sys.stdout, "reconfigure"):
 @@ -436,6 +437,23 @@ def cmd_user_profile(args: argparse.Namespace) -> None:
          browser.close()
- 
- 
+
+
 +def cmd_creator_profile(args: argparse.Namespace) -> None:
 +    """读取创作平台：本账号近 N 条笔记 + 数据中心画像文本（账号画像功能的数据源）。"""
 +    from xhs.creator import get_creator_notes, get_datacenter_snapshot
@@ -134,7 +134,7 @@ index 20c459f..178800b 100644
          )
          _output({"success": True, "title": title, "images": len(image_paths), "status": "表单已填写，等待确认发布"})
 @@ -599,8 +627,8 @@ def cmd_click_publish(args: argparse.Namespace) -> None:
- 
+
      browser, page = _connect_existing(args)
      try:
 -        click_publish_button(page)
@@ -143,11 +143,11 @@ index 20c459f..178800b 100644
 +        _output({"success": True, "status": "发布完成", **confirmation})
      finally:
          browser.close()
- 
+
 @@ -781,6 +809,12 @@ def build_parser() -> argparse.ArgumentParser:
      sub.add_argument("--xsec-token", required=True)
      sub.set_defaults(func=cmd_user_profile)
- 
+
 +    # creator-profile：读创作平台本账号笔记+数据中心（账号画像数据源）
 +    sub = subparsers.add_parser("creator-profile", help="读取创作平台近 N 条笔记及数据中心画像")
 +    sub.add_argument("--max-count", type=int, default=20)
@@ -167,7 +167,7 @@ index 20c459f..178800b 100644
 +    sub.add_argument("--shooting-date", default="")
 +    sub.add_argument("--shooting-location", default="")
      sub.set_defaults(func=cmd_publish)
- 
+
      # publish-video
 @@ -841,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
      sub.add_argument("--schedule-at")
@@ -179,32 +179,32 @@ index 20c459f..178800b 100644
 +    sub.add_argument("--shooting-date", default="")
 +    sub.add_argument("--shooting-location", default="")
      sub.set_defaults(func=cmd_fill_publish)
- 
+
      # fill-publish-video
 diff --git a/scripts/xhs/publish.py b/scripts/xhs/publish.py
-index 3863d67..c83cbb4 100644
+index 3863d67..6169c81 100644
 --- a/scripts/xhs/publish.py
 +++ b/scripts/xhs/publish.py
 @@ -9,6 +9,7 @@ import re
  import time
- 
+
  from .cdp import Page
 +from .human import sleep_random
  from .errors import ContentTooLongError, PublishError, TitleTooLongError, UploadTimeoutError
  from .selectors import (
      CONTENT_EDITOR,
 @@ -75,7 +76,7 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
- 
+
      # 点击"上传图文" TAB
      _click_publish_tab(page, "上传图文")
 -    time.sleep(1)
 +    sleep_random(700, 1400)
- 
+
      # 上传图片
      _upload_images(page, content.image_paths)
 @@ -86,13 +87,18 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
          logger.warning("标签数量超过10，截取前10个")
- 
+
      logger.info(
 -        "发布内容: title=%s, images=%d, tags=%d, schedule=%s, original=%s, visibility=%s",
 +        "发布内容: title=%s, images=%d, tags=%d, schedule=%s, original=%s, visibility=%s, album=%s, location=%s, topic_template=%s, shooting_date=%s, shooting_location=%s",
@@ -220,7 +220,7 @@ index 3863d67..c83cbb4 100644
 +        content.shooting_date,
 +        content.shooting_location,
      )
- 
+
      # 填写表单（不点击发布）
 @@ -104,39 +110,105 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
          content.schedule_time,
@@ -232,8 +232,8 @@ index 3863d67..c83cbb4 100644
 +        content.shooting_date,
 +        content.shooting_location,
      )
- 
- 
+
+
 -def click_publish_button(page: Page) -> None:
 -    """点击发布按钮。
 +def _publish_page_state(page: Page, initial_url: str) -> dict:
@@ -262,16 +262,16 @@ index 3863d67..c83cbb4 100644
 +        """
 +    )
 +    return state if isinstance(state, dict) else {"url": "", "confirmed": False, "alerts": []}
-+
- 
+
 -    用文本内容精确匹配，避免点到旁边的"发布笔记"下拉按钮。
++
 +def click_publish_button(page: Page) -> dict:
 +    """触发平台真实发布事件，并等待平台确认。
 +
 +    新版创作平台的提交按钮是 closed-shadow custom element，普通 DOM 文本
 +    搜索只能找到“定时发布”开关，不能代表真正提交。因此优先派发组件公开
 +    的 ``publish`` 事件，再兼容旧版普通按钮。
- 
+
      Raises:
 -        PublishError: 点击失败。
 +        PublishError: 找不到提交控件、提交被拒绝或平台未返回确认。
@@ -344,8 +344,8 @@ index 3863d67..c83cbb4 100644
 +    raise PublishError(
 +        f"已触发发布但未收到平台确认，状态不明{(': ' + detail) if detail else ''}"
 +    )
- 
- 
+
+
  def save_as_draft(page: Page) -> None:
 @@ -156,7 +228,7 @@ def save_as_draft(page: Page) -> None:
          """
@@ -365,8 +365,8 @@ index 3863d67..c83cbb4 100644
      page.wait_dom_stable()
 -    time.sleep(2)
 +    sleep_random(1600, 2600)
- 
- 
+
+
  def _click_publish_tab(page: Page, tab_name: str) -> None:
 @@ -183,26 +255,35 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
          found = page.evaluate(
@@ -437,20 +437,20 @@ index 3863d67..c83cbb4 100644
 @@ -232,7 +309,7 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
              # 尝试移除弹窗
              _remove_pop_cover(page)
- 
+
 -        time.sleep(0.2)
 +        sleep_random(120, 260)
- 
+
      # 调试：输出页面信息
      debug_info = page.evaluate("""
 @@ -277,7 +354,7 @@ def _upload_images(page: Page, image_paths: list[str]) -> None:
- 
+
          page.set_file_input(selector, [path])
          _wait_for_upload_complete(page, i + 1)
 -        time.sleep(1)
 +        sleep_random(700, 1400)
- 
- 
+
+
  def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
 @@ -290,7 +367,7 @@ def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
          if count >= expected_count:
@@ -458,9 +458,9 @@ index 3863d67..c83cbb4 100644
              return
 -        time.sleep(0.5)
 +        sleep_random(350, 700)
- 
+
      raise UploadTimeoutError(f"第{expected_count}张图片上传超时(60s)")
- 
+
 @@ -334,6 +411,11 @@ def _fill_publish_form(
      schedule_time: str | None,
      is_original: bool,
@@ -473,27 +473,29 @@ index 3863d67..c83cbb4 100644
  ) -> None:
      """填写表单（不点击发布）。"""
      # 从正文末尾提取 hashtag 并合并到 tags
-@@ -347,24 +429,36 @@ def _fill_publish_form(
+@@ -346,25 +428,42 @@ def _fill_publish_form(
+     if title_len > 20:
          raise TitleTooLongError(str(title_len), "20")
- 
+
++    started = time.monotonic()
      page.input_text(TITLE_INPUT, title)
 -    time.sleep(0.5)
-+    sleep_random(350, 700)
++    time.sleep(0.15)
      _check_title_max_length(page)
-     logger.info("标题长度检查通过")
+-    logger.info("标题长度检查通过")
 -    time.sleep(1)
-+    sleep_random(700, 1400)
- 
++    logger.info("标题长度检查通过，填表开始")
+
      # 正文
      content_selector = _find_content_element(page)
      page.input_content_editable(content_selector, content)
- 
+
      # 回点标题（增强稳定性）
 -    time.sleep(1)
-+    sleep_random(700, 1400)
++    time.sleep(0.2)
      page.click_element(TITLE_INPUT)
      logger.info("已回点标题输入框")
- 
+
 +    # 话题模板优先使用小红书官方功能；失败时再回退到逐个输入 tags。
 +    template_applied = False
 +    if topic_template:
@@ -503,22 +505,27 @@ index 3863d67..c83cbb4 100644
 +                logger.info("已应用官方话题模板: %s", topic_template)
 +            else:
 +                logger.warning("未能应用官方话题模板，回退到逐个输入话题: %s", topic_template)
++        except PublishError:
++            raise
 +        except Exception as e:
 +            logger.warning("应用官方话题模板失败，回退到逐个输入话题: %s", e)
 +
      # 标签
--    if tags:
-+    if tags and not template_applied:
-         _input_tags(page, content_selector, tags)
+     if tags:
+-        _input_tags(page, content_selector, tags)
 -    time.sleep(1)
++        existing = page.evaluate(f"Array.from(document.querySelectorAll({json.dumps(content_selector)} + ' [data-topic], ' + {json.dumps(content_selector)} + ' a, ' + {json.dumps(content_selector)} + ' .topic')).map(e => (e.innerText || '').replace(/^#/, '').trim())") or []
++        missing = [tag for tag in tags if tag.lstrip("#") not in existing]
++        if missing:
++            _input_tags(page, content_selector, missing)
 +    sleep_random(700, 1400)
      _check_content_max_length(page)
      logger.info("正文长度检查通过")
- 
-@@ -375,6 +469,15 @@ def _fill_publish_form(
+
+@@ -375,6 +474,15 @@ def _fill_publish_form(
      # 可见范围
      _set_visibility(page, visibility)
- 
+
 +    # 专辑/合集和地点是网页端频繁改版区域；这里做 best-effort，失败只写日志，不中断核心填表。
 +    if album:
 +        _set_album_best_effort(page, album)
@@ -531,10 +538,11 @@ index 3863d67..c83cbb4 100644
      # 原创声明
      if is_original:
          try:
-@@ -383,9 +486,195 @@ def _fill_publish_form(
+@@ -383,7 +491,193 @@ def _fill_publish_form(
          except Exception as e:
              logger.warning("设置原创声明失败: %s", e)
- 
+
+-    logger.info("表单填写完成，等待确认发布")
 +    if shooting_date or shooting_location:
 +        try:
 +            _set_content_source_declaration_best_effort(page, shooting_date, shooting_location)
@@ -542,9 +550,9 @@ index 3863d67..c83cbb4 100644
 +        except Exception as e:
 +            logger.warning("设置内容来源声明失败: %s", e)
 +
-     logger.info("表单填写完成，等待确认发布")
- 
- 
++    logger.info("表单填写完成，耗时 %.1fs，等待确认发布", time.monotonic()-started)
++
++
 +def _restore_title_if_needed(page: Page, expected_title: str) -> None:
 +    """Protect title from optional-field best-effort selectors."""
 +    current = page.evaluate(
@@ -722,259 +730,205 @@ index 3863d67..c83cbb4 100644
 +        logger.info("已尝试填写地点/位置: %s", location)
 +    else:
 +        logger.warning("未找到地点/位置控件，请手动选择: %s", location)
-+
-+
+
+
  def _find_content_element(page: Page) -> str:
-     """查找内容输入框（兼容两种 UI）。"""
-     if page.has_element(CONTENT_EDITOR):
-@@ -444,7 +733,7 @@ def _check_content_max_length(page: Page) -> None:
- 
+@@ -444,7 +738,7 @@ def _check_content_max_length(page: Page) -> None:
+
  def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
      """输入标签。"""
 -    time.sleep(1)
 +    sleep_random(700, 1400)
- 
+
      # 先记录当前段落数（insertParagraph 之前），之后用于精确定位正文最后一段
      # 注意：必须在 insertParagraph 之前记录，否则 para_count_before 会包含新增的 tags 行
-@@ -470,7 +759,7 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+@@ -470,7 +764,7 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
          }})()
          """
      )
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
- 
+
      for tag in tags:
          tag = tag.lstrip("#")
-@@ -498,14 +787,14 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+@@ -498,39 +792,201 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
          }})()
          """
      )
 -    time.sleep(0.3)
 +    sleep_random(200, 450)
- 
- 
+
+
  def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
-     """输入单个标签。"""
-     # 输入 #
-     page.type_text("#", delay_ms=0)
+-    """输入单个标签。"""
+-    # 输入 #
+-    page.type_text("#", delay_ms=0)
 -    time.sleep(0.3)
-+    sleep_random(200, 450)
- 
-     # 逐字输入标签（随机间隔模拟真实输入）
-     for char in tag:
-@@ -516,7 +805,7 @@ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
-     deadline = time.monotonic() + 3.0
-     clicked = False
+-
+-    # 逐字输入标签（随机间隔模拟真实输入）
+-    for char in tag:
+-        page.type_text(char, delay_ms=0)
+-        time.sleep(random.uniform(0.05, 0.12))
+-
+-    # 等待标签联想出现（最多 3 秒）
+-    deadline = time.monotonic() + 3.0
+-    clicked = False
++    """One bridge input per topic; choose an exact suggestion, never a random first row."""
++    started = time.monotonic()
++    page.type_text("#" + tag, delay_ms=0)
++    deadline = time.monotonic() + 2.5
      while time.monotonic() < deadline:
 -        time.sleep(0.5)
-+        sleep_random(350, 700)
-         if page.has_element(TAG_TOPIC_CONTAINER):
-             item_selector = f"{TAG_TOPIC_CONTAINER} {TAG_FIRST_ITEM}"
-             if page.has_element(item_selector):
-@@ -530,7 +819,252 @@ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
-         logger.warning("未找到标签联想，直接输入空格: %s", tag)
-         page.type_text(" ", delay_ms=0)
- 
--    time.sleep(0.8)
-+    sleep_random(550, 1000)
+-        if page.has_element(TAG_TOPIC_CONTAINER):
+-            item_selector = f"{TAG_TOPIC_CONTAINER} {TAG_FIRST_ITEM}"
+-            if page.has_element(item_selector):
+-                page.click_element(item_selector)
+-                logger.info("点击标签联想: %s", tag)
+-                clicked = True
++        clicked = page.evaluate(
++            r"""(() => {
++                const wanted = WANTED;
++                const visible = e => e.getBoundingClientRect().width > 0 && getComputedStyle(e).visibility !== 'hidden';
++                const rows = Array.from(document.querySelectorAll('#creator-editor-topic-container .item')).filter(visible);
++                const row = rows.find(e => {
++                    const lines = (e.innerText || '').split(/\n/).map(t => t.trim().replace(/^#/, ''));
++                    return lines.includes(wanted);
++                });
++                if (!row) return false;
++                row.click(); return true;
++            })()""".replace("WANTED", json.dumps(tag))
++        )
++        if clicked:
++            logger.info("话题 %s 已精确选择，耗时 %.1fs", tag, time.monotonic() - started)
++            return
++        time.sleep(0.2)
++    page.type_text(" ", delay_ms=0)
++    logger.warning("话题 %s 没有精确联想，保留原话题文本，耗时 %.1fs", tag, time.monotonic() - started)
 +
 +
 +# ========== 官方话题模板 ==========
 +
++# Scope every operation to the actual template modal. Never pick the heading
++# itself or a close/apply control from elsewhere on the creator page.
++_TEMPLATE_STATE_JS = r"""(() => {
++    const action = ACTION;
++    const target = TARGET;
++    const visible = e => !!e && e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0 && getComputedStyle(e).visibility !== 'hidden';
++    const text = e => (e?.innerText || '').trim();
++    const isApply = e => ['应用','使用','使用模板'].includes(text(e)) && !Array.from(e.children).some(c => ['应用','使用','使用模板'].includes(text(c)));
++    const buttons = e => Array.from(e.querySelectorAll('button,[role="button"],a,span,div')).filter(visible).filter(isApply);
++    const known = Array.from(document.querySelectorAll('[role="dialog"],.d-modal,.d-modal-content,.d-dialog,.semi-modal,.modal,[class*="template-dialog"],[class*="template-modal"]'))
++      .filter(visible).filter(e => /话题模[板版]/.test(text(e)));
++    let modal = known.filter(e => buttons(e).length).sort((a,b) => text(a).length-text(b).length)[0] || known[0];
++    if (!modal) {
++      const headings = Array.from(document.querySelectorAll('div,span,h2,h3')).filter(visible).filter(e => /^话题模[板版]$/.test(text(e)));
++      for (const heading of headings) {
++        for (let p=heading.parentElement, depth=0; p && p!==document.body && depth<8; p=p.parentElement,depth++) {
++          if (p.querySelector('.ql-editor')) break;
++          if (buttons(p).length) { modal=p; break; }
++        }
++        if (modal) break;
++      }
++    }
++    if (!modal) return {found:false, rows:[]};
++    if (action === 'close') {
++      const close = Array.from(modal.querySelectorAll('[aria-label*="关闭"],[aria-label*="close"],button,[role="button"],[class*="close"],span,i'))
++        .filter(visible).find(e => /close|关闭/i.test((e.getAttribute('aria-label')||'')+' '+String(e.className||'')) || ['完成','关闭','收起','确定'].includes(text(e)));
++      if (close) { close.click(); return {found:true,closed:true}; }
++      return {found:true,closed:false};
++    }
++    const rows = buttons(modal).map((btn,idx) => {
++      let row=btn;
++      for (let i=0;i<6;i++) {
++        const parent=row.parentElement;
++        if (!parent || parent===modal || buttons(parent).length!==1 || text(parent).length>600) break;
++        row=parent;
++      }
++      const named = row.querySelector('[class*="title"],[class*="name"]');
++      const lines=text(row).split(/\n/).map(t=>t.trim()).filter(t=>t && !['应用','使用','使用模板'].includes(t));
++      return {idx,name:(text(named)||lines[0]||'').replace(/(?:应用|使用模板|使用)$/,'').replace(/\s+/g,''), detail:text(row),btn};
++    });
++    if (action === 'apply') {
++      const row=rows.find(r=>r.idx===target);
++      if (!row) return {found:true,applied:false};
++      row.btn.scrollIntoView({block:'center'}); row.btn.click(); return {found:true,applied:true};
++    }
++    if (action === 'scroll') {
++      const sc=[modal,...modal.querySelectorAll('*')].filter(visible).filter(e=>e.scrollHeight>e.clientHeight+10).pop();
++      const before=sc?.scrollTop;
++      if (sc) sc.scrollTop += Math.max(200,sc.clientHeight*.8);
++      return {found:true,moved:!!sc && sc.scrollTop>before};
++    }
++    return {found:true,rows:rows.map(({idx,name,detail})=>({idx,name,detail}))};
++})()"""
++
++
++def _template_state(page, action="list", target=-1):
++    return page.evaluate(_TEMPLATE_STATE_JS.replace("ACTION", json.dumps(action)).replace("TARGET", str(int(target)))) or {"found":False}
++
++
++def _pick_template(rows, name):
++    wanted = "".join(name.split())
++    exact = [r for r in rows if r["name"] == wanted]
++    if len(exact) == 1:
++        return exact[0]
++    partial = [r for r in rows if wanted in r["name"]]
++    return partial[0] if len(partial) == 1 else None
++
++
++def _close_topic_template(page):
++    if not _template_state(page).get("found"):
++        return
++    _template_state(page, "close")
++    for _ in range(8):
++        if not _template_state(page).get("found"):
++            return
++        time.sleep(0.15)
++    page.press_key("Escape")
++    for _ in range(8):
++        if not _template_state(page).get("found"):
++            return
++        time.sleep(0.15)
++    raise PublishError("话题模板弹窗未关闭，已停止填表，请关闭弹窗后重试")
++
 +
 +def _apply_topic_template_best_effort(page: Page, template_name: str) -> bool:
-+    """应用官方话题模板：打开弹窗 -> 滚动收集所有模板行 -> 精确/包含/相似度匹配 -> 点应用 -> 关弹窗。
-+
-+    用户可能只输入模板名的一部分（如"艺考"匹配"艺考录制"），按最相近的匹配。
-+    """
-+    template_name = template_name.strip()
-+    if not template_name:
++    if not template_name.strip():
 +        return False
-+
-+    if not _click_topic_template_entry(page):
-+        return False
-+    sleep_random(550, 1000)
-+
-+    # JS：收集弹窗内所有"模板行"（每行含一个 应用 按钮），给按钮打上标记并返回行名列表。
-+    js_collect = """
-+        (() => {
-+            const visible = (el) => {
-+                if (!el) return false;
-+                const r = el.getBoundingClientRect();
-+                const s = getComputedStyle(el);
-+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
-+            };
-+            const modals = Array.from(document.querySelectorAll('[role="dialog"], .d-modal, .d-dialog, .semi-modal, .modal, div, section'))
-+                .filter(visible)
-+                .filter(el => {
-+                    const t = el.innerText || '';
-+                    return t.includes('话题模板') && t.length < 3000;
-+                })
-+                .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
-+            const modal = modals[0];
-+            if (!modal) return { found: false };
-+            document.querySelectorAll('[data-tpl-btn]').forEach(el => el.removeAttribute('data-tpl-btn'));
-+            const applyTexts = ['应用', '使用', '使用模板'];
-+            const btns = Array.from(modal.querySelectorAll('button, [role="button"], a, span, div'))
-+                .filter(visible)
-+                .filter(el => {
-+                    const t = (el.innerText || '').trim();
-+                    return applyTexts.includes(t);
-+                });
-+            const rows = [];
-+            btns.forEach((btn, idx) => {
-+                let row = btn;
-+                for (let i = 0; i < 5; i++) {
-+                    const parent = row.parentElement;
-+                    if (!parent || parent === modal) break;
-+                    const t = (parent.innerText || '').trim();
-+                    if (t && t.length < 120 && applyTexts.some(a => t.includes(a))) { row = parent; continue; }
-+                    break;
-+                }
-+                const name = (row.innerText || '')
-+                    .replace(/应用|使用模板|使用/g, '')
-+                    .replace(/\\s+/g, '')
-+                    .trim();
-+                if (!name) return;
-+                btn.setAttribute('data-tpl-btn', String(idx));
-+                rows.push({ idx, name });
-+            });
-+            const scrollers = [modal, ...Array.from(modal.querySelectorAll('*'))]
-+                .filter(visible)
-+                .filter(el => el.scrollHeight > el.clientHeight + 40);
-+            return { found: true, rows, scrollable: scrollers.length > 0 };
-+        })()
-+    """
-+
-+    def pick_best(rows: list[dict]) -> dict | None:
-+        import difflib
-+
-+        wanted = "".join(template_name.split())
-+        best: dict | None = None
-+        best_score = 0.0
-+        for r in rows:
-+            name = r["name"]
-+            if name == wanted:
-+                score = 1.0
-+            elif name in wanted or wanted in name:
-+                score = 0.8
-+            else:
-+                score = difflib.SequenceMatcher(None, name, wanted).ratio()
-+            if score > best_score:
-+                best_score = score
-+                best = r
-+        if best and best_score >= 0.45:
-+            return best
-+        return None
-+
-+    found: dict | None = None
-+    scrollable = False
-+    for _attempt in range(14):
-+        state = page.evaluate(js_collect)
-+        if not state.get("found"):
-+            logger.warning("话题模板弹窗未找到")
++    started = time.monotonic()
++    try:
++        if not _click_topic_template_entry(page):
 +            return False
-+        found = pick_best(state.get("rows") or [])
-+        if found:
-+            break
-+        scrollable = bool(state.get("scrollable"))
-+        if not scrollable:
-+            break
-+        moved = page.evaluate(
-+            """
-+            (() => {
-+                const visible = (el) => {
-+                    if (!el) return false;
-+                    const r = el.getBoundingClientRect();
-+                    const s = getComputedStyle(el);
-+                    return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
-+                };
-+                const modal = Array.from(document.querySelectorAll('div, section'))
-+                    .filter(visible)
-+                    .filter(el => {
-+                        const t = el.innerText || '';
-+                        return t.includes('话题模板') && t.length < 3000;
-+                    })
-+                    .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
-+                if (!modal) return false;
-+                const scrollers = [modal, ...Array.from(modal.querySelectorAll('*'))]
-+                    .filter(visible)
-+                    .filter(el => el.scrollHeight > el.clientHeight + 40);
-+                const sc = scrollers[scrollers.length - 1];
-+                if (!sc) return false;
-+                const before = sc.scrollTop;
-+                sc.scrollTop = before + 240;
-+                return Math.abs(sc.scrollTop - before) > 2;
-+            })()
-+            """
-+        )
-+        if not moved:
-+            break
-+        sleep_random(200, 450)
-+
-+    if not found:
-+        logger.warning("话题模板中未找到与 %r 相近的模板，跳过（正文话题已由 AI 生成）", template_name)
++        deadline = time.monotonic() + 4
++        while time.monotonic() < deadline:
++            state = _template_state(page)
++            if state.get("found"):
++                break
++            time.sleep(0.2)
++        for _ in range(12):
++            state = _template_state(page)
++            if not state.get("found"):
++                return False
++            found = _pick_template(state.get("rows", []), template_name)
++            if found:
++                applied = _template_state(page, "apply", found["idx"]).get("applied", False)
++                logger.info("话题模板 %s 匹配 %s，耗时 %.1fs", template_name, found["name"], time.monotonic()-started)
++                return bool(applied)
++            if not _template_state(page, "scroll").get("moved"):
+                 break
++            time.sleep(0.15)
++        logger.warning("话题模板 %s 未找到唯一匹配，将使用指定话题", template_name)
 +        return False
-+
-+    clicked = page.evaluate(
-+        """
-+        (() => {
-+            const btn = document.querySelector('[data-tpl-btn]');
-+            if (!btn) return false;
-+            const realClick = (el) => {
-+                el.scrollIntoView({ block: 'center', inline: 'center' });
-+                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-+                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-+            };
-+            realClick(btn);
-+            return true;
-+        })()
-+        """
-+    )
-+    if not clicked:
-+        return False
-+    sleep_random(700, 1400)
-+
-+    # 关闭弹窗：找 完成/关闭/收起 按钮，找不到按 Escape，避免弹窗挡住后续填表。
-+    closed = page.evaluate(
-+        """
-+        (() => {
-+            const visible = (el) => {
-+                if (!el) return false;
-+                const r = el.getBoundingClientRect();
-+                const s = getComputedStyle(el);
-+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
-+            };
-+            const realClick = (el) => {
-+                el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-+                el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-+            };
-+            const texts = ['完成', '关闭', '收起', '确定'];
-+            const closer = Array.from(document.querySelectorAll('button, [role="button"], .d-icon, span, i'))
-+                .filter(visible)
-+                .find(el => {
-+                    const t = (el.innerText || '').trim();
-+                    if (t && texts.includes(t)) return true;
-+                    const label = String(el.getAttribute('aria-label') || '') + String(el.className || '');
-+                    return /close|icon_close/i.test(label) && t === '';
-+                });
-+            if (closer) { realClick(closer); return 'clicked'; }
-+            return 'none';
-+        })()
-+        """
-+    )
-+    if closed != "clicked":
-+        try:
-+            page.keyboard.press("Escape")
-+        except Exception:
-+            pass
-+    sleep_random(350, 700)
-+    logger.info("已应用话题模板: %s（匹配到 %r）", template_name, found["name"])
-+    return True
-+
-+
++    finally:
++        # Cleanup on success, no match, timeout and exceptions alike.
++        _close_topic_template(page)
+
+-    if not clicked:
+-        # 没有联想，直接空格
+-        logger.warning("未找到标签联想，直接输入空格: %s", tag)
+-        page.type_text(" ", delay_ms=0)
+
+-    time.sleep(0.8)
 +def _click_topic_template_entry(page: Page) -> bool:
 +    opened_topic_menu = page.evaluate(
 +        """
@@ -1022,13 +976,13 @@ index 3863d67..c83cbb4 100644
 +    if not created:
 +        created = _click_visible_text_best_effort(page, "话题模版")
 +    return bool(created)
- 
- 
+
+
  # ========== 定时发布 ==========
-@@ -546,15 +1080,99 @@ def _set_schedule_publish(page: Page, schedule_time: str) -> None:
+@@ -546,15 +1002,99 @@ def _set_schedule_publish(page: Page, schedule_time: str) -> None:
      except ValueError as e:
          raise PublishError(f"定时发布时间格式错误: {e}") from e
- 
+
 -    # 点击定时发布开关
 -    page.click_element(SCHEDULE_SWITCH)
 -    time.sleep(0.8)
@@ -1071,7 +1025,7 @@ index 3863d67..c83cbb4 100644
 +
 +    def matches_expected(value: str) -> bool:
 +        return value.replace("T", " ").startswith(expected_prefix)
- 
+
 -    # 设置日期时间
 -    datetime_str = dt.strftime("%Y-%m-%d %H:%M")
 -    page.select_all_text(DATETIME_INPUT)
@@ -1130,21 +1084,21 @@ index 3863d67..c83cbb4 100644
 +            f"定时发布时间未写入输入框（期望 {datetime_str}，实际 {actual or '空'}）"
 +        )
 +    sleep_random(350, 700)
- 
+
      logger.info("已设置定时发布: %s", datetime_str)
- 
-@@ -576,7 +1194,7 @@ def _set_visibility(page: Page, visibility: str) -> None:
- 
+
+@@ -576,7 +1116,7 @@ def _set_visibility(page: Page, visibility: str) -> None:
+
      # 点击下拉框
      page.click_element(VISIBILITY_DROPDOWN)
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
- 
+
      # 查找并点击目标选项
      clicked = page.evaluate(
-@@ -598,7 +1216,219 @@ def _set_visibility(page: Page, visibility: str) -> None:
+@@ -598,7 +1138,219 @@ def _set_visibility(page: Page, visibility: str) -> None:
          raise PublishError(f"未找到可见范围选项: {visibility}")
- 
+
      logger.info("已设置可见范围: %s", visibility)
 -    time.sleep(0.2)
 +    sleep_random(120, 260)
@@ -1360,39 +1314,39 @@ index 3863d67..c83cbb4 100644
 +        """
 +    )
 +    return bool(result)
- 
- 
+
+
  # ========== 原创声明 ==========
-@@ -632,7 +1462,7 @@ def _set_original(page: Page) -> None:
+@@ -632,7 +1384,7 @@ def _set_original(page: Page) -> None:
      if result == "not_found":
          raise PublishError("未找到原创声明选项")
- 
+
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
- 
+
      # 处理确认弹窗
      _confirm_original_declaration(page)
-@@ -640,7 +1470,7 @@ def _set_original(page: Page) -> None:
- 
+@@ -640,7 +1392,7 @@ def _set_original(page: Page) -> None:
+
  def _confirm_original_declaration(page: Page) -> None:
      """处理原创声明确认弹窗。"""
 -    time.sleep(0.8)
 +    sleep_random(550, 1000)
- 
+
      # 勾选 checkbox
      page.evaluate(
-@@ -656,7 +1486,7 @@ def _confirm_original_declaration(page: Page) -> None:
+@@ -656,7 +1408,7 @@ def _confirm_original_declaration(page: Page) -> None:
          })()
          """
      )
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
- 
+
      # 点击声明原创按钮
      result = page.evaluate(
-@@ -687,4 +1517,4 @@ def _confirm_original_declaration(page: Page) -> None:
+@@ -687,4 +1439,4 @@ def _confirm_original_declaration(page: Page) -> None:
          raise PublishError("声明原创按钮仍处于禁用状态")
- 
+
      logger.info("已成功点击声明原创按钮")
 -    time.sleep(0.3)
 +    sleep_random(200, 450)
@@ -1409,8 +1363,8 @@ index d14fbd5..67484a4 100644
 +    topic_template: str = ""
 +    shooting_date: str = ""
 +    shooting_location: str = ""
- 
- 
+
+
  @dataclass
 diff --git a/scripts/xhs/creator.py b/scripts/xhs/creator.py
 new file mode 100644

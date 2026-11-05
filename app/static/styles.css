@@ -33,12 +33,27 @@ button { font-family: inherit; }
 .app-shell {
   display: grid;
   grid-template-columns: 216px 6px minmax(0, 1fr) 6px 320px;
-  height: 100vh;
+  height: calc(100vh - 68px);
+  margin-top: 68px;
 }
 
+.workspace-header { position: fixed; inset: 0 0 auto; height: 68px; display: flex; align-items: center; gap: 16px; padding: 8px 18px; border-bottom: 1px solid var(--line); background: #fff; z-index: 55; }
+.workspace-title { font-size: 14px; font-weight: 650; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.side-item.active { color: var(--accent); background: var(--accent-soft); }
+.profile-account-context { display: flex; align-items: center; gap: 10px; padding: 14px 0; min-width: 0; }
+.profile-account-context > div { min-width: 0; overflow-wrap: anywhere; }
+.profile-account-context strong { font-size: 14px; }
+.profile-account-context p { margin-top: 4px; line-height: 1.5; }
+.account-profile-card .profile-inputs { margin-top: 16px; }
+.profile-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+@media (max-width: 600px) { .workspace-header { padding: 8px; gap: 8px; } .workspace-title { display: none; } .account-profile-card .two-cols { grid-template-columns: 1fr; } }
+
 .update-banner {
-  position: relative;
-  z-index: 20;
+  position: fixed;
+  top: 76px;
+  left: 18px;
+  right: 18px;
+  z-index: 54;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -46,12 +61,14 @@ button { font-family: inherit; }
   padding: 10px 14px;
   color: #173b2b;
   background: #eaf7ef;
-  border-bottom: 1px solid #c9e9d4;
+  border: 1px solid #c9e9d4;
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(23,59,43,.12);
 }
 
 .update-copy { min-width: 0; }
 .update-copy strong { display: block; font-size: 13px; }
-.update-copy p { margin-top: 3px; color: #476655; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.update-copy p { max-height: 110px; overflow-y: auto; margin-top: 3px; color: #476655; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .update-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .update-actions .primary { min-height: 34px; white-space: nowrap; }
 .update-actions .icon-tool { width: 32px; height: 32px; }
@@ -206,7 +223,7 @@ button { font-family: inherit; }
 
 .sidebar-expand {
   position: fixed;
-  top: 14px;
+  top: 82px;
   left: 8px;
   z-index: 50;
   width: 30px;
@@ -853,6 +870,7 @@ input[type="date"], input[type="time"], input[type="datetime-local"], input[type
 /* ================= 右栏 ================= */
 
 .right-panel {
+  min-width: 0;
   background: #fff;
   border-left: 1px solid var(--line);
   display: flex;
@@ -863,6 +881,7 @@ input[type="date"], input[type="time"], input[type="datetime-local"], input[type
 
 .right-tabs {
   display: flex;
+  overflow-x: auto;
   padding: 11px 10px 0;
   gap: 2px;
   border-bottom: 1px solid var(--line);
@@ -897,8 +916,8 @@ input[type="date"], input[type="time"], input[type="datetime-local"], input[type
   margin: 13px;
   border-radius: 12px;
   background: #f2f3f5;
-  min-height: 360px;
-  flex: 1;
+  min-height: 0;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -909,7 +928,12 @@ input[type="date"], input[type="time"], input[type="datetime-local"], input[type
 
 .cover-preview-img {
   display: block; /* 尺寸完全由 JS 等比控制（applyExplicitSize + ResizeObserver），CSS 不钳制 */
+  flex: none;
 }
+
+.right-preview.collage-mode { min-height: 360px; }
+.right-preview .preview-placeholder { min-height: 250px; }
+.right-preview .fx-preview-box { flex: none; }
 
 .preview-placeholder { text-align: center; color: #b5b9c0; padding: 28px; }
 .preview-placeholder svg { width: 50px; height: 50px; margin-bottom: 9px; }
@@ -1194,18 +1218,25 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 .small-hint { font-size: 11px; }
 
 /* 右上角多账号（Chrome Profile 隔离） */
-.account-bar { position: relative; margin-left: auto; flex-shrink: 0; }
-.account-btn { display: flex; align-items: center; gap: 5px; border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 4px 10px; font-size: 12px; cursor: pointer; color: var(--ink); }
+.account-bar { position: relative; margin-left: auto; max-width: 100%; min-width: 0; }
+.account-btn { display: flex; align-items: center; gap: 9px; border: 1px solid var(--line); background: #fff; border-radius: 12px; padding: 5px 10px; width: 292px; max-width: calc(100vw - 16px); font-size: 12px; cursor: pointer; color: var(--ink); text-align: left; }
 .account-btn:hover { border-color: var(--accent); color: var(--accent); }
 .account-btn svg { width: 14px; height: 14px; }
-.account-btn .caret { width: 11px; height: 11px; color: #9aa0a8; }
-.account-dot { width: 7px; height: 7px; border-radius: 50%; background: #d6d9de; }
+.account-btn .caret { width: 11px; height: 11px; color: #9aa0a8; flex: none; }
+.account-avatar { display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; flex: none; border-radius: 50%; background: var(--accent-soft); color: var(--accent); overflow: hidden; font-size: 14px; font-weight: 650; }
+.account-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.account-names { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 3px; }
+.account-chrome, .account-nickname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+.account-chrome { color: var(--sub); font-size: 11px; font-weight: 400; }
+.account-nickname { font-size: 13px; font-weight: 600; }
+.account-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: #d6d9de; }
 .account-dot.ok { background: #2fbf71; }
-.account-menu { position: absolute; right: 0; top: calc(100% + 6px); width: 300px; background: #fff; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.12); padding: 8px; z-index: 80; max-height: 62vh; overflow: auto; }
+.account-menu { position: absolute; right: 0; top: calc(100% + 8px); width: 340px; max-width: calc(100vw - 16px); background: #fff; border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.12); padding: 8px; z-index: 80; max-height: min(70vh, calc(100vh - 86px)); overflow: auto; }
 .account-head { font-size: 11px; color: #8a8f99; padding: 4px 8px 6px; }
 .account-item { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; background: transparent; padding: 7px 8px; border-radius: 8px; font-size: 13px; cursor: pointer; text-align: left; color: var(--ink); }
 .account-item:hover { background: #f5f6f8; }
 .account-item.is-active { color: var(--accent); font-weight: 600; }
+.account-item:disabled { opacity: .6; cursor: wait; }
 .account-item.muted { color: #9aa0a8; cursor: default; }
 .account-check { width: 16px; flex: none; text-align: center; }
 .account-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1244,3 +1275,23 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: #d8dade; border-radius: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* 全局更新入口：独立于三栏宽度与内容滚动 */
+.workspace-updates { display: flex; flex-direction: column; align-items: center; gap: 3px; margin-left: auto; flex: 0 0 auto; }
+.workspace-updates + .account-bar { margin-left: 0; flex: 0 1 292px; }
+.workspace-updates + .account-bar .account-btn { width: 100%; max-width: 292px; }
+.update-check-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 30px; border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; background: #fff; color: var(--ink); font-size: 12px; white-space: nowrap; cursor: pointer; }
+.update-check-btn svg { width: 15px; height: 15px; }
+.update-check-btn:hover { border-color: var(--accent); color: var(--accent); }
+.update-check-btn.has-update { background: var(--accent-soft); color: var(--accent-dark); border-color: #ffc8d0; }
+.update-check-btn:disabled { opacity: .65; cursor: wait; }
+.update-status { color: var(--sub); font-size: 10px; line-height: 1.2; white-space: nowrap; }
+.update-status.is-error { color: #b45309; }
+.update-banner .update-actions { align-self: flex-start; }
+@media (max-width: 600px) {
+  .workspace-updates { margin-left: 0; }
+  .workspace-updates + .account-bar { margin-left: auto; flex-basis: 180px; }
+  .workspace-updates + .account-bar .account-avatar { width: 28px; height: 28px; }
+  .update-banner { left: 8px; right: 8px; flex-wrap: wrap; }
+  .update-copy { flex-basis: 100%; }
+}

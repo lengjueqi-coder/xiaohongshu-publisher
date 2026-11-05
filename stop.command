@@ -2,6 +2,12 @@
 set -u
 
 PORT="5818"
+# Stop the optional recovery wrapper as well, so a deliberate stop stays stopped.
+# Its plist remains available for the next Mac login.
+AGENT_TARGET="gui/$(id -u)/com.xhsassistant.publisher"
+if launchctl print "$AGENT_TARGET" >/dev/null 2>&1; then
+  launchctl bootout "$AGENT_TARGET" >/dev/null 2>&1 || true
+fi
 if ! curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/status" >/dev/null 2>&1; then
   echo "端口 ${PORT} 没有运行小红书助手。"
   exit 0
