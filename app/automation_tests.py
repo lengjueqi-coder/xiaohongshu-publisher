@@ -134,6 +134,10 @@ class ContinuousPublishingTests(unittest.TestCase):
                 self.save(layout=layout,min_images=1,max_images=9)
             self.save(layout=layout,min_images=needed,max_images=9)
 
+    def test_plan_accepts_platform_image_limit(self):
+        plan = self.save(min_images=9, max_images=server.MAX_NOTE_IMAGES, layout="3x3")
+        self.assertEqual(plan["config"]["max_images"], server.MAX_NOTE_IMAGES)
+
     def test_approval_is_account_scoped_and_cancel_releases_progress(self):
         self.save(); self.bind()
         ids=self.engine.build_batch("Default",1)

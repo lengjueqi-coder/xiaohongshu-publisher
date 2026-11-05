@@ -2,7 +2,7 @@
 set -u
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
-APP_VERSION="2026.11.7"
+APP_VERSION="2026.11.8"
 
 if ! command -v python3 >/dev/null 2>&1; then
   osascript -e 'display alert "小红书发布助手缺少 Python 3" message "请先运行安装教程中的 Python 安装步骤。"'

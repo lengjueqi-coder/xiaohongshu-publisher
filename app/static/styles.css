@@ -408,12 +408,18 @@ button { font-family: inherit; }
   border-radius: 999px;
 }
 
+.count-badge.over-limit { color: var(--accent-dark); background: var(--accent-soft); }
+
 .scan-count { white-space: nowrap; }
 
 /* 主次分组 */
 
 .main-group { display: flex; gap: 7px; margin-left: 4px; }
 .minor-group { display: flex; gap: 4px; margin-left: auto; align-items: center; }
+
+.asset-folder-row { display: flex; align-items: center; margin-bottom: 8px; }
+.material-folder-btn { min-height: 32px; gap: 7px; padding: 6px 10px; }
+.material-folder-btn svg { width: 15px; height: 15px; flex: 0 0 auto; }
 
 /* 按钮 */
 
@@ -548,6 +554,9 @@ button.mini-text {
   overflow-x: auto;
   padding: 4px 2px 8px;
 }
+
+.thumb-strip.drop-active { outline: 1px dashed var(--accent); outline-offset: 2px; background: var(--accent-soft); }
+.image-drop-hint { min-height: 64px; display: flex; align-items: center; padding: 0 12px; color: var(--muted); font-size: 12px; }
 
 .thumb-cell {
   position: relative;

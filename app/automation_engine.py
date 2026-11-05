@@ -96,7 +96,7 @@ class AutomationEngine:
                 raise ValueError("运行模式或拼图方式无效")
             if config["copy_mode"] not in {"local", "ai", "library"} or config["selection"] not in {"ordered", "random"}:
                 raise ValueError("选图或文案方式无效")
-            for key, lower, upper in (("daily_count", 1, 10), ("ahead_days", 1, 7), ("min_images", 1, 9), ("max_images", 1, 9), ("submission_hour_limit", 1, 10), ("submission_day_limit", 1, 50)):
+            for key, lower, upper in (("daily_count", 1, 10), ("ahead_days", 1, 7), ("min_images", 1, 18), ("max_images", 1, 18), ("submission_hour_limit", 1, 10), ("submission_day_limit", 1, 50)):
                 config[key] = int(config[key])
                 if not lower <= config[key] <= upper:
                     raise ValueError(f"{key} 必须在 {lower}–{upper} 之间")
@@ -293,7 +293,8 @@ class AutomationEngine:
                 if len(images) < 2:
                     raise ValueError("拼图至少需要 2 张图，请调整规则或补充素材")
                 collage = imagefx.make_collage(images[:needed], layout, 8, "#ffffff", task_dir / "cover.jpg")
-                images = [str(collage)] if config["layout"] == "collage_only" else [str(collage), *images[:8]]
+                images = [str(collage)] if config["layout"] == "collage_only" else [str(collage), *images[:self.app.MAX_NOTE_IMAGES - 1]]
+            self.app.validate_note_image_count(images, require_one=True)
             style = random.choice(config["styles"])
             if config["copy_mode"] == "library":
                 copy = random.choice(config["copy_library"])

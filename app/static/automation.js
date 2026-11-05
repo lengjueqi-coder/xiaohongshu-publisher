@@ -15,8 +15,8 @@
       <label>发布时间所属时区<select id="auto_timezone"><option value="Asia/Shanghai">北京时间</option><option value="America/Los_Angeles">洛杉矶时间</option></select></label>
       <label>提前准备天数<input id="auto_ahead_days" type="number" min="1" max="7"/></label>
       <label>选图方式<select id="auto_selection"><option value="ordered">按文件顺序选取</option><option value="random">从当前子文件夹随机选择</option></select></label>
-      <label>最少选几张<input id="auto_min_images" type="number" min="1" max="9"/></label>
-      <label>最多选几张<input id="auto_max_images" type="number" min="1" max="9"/></label>
+      <label>最少选几张<input id="auto_min_images" type="number" min="1" max="18"/></label>
+      <label>最多选几张<input id="auto_max_images" type="number" min="1" max="18"/></label>
       <label>图片组合<select id="auto_layout"><option value="original">直接发布原图组</option><option value="2x2">四宫格封面＋原图</option><option value="3x3">九宫格封面＋原图</option><option value="collage_only">只发四宫格拼图</option></select></label>
       <label>文案来源<select id="auto_copy_mode"><option value="local">随机选择内置文案风格</option><option value="library">从我的配套文案库随机选择</option><option value="ai">根据账号画像生成 AI 文案</option></select></label>
       <div class="auto-wide"><span style="font-size:12px">参与随机的文案风格</span><div id="autoStyles" class="auto-actions">${Object.entries(styles).map(([k,v])=>`<label class="auto-check"><input type="checkbox" data-auto-style="${k}"/>${v}</label>`).join("")}</div></div>

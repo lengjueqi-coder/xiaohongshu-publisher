@@ -43,10 +43,13 @@ _EXTERNAL_XHS_SKILL_DIR = PROJECT_ROOT / "tool-eval" / "xiaohongshu-skills"
 XHS_SKILL_DIR = _BUNDLED_XHS_SKILL_DIR if _BUNDLED_XHS_SKILL_DIR.exists() else _EXTERNAL_XHS_SKILL_DIR
 DEFAULT_TEST_ROOT = PROJECT_ROOT / "小红书软件测试"
 PREPARED_DIR = APP_ROOT / "data" / "prepared"
+IMPORTED_DIR = APP_ROOT / "data" / "imported"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
-APP_VERSION = "2026.11.7"
+MAX_IMPORT_IMAGE_BYTES = 100 * 1024 * 1024
+MAX_NOTE_IMAGES = 18
+APP_VERSION = "2026.11.8"
 
 
 COPY_STYLES = {
@@ -458,6 +461,29 @@ def read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+def store_imported_image(filename: str, raw: bytes, target_root: Path | None = None) -> Path:
+    if not raw:
+        raise ValueError("没有收到图片数据")
+    if len(raw) > MAX_IMPORT_IMAGE_BYTES:
+        raise ValueError("单张拖入图片不能超过 100MB")
+    safe_name = Path(str(filename or "").replace("\\", "/")).name.strip()
+    suffix = Path(safe_name).suffix.lower()
+    if not safe_name or suffix not in IMAGE_EXTENSIONS:
+        raise ValueError("只支持拖入 JPG、PNG、WebP、GIF 或 HEIC 图片")
+    folder = Path(target_root or IMPORTED_DIR) / uuid.uuid4().hex
+    folder.mkdir(parents=True, exist_ok=False)
+    target = folder / safe_name
+    target.write_bytes(raw)
+    return target
+
+
+def validate_note_image_count(images: list[Any], require_one: bool = False) -> None:
+    if require_one and not images:
+        raise PublishError("每条笔记至少需要 1 张图片")
+    if len(images) > MAX_NOTE_IMAGES:
+        raise PublishError(f"小红书图文最多发布 {MAX_NOTE_IMAGES} 张图片，请从列表移除多余图片后再继续")
+
+
 def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     handler.send_response(status)
@@ -554,6 +580,8 @@ def prepare_images_for_xhs(paths: list[str]) -> tuple[list[str], list[str]]:
 
 def freeze_payload(payload: dict[str, Any], task_dir: Path | None = None) -> dict[str, Any]:
     """Freeze reviewed image bytes and effects so execution cannot change them."""
+    images = payload.get("images") or []
+    validate_note_image_count(images, require_one=True)
     if payload.get("frozen_images"):
         verify_frozen_images(payload)
         return payload
@@ -565,7 +593,7 @@ def freeze_payload(payload: dict[str, Any], task_dir: Path | None = None) -> dic
         if fx.get(enabled) and not (enabled == "watermark_enabled" and fx.get("watermark_text")) and not Path(fx.get(path_key) or "").is_file():
             raise PublishError("已开启的 LOGO/图片水印文件不存在，请重新选择")
     copied = []
-    for index, raw in enumerate(payload.get("images") or []):
+    for index, raw in enumerate(images):
         source = Path(raw)
         if not source.is_file() or source.suffix.lower() not in IMAGE_EXTENSIONS:
             raise PublishError(f"图片不存在或格式不支持：{source.name}")
@@ -573,8 +601,6 @@ def freeze_payload(payload: dict[str, Any], task_dir: Path | None = None) -> dic
         if source.resolve() != target.resolve():
             shutil.copy2(source, target)
         copied.append(str(target))
-    if not copied or len(copied) > 9:
-        raise PublishError("每条任务需要 1–9 张图片")
     outputs, notes = imagefx.apply_for_publish(copied, fx, task_dir / "rendered")
     if notes:
         raise PublishError("图片处理未完成：" + "；".join(notes))
@@ -1041,8 +1067,8 @@ def scan_folders(root_path: str) -> list[FolderCandidate]:
     return candidates
 
 
-def choose_image_group(images: list[str], max_count: int = 9) -> list[str]:
-    selected = images[:max_count]
+def choose_image_group(images: list[str], max_count: int = MAX_NOTE_IMAGES) -> list[str]:
+    selected = images[: max(1, min(int(max_count), MAX_NOTE_IMAGES))]
     return sorted(selected, key=lambda p: Path(p).name)
 
 
@@ -1678,6 +1704,7 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
     tags = [str(t).strip().lstrip("#") for t in payload.get("tags") or [] if str(t).strip()]
     if not title or not content or not images:
         raise PublishError("标题、正文和图片不能为空")
+    validate_note_image_count(images, require_one=True)
 
     schedule_time = "" if payload.get("publish_mode") == "immediate" else str(payload.get("schedule_time") or "")
     if payload.get("publish_mode") == "scheduled" and not schedule_time:
@@ -2147,8 +2174,31 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             error_response(self, str(exc), 500)
 
+    def import_material_image(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("图片数据长度无效") from exc
+        if length <= 0:
+            raise ValueError("没有收到图片数据")
+        if length > MAX_IMPORT_IMAGE_BYTES:
+            raise ValueError("单张拖入图片不能超过 100MB")
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError("图片数据未完整接收，请重新拖入")
+        filename = urllib.parse.unquote(self.headers.get("X-File-Name", ""))
+        target = store_imported_image(filename, raw)
+        json_response(self, {
+            "ok": True,
+            "path": str(target),
+            "folder_path": str(target.parent),
+        })
+
     def _post(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if path == "/api/material/import":
+            self.import_material_image()
+            return
         payload = read_json(self)
         if path.startswith("/api/automation/") or path.startswith("/api/notifications/"):
             self.automation_post(path, payload)
@@ -2258,7 +2308,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             candidate = candidates[0]
             data = asdict(candidate)
-            data["selected_images"] = choose_image_group(candidate.images, int(payload.get("max_images") or 9))
+            data["selected_images"] = choose_image_group(candidate.images, int(payload.get("max_images") or MAX_NOTE_IMAGES))
             json_response(self, {"ok": True, "item": data})
             return
         if path == "/api/polish":
@@ -2323,6 +2373,7 @@ class Handler(BaseHTTPRequestHandler):
                 error_response(self, result.get("error") or "生成画像失败", 500)
             return
         if path == "/api/validate":
+            validate_note_image_count(payload.get("images") or [])
             if payload.get("publish_mode") == "scheduled" and not payload.get("schedule_time"):
                 try:
                     payload = {

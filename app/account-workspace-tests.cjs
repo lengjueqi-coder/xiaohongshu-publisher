@@ -19,7 +19,7 @@ function workspace() {
   });
   const source = fs.readFileSync(path.join(__dirname, "static/app.js"), "utf8")
     .replace('init().catch((err) => log(err.message));', "");
-  vm.runInContext(source + "\nglobalThis.workspace = {state, loadProfile, displayProfile, generateProfile, showView, renderCurrentAccount, currentPayload, generateCopy, invalidateCopies, polishCurrentCopy, selectStyle, firstUsableImage, applyExplicitSize, renderRecommendation, generateCover, saveCover, saveConfig, checkForUpdates, maybeCheckForUpdates, startUpdateChecks};", context);
+  vm.runInContext(source + "\nglobalThis.workspace = {state, loadProfile, displayProfile, generateProfile, showView, renderCurrentAccount, currentPayload, generateCopy, invalidateCopies, polishCurrentCopy, selectStyle, firstUsableImage, applyExplicitSize, renderRecommendation, generateCover, saveCover, saveConfig, checkForUpdates, maybeCheckForUpdates, startUpdateChecks, appendImportedPaths, validatePublishImageCount, updateImageCount};", context);
   return { context, get, ...context.workspace };
 }
 
@@ -45,6 +45,21 @@ test("a collage in first position is the actual preview cover", () => {
   assert.equal(app.firstUsableImage(),"/x/四宫格_1.jpg");
   app.state.excluded.add("/x/四宫格_1.jpg");
   assert.equal(app.firstUsableImage(),"/x/original.jpg");
+});
+
+test("images dragged from separate folders append as independent publish paths", () => {
+  const app=workspace();
+  app.state.current={path:"/folder-a",selected_images:["/folder-a/one.jpg"]};
+  app.appendImportedPaths(["/managed/two.jpg","/managed/three.png"]);
+  assert.deepEqual(app.state.current.selected_images,["/folder-a/one.jpg","/managed/two.jpg","/managed/three.png"]);
+});
+
+test("the publish image maximum is explicit and is never silently truncated", () => {
+  const app=workspace();
+  assert.doesNotThrow(()=>app.validatePublishImageCount(Array.from({length:18},(_,i)=>String(i))));
+  assert.throws(()=>app.validatePublishImageCount(Array.from({length:19},(_,i)=>String(i))),/最多发布 18 张/);
+  app.updateImageCount(19);
+  assert.match(app.get("imageCountTotal").textContent,/最多发布 18 张/);
 });
 
 test("all native image ratios fit wide and narrow panes without distortion", () => {
@@ -257,6 +272,9 @@ test("latest-version and network-failure states are visible even for automatic c
   app.context.fetch=async()=>({ok:true,json:async()=>({ok:true,update_available:false,current_version:"2026.11.7"})});
   await app.checkForUpdates(true);
   assert.match(app.get("updateStatus").textContent,/2026.11.7.*已是最新/);
+  app.context.fetch=async()=>({ok:true,json:async()=>({ok:true,update_available:false,current_version:"2026.11.8",latest_version:"2026.11.7"})});
+  await app.checkForUpdates(true);
+  assert.match(app.get("updateStatus").textContent,/本地 v2026\.11\.8.*GitHub 最新 v2026\.11\.7/);
   app.context.fetch=async()=>{throw Error("offline");};
   await app.checkForUpdates(true);
   assert.match(app.get("updateStatus").textContent,/检查失败/);

@@ -470,6 +470,25 @@ class AssistantTests(unittest.TestCase):
         images = ["/tmp/03.jpg", "/tmp/01.jpg", "/tmp/02.jpg"]
         self.assertEqual(choose_image_group(images, 2), ["/tmp/01.jpg", "/tmp/03.jpg"])
 
+    def test_choose_image_group_supports_platform_limit_and_never_exceeds_it(self) -> None:
+        images = [f"/tmp/{index:02}.jpg" for index in range(24)]
+        self.assertEqual(len(choose_image_group(images)), server.MAX_NOTE_IMAGES)
+        self.assertEqual(len(choose_image_group(images, 100)), server.MAX_NOTE_IMAGES)
+
+    def test_publish_image_limit_is_enforced_without_silent_truncation(self) -> None:
+        server.validate_note_image_count([f"{index}.jpg" for index in range(server.MAX_NOTE_IMAGES)])
+        with self.assertRaisesRegex(server.PublishError, "最多发布 18 张"):
+            server.validate_note_image_count([f"{index}.jpg" for index in range(server.MAX_NOTE_IMAGES + 1)])
+
+    def test_imported_images_are_copied_into_managed_local_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = server.store_imported_image("../../来自外部目录/photo.jpg", b"image bytes", Path(tmp))
+            self.assertEqual(target.name, "photo.jpg")
+            self.assertTrue(target.is_relative_to(Path(tmp)))
+            self.assertEqual(target.read_bytes(), b"image bytes")
+            with self.assertRaisesRegex(ValueError, "只支持拖入"):
+                server.store_imported_image("clip.mov", b"video", Path(tmp))
+
 
 if __name__ == "__main__":
     unittest.main()

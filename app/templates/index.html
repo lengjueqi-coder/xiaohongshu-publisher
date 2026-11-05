@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>小红书发布助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=2026.11.6-automation" />
+    <link rel="stylesheet" href="/static/styles.css?v=2026.11.8-materials" />
     <link rel="stylesheet" href="/static/automation.css?v=1" />
   </head>
   <body>
@@ -156,20 +156,23 @@
                 <span id="candidateCount" class="muted scan-count"></span>
 
                 <div class="minor-group" title="辅助操作">
-                  <button id="checkLoginBtn" class="icon-tool ghost" type="button" title="检测小红书登录状态">
-                    <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M5 20c.6-3.4 3.6-5 7-5s6.4 1.6 7 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+                  <button id="refreshImagesBtn" class="icon-tool ghost" type="button" title="刷新图片缩略图" aria-label="刷新图片缩略图">
+                    <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 00-13.6-5.7L4 9m0-5v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
                   </button>
-
-                  <button id="refreshImagesBtn" class="icon-tool ghost" type="button" title="刷新缩略图（修图保存后点此）">
-                    <svg viewBox="0 0 24 24"><path d="M20 11A8 8 0 006.6 6.6L4 9M4 4v5h5M4 13a8 8 0 0013.4 4.4L20 15M20 20v-5h-5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                  </button>
-                  <button id="clearImagesBtn" class="icon-tool ghost" type="button" title="清空全部图片">
+                  <button id="clearImagesBtn" class="icon-tool ghost" type="button" title="清空全部图片" aria-label="清空全部图片">
                     <svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7.5 7l.8 12.5h7.4l.8-12.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 11v6M14 11v6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
                   </button>
                 </div>
               </header>
 
-              <div id="recommendation" class="empty recommend-empty">尚未加载素材。点「推荐一组」自动推荐，或点下方 + 号手动指定文件夹。</div>
+              <div class="asset-folder-row">
+                <button id="chooseMaterialFolderBtn" class="ghost material-folder-btn" type="button" title="选择素材文件夹并递归扫描图片">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7a2 2 0 012-2h5l2 2H19a2 2 0 012 2v9a2 2 0 01-2 2H5.5a2 2 0 01-2-2V7z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+                  选择素材文件夹
+                </button>
+              </div>
+
+              <div id="recommendation" class="empty recommend-empty">尚未加载素材。点「推荐一组」自动推荐，或选择素材文件夹。</div>
 
               <div id="thumbGrid" class="thumb-strip"></div>
 
@@ -596,7 +599,7 @@
 
     <div id="runLog" class="run-log">等待操作（版本 2026.11.4）。</div>
 
-    <script src="/static/app.js?v=automation1"></script>
-    <script src="/static/automation.js?v=1"></script>
+    <script src="/static/app.js?v=2026.11.8-materials"></script>
+    <script src="/static/automation.js?v=2026.11.8-materials"></script>
   </body>
 </html>

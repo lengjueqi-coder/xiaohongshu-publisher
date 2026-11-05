@@ -1,3 +1,5 @@
+const MAX_NOTE_IMAGES = 18;
+
 const state = {
   config: {},
   candidates: [],
@@ -96,8 +98,15 @@ async function checkForUpdates(silent = false) {
         $("updateBanner").hidden = true;
         $("updateButtonLabel").textContent = "检查更新";
         button.classList.toggle("has-update", false);
-        $("updateStatus").textContent = `v${data.current_version} · 已是最新`;
-        if (!silent) log(`当前已是最新版本 ${data.current_version}。`);
+        $("updateStatus").textContent = data.latest_version && data.latest_version !== data.current_version
+          ? `本地 v${data.current_version} · GitHub 最新 v${data.latest_version}`
+          : `v${data.current_version} · 已是最新`;
+        if (!silent) {
+          const message = data.latest_version && data.latest_version !== data.current_version
+            ? `本地版本 ${data.current_version}，GitHub 最新版 ${data.latest_version}。`
+            : `当前已是最新版本 ${data.current_version}。`;
+          log(message);
+        }
       }
     } catch (error) {
       $("updateButtonLabel").textContent = state.latestUpdate ? "有新版本" : "重试检查更新";
@@ -323,8 +332,23 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
-function imageUrl(path) {
-  return `/api/image?path=${encodeURIComponent(path)}`;
+function imageUrl(path, refresh = false) {
+  const version = refresh ? `&v=${Date.now()}` : "";
+  return `/api/image?path=${encodeURIComponent(path)}${version}`;
+}
+
+function updateImageCount(count) {
+  const badge = $("imageCountTotal");
+  const overLimit = count > MAX_NOTE_IMAGES;
+  badge.textContent = overLimit ? `共 ${count} 张（最多发布 ${MAX_NOTE_IMAGES} 张）` : `共 ${count} 张`;
+  badge.title = overLimit ? `请从列表移除多余图片，发布上限为 ${MAX_NOTE_IMAGES} 张` : "";
+  badge.classList.toggle("over-limit", overLimit);
+}
+
+function validatePublishImageCount(images) {
+  if (images.length > MAX_NOTE_IMAGES) {
+    throw new Error(`小红书图文最多发布 ${MAX_NOTE_IMAGES} 张，请从列表移除多余图片后再继续。`);
+  }
 }
 
 function renderRecommendation(item) {
@@ -363,7 +387,7 @@ function renderRecommendation(item) {
   });
   const selected = item.selected_images || item.images || [];
   state.collageSelection = [];
-  $("imageCountTotal").textContent = `共 ${selected.length} 张`;
+  updateImageCount(selected.filter((path) => !state.excluded.has(path)).length);
   renderThumbStrip(selected);
   updateCoverPreview();
   updateChecklist();
@@ -385,10 +409,8 @@ function prefetchAllStyles() {
   generateCopy(state.style, {apply:true, randomize:false}).catch((e) => log(e.message));
 }
 
-function renderThumbStrip(selected) {
-  $("imageCountTotal").textContent = `共 ${selected.filter(p => !state.excluded.has(p)).length} 张`;
-  const addBtn = (pos) => `
-    <button class="add-thumb" data-addpos="${pos}" type="button" title="手动指定图片/文件夹">+</button>`;
+function renderThumbStrip(selected, forceReload = false) {
+  updateImageCount(selected.filter(p => !state.excluded.has(p)).length);
   const cells = selected
     .map(
       (path, i) => `
@@ -402,13 +424,13 @@ function renderThumbStrip(selected) {
             <svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 13h8l1-13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         </div>
-        <img src="${imageUrl(path)}" alt="" loading="lazy" data-preview="${escapeHtml(path)}" />
+        <img src="${imageUrl(path, forceReload)}" alt="" loading="lazy" data-preview="${escapeHtml(path)}" />
       </div>
     `,
     )
     .join("");
   $("thumbGrid").className = "thumb-strip";
-  $("thumbGrid").innerHTML = addBtn("before") + cells + addBtn("after");
+  $("thumbGrid").innerHTML = cells || '<div class="image-drop-hint">也可以把不同文件夹里的图片逐张拖到这里</div>';
   bindThumbStripEvents();
 }
 
@@ -427,7 +449,7 @@ function removeImageFromList(path) {
   $("thumbGrid").querySelectorAll(".thumb-cell").forEach((el, i) => {
     el.querySelector(".thumb-index").textContent = i + 1;
   });
-  $("imageCountTotal").textContent = `共 ${list.length} 张`;
+  updateImageCount(list.filter((image) => !state.excluded.has(image)).length);
   updateCoverPreview(); // 删的是第一张时自动切到新的第一张
   updateChecklist();
   log(`已从列表移除 ${path.split("/").pop()}（原图保留在素材文件夹），剩余 ${list.length} 张。`);
@@ -456,10 +478,6 @@ function bindThumbStripEvents() {
   $("thumbGrid").querySelectorAll("[data-edit-one]").forEach((btn) => {
     btn.addEventListener("click", () => openInEditor([btn.dataset.editOne]));
   });
-  $("thumbGrid").querySelectorAll("[data-addpos]").forEach((btn) => {
-    btn.addEventListener("click", () => pickImagesManual());
-  });
-
   // 拖拽排序（同小红书逻辑：拖到目标位置松手即重排）
   // 注意：不设 effectAllowed（默认 all），否则与拼图区 dropEffect 不兼容会导致 drop 被浏览器禁止
   $("thumbGrid").querySelectorAll(".thumb-cell").forEach((cell) => {
@@ -474,15 +492,104 @@ function bindThumbStripEvents() {
     });
     cell.addEventListener("dragover", (e) => {
       e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
+      const isFileDrop = Array.from(e.dataTransfer?.types || []).includes("Files");
+      e.dataTransfer.dropEffect = isFileDrop ? "copy" : "move";
     });
     cell.addEventListener("drop", (e) => {
+      if (Array.from(e.dataTransfer?.types || []).includes("Files")) return;
       e.preventDefault();
       e.stopPropagation();
       const src = dragSrcPath || e.dataTransfer.getData("text/plain");
       if (src && src !== cell.dataset.path) reorderImages(src, cell.dataset.path);
     });
   });
+}
+
+function bindMaterialDropZone() {
+  const grid = $("thumbGrid");
+  const hasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+  grid.addEventListener("dragover", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    grid.classList.add("drop-active");
+  });
+  grid.addEventListener("dragleave", (event) => {
+    if (!grid.contains(event.relatedTarget)) grid.classList.remove("drop-active");
+  });
+  grid.addEventListener("drop", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    grid.classList.remove("drop-active");
+    importDroppedImages(Array.from(event.dataTransfer.files || [])).catch((error) => log(error.message));
+  });
+}
+
+async function importDroppedImages(files) {
+  const accepted = files.filter((file) => /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(file.name));
+  const skipped = files.length - accepted.length;
+  if (!accepted.length) {
+    log("没有检测到可导入图片。请拖入 JPG、PNG、WebP、GIF 或 HEIC 图片；文件夹请使用“选择素材文件夹”。");
+    return;
+  }
+  const imported = [];
+  for (const file of accepted) {
+    if (file.size > 100 * 1024 * 1024) {
+      log(`已跳过 ${file.name}：单张图片不能超过 100MB。`);
+      continue;
+    }
+    const response = await fetch("/api/material/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) },
+      body: file,
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) throw new Error(data.error || `导入失败：${file.name}`);
+    imported.push(data);
+  }
+  if (!imported.length) return;
+  appendImportedImages(imported);
+  const suffix = skipped ? `，另有 ${skipped} 个非图片文件已跳过` : "";
+  log(`已导入 ${imported.length} 张图片副本，可继续拖入其他文件夹中的图片${suffix}。`);
+}
+
+function appendImportedImages(items) {
+  const paths = items.map((item) => item.path);
+  if (!state.current) {
+    const images = paths;
+    renderRecommendation({
+      name: "手动导入图片",
+      display_name: "手动导入图片",
+      path: items[0].folder_path,
+      model_name: "",
+      shooting_date: "",
+      image_count: images.length,
+      latest_mtime_label: "",
+      score_reason: "从 Finder 拖入",
+      hierarchy: ["手动导入"],
+      year: "",
+      month: "",
+      images,
+      selected_images: images,
+    });
+    return;
+  }
+  appendImportedPaths(paths);
+  state.current.image_count = state.current.selected_images.length;
+  state.excluded = new Set([...state.excluded].filter((path) => state.current.selected_images.includes(path)));
+  invalidateCopies();
+  renderThumbStrip(state.current.selected_images);
+  const count = $("recommendation").querySelector(".meta-row .chip");
+  if (count) count.textContent = `${state.current.image_count} 张图片`;
+  updateCoverPreview();
+  updateChecklist();
+}
+
+function appendImportedPaths(paths) {
+  if (!state.current) return;
+  state.current.selected_images ||= [];
+  state.current.selected_images.push(...paths);
 }
 
 // ---------- 图片区操作 ----------
@@ -501,31 +608,35 @@ async function changeGroup() {
   if (state.current?.path) state.viewedGroups.add(state.current.path);
   const next = state.candidates.find((c) => !state.viewedGroups.has(c.path));
   if (!next) {
-    log("所有素材组都看过了。可点 + 手动指定文件夹。");
+    log("所有素材组都看过了。可选择素材文件夹，或拖入单张图片。");
     return;
   }
   invalidateCopies(); // 换组后文案缓存失效
-  renderRecommendation({ ...next, selected_images: next.images.slice(0, 9).sort() });
+  renderRecommendation({ ...next, selected_images: next.images.slice(0, MAX_NOTE_IMAGES).sort() });
   state.viewedGroups.add(next.path);
   log(`已换组：${next.name}`);
 }
 
-function clearImages() {
-  if (!window.confirm("确定清空全部图片吗？\n原图文件保留，仅清空本次编辑区。")) return;
+function resetMaterialSelection(message) {
   state.current = null;
   state.excluded = new Set();
   invalidateCopies();
-  $("thumbGrid").innerHTML = "";
-  $("imageCountTotal").textContent = "共 0 张";
+  renderThumbStrip([]);
+  updateImageCount(0);
   $("recommendation").className = "empty recommend-empty";
-  $("recommendation").textContent = "已清空。点「换一组」自动推荐，或点 + 手动指定。";
+  $("recommendation").textContent = message;
   updateCoverPreview(null);
   updateChecklist();
 }
 
+function clearImages() {
+  if (!window.confirm("确定清空全部图片吗？\n原图文件保留，仅清空本次编辑区。")) return;
+  resetMaterialSelection("已清空。点「换一组」自动推荐，或选择素材文件夹。 ");
+}
+
 function refreshThumbs(showLog = false) {
   if (!state.current) return;
-  renderThumbStrip(state.current.selected_images || []);
+  renderThumbStrip(state.current.selected_images || [], true);
   updateCoverPreview();
   if (showLog) log("缩略图已刷新，已加载磁盘最新内容。");
 }
@@ -568,28 +679,24 @@ function updateEditorPathUI() {
   $("editorPathBtn").classList.toggle("is-set", !!state.editorAppPath);
 }
 
-async function pickImagesManual() {
-  try {
-    const data = await api("/api/choose-folder", {});
-    if (!data.path) return;
-    const folder = state.candidates.find((c) => c.path === data.path);
-    if (folder) {
-      invalidateCopies();
-      renderRecommendation({ ...folder, selected_images: folder.images.slice(0, 9).sort() });
-      state.viewedGroups.add(folder.path);
-    } else {
-      // 手动指定的文件夹不在扫描列表里，重新扫描后渲染
-      const scanData = await api("/api/scan", { root_path: data.path });
-      if (scanData.items[0]) {
-        const item = scanData.items[0];
-        invalidateCopies();
-        renderRecommendation({ ...item, selected_images: item.images.slice(0, 9).sort() });
-      }
-    }
-    log(`已手动指定：${data.path}`);
-  } catch (e) {
-    log(`文件夹选择接口阶段2接入：${e.message}`);
+async function chooseMaterialFolder() {
+  const chosen = await api("/api/choose-folder", {});
+  if (!chosen.path) return;
+  $("rootPath").value = chosen.path;
+  await saveConfig();
+  const data = await api("/api/scan", { root_path: chosen.path });
+  state.candidates = data.items;
+  state.viewedGroups.clear();
+  $("candidateCount").textContent = `${data.items.length} 个可用文件夹`;
+  if (!data.items.length) {
+    resetMaterialSelection("所选文件夹及其子文件夹中没有找到可用图片。");
+    log("递归扫描完成：所选文件夹及其子文件夹中没有找到可用图片。");
+    return;
   }
+  const first = data.items[0];
+  renderRecommendation({ ...first, selected_images: first.images.slice(0, MAX_NOTE_IMAGES).sort() });
+  state.viewedGroups.add(first.path);
+  log(`已选择素材目录并递归扫描：找到 ${data.items.length} 个图片文件夹。当前加载 ${first.name}。`);
 }
 
 // ---------- 右侧封面预览 ----------
@@ -679,6 +786,7 @@ async function pauseQueue() {
 
 async function enqueueCurrent() {
   const payload = currentPayload();
+  validatePublishImageCount(payload.images);
   if (!payload.images.length) throw new Error("没有可发布图片");
   if (!payload.title || !payload.content) throw new Error("请先生成或填写标题、正文");
   if (payload.publish_mode === "scheduled") {
@@ -698,11 +806,13 @@ async function enqueueCurrent() {
 }
 
 async function confirmEnqueue() {
+  const current = currentPayload();
+  validatePublishImageCount(current.images);
   const time = $("dialogTimeInput").value;
   if (!time) throw new Error("请选择发布时间");
   const normalizedTime = time.replace(" ", "T").slice(0, 16);
   const payload = {
-    ...currentPayload(),
+    ...current,
     schedule_time: normalizedTime,
     // 自动建议时间发生冲突时允许后端顺延到下一个可用日；手动改过则严格校验。
     schedule_auto: !state.scheduleSuggestion || normalizedTime === state.scheduleSuggestion,
@@ -833,9 +943,13 @@ async function scan() {
   log("正在扫描素材文件夹...");
   const data = await api("/api/scan", { root_path: $("rootPath").value.trim() });
   state.candidates = data.items;
+  state.viewedGroups.clear();
   $("candidateCount").textContent = `${data.items.length} 个可用文件夹`;
   if (data.items[0]) {
-    renderRecommendation({ ...data.items[0], selected_images: data.items[0].images.slice(0, 9).sort() });
+    renderRecommendation({ ...data.items[0], selected_images: data.items[0].images.slice(0, MAX_NOTE_IMAGES).sort() });
+    state.viewedGroups.add(data.items[0].path);
+  } else {
+    resetMaterialSelection("当前素材目录及其子文件夹中没有找到可用图片。");
   }
   log(`扫描完成，找到 ${data.items.length} 个包含图片的素材文件夹。`);
 }
@@ -843,7 +957,7 @@ async function scan() {
 async function recommend() {
   await saveConfig();
   log("正在按未发布和最近加入规则推荐素材...");
-  const data = await api("/api/recommend", { root_path: $("rootPath").value.trim(), max_images: 9 });
+  const data = await api("/api/recommend", { root_path: $("rootPath").value.trim(), max_images: MAX_NOTE_IMAGES });
   renderRecommendation(data.item);
   state.viewedGroups.add(data.item.path);
   log(`已推荐：${data.item.name}`);
@@ -1001,6 +1115,7 @@ async function loadNextQueue() {
 
 async function publishNow() {
   const payload = { ...currentPayload(), publish_mode: "immediate", schedule_time: "" };
+  validatePublishImageCount(payload.images);
   if (!payload.title || !payload.content || !payload.images.length) throw new Error("请先确认图片、标题和正文");
   if (!confirm(`立即发布到当前账号？\n${payload.title}\n${payload.images.length} 张图片 · ${payload.visibility}`)) return;
   await api("/api/xhs/publish-now", payload);
@@ -1093,12 +1208,14 @@ async function fillMoments() {
   }
   await saveConfig();
   const btn = $("momentsBtn");
+  const images = payload.images.slice(0, 9);
+  if (payload.images.length > images.length) log("朋友圈当前最多接收 9 张图，已按朋友圈接口上限选择前 9 张。");
   btn.disabled = true;
   btn.textContent = "正在填入朋友圈…";
   log("正在填入朋友圈（请勿操作电脑），完成后会停在发表按钮前...");
   try {
     const data = await api("/api/moments/publish", {
-      images: payload.images.slice(0, 9),
+      images,
       text: payload.content,
       tag: $("momentsTag").value.trim(),
       dryRun: true,
@@ -1958,12 +2075,11 @@ function bindEvents() {
     });
   });
   $("recommendBtn").addEventListener("click", () => recommend().catch((e) => log(e.message)));
+  $("chooseMaterialFolderBtn").addEventListener("click", () => chooseMaterialFolder().catch((e) => log(e.message)));
+  bindMaterialDropZone();
   $("checklistToggle").addEventListener("click", () => {
     $("checklistCard").classList.toggle("collapsed");
   });
-  $("checkLoginBtn").addEventListener("click", () => checkLogin().catch((e) => {
-    log(e.message);
-  }));
   $("checkUpdatesBtn").addEventListener("click", () => checkForUpdates(false));
   $("installUpdateBtn").addEventListener("click", () => installUpdate());
   $("dismissUpdateBtn").addEventListener("click", () => { $("updateBanner").hidden = true; });
@@ -2204,6 +2320,7 @@ function renderAccountMenu(data) {
     <div class="account-head">Chrome 用户资料 → 小红书运营账号</div>
     ${rows || '<div class="account-item muted">未检测到 Chrome 账号</div>'}
     <div class="account-sep"></div>
+    <button class="account-item" id="checkLoginBtn" type="button">检测小红书登录状态</button>
     <button class="account-item" id="accountRefreshBtn" type="button" ${state.accountBusy ? "disabled" : ""}>刷新当前账号资料</button>
     <button class="account-item" id="accountProfileBtn" type="button">管理当前账号画像</button>
     <button class="account-item" id="accountLogoutBtn" type="button" ${state.accountBusy ? "disabled" : ""}>退出当前小红书账号（清登录态）</button>
@@ -2212,6 +2329,7 @@ function renderAccountMenu(data) {
   menu.querySelectorAll("[data-profile]").forEach((btn) => {
     btn.addEventListener("click", () => switchAccount(btn.dataset.profile, state.accounts.find((p) => p.dir === btn.dataset.profile)?.label || btn.dataset.profile));
   });
+  $("checkLoginBtn").addEventListener("click", () => checkLogin().catch((error) => log(error.message)));
   $("accountRefreshBtn").addEventListener("click", () => refreshAccountIdentity());
   $("accountProfileBtn").addEventListener("click", () => { closeAccountMenu(); showView("profile"); });
   const logout = $("accountLogoutBtn");
@@ -2425,7 +2543,7 @@ async function saveCover(data, target) {
     });
     if (coverTargetIsCurrent(target)) {
       state.current.selected_images.unshift(result.path);
-      $("imageCountTotal").textContent = `共 ${state.current.selected_images.length} 张`;
+      updateImageCount(state.current.selected_images.filter((path) => !state.excluded.has(path)).length);
       renderThumbStrip(state.current.selected_images);
       updateCoverPreview(result.path);
     }
