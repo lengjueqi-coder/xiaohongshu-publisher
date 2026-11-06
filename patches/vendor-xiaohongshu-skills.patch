@@ -1,10 +1,64 @@
+diff --git a/extension/background.js b/extension/background.js
+index 773fd89..61374f8 100644
+--- a/extension/background.js
++++ b/extension/background.js
+@@ -13,2 +13,15 @@ const BRIDGE_URL = "ws://localhost:9333";
+ let ws = null;
++let clientId = null;
++let connecting = false;
++async function announcePair(tab) {
++  if (!tab?.url || !ws || ws.readyState !== WebSocket.OPEN) return;
++  try {
++    const url = new URL(tab.url);
++    if (url.origin !== 'http://127.0.0.1:5818' || url.pathname !== '/bridge-pair') return;
++    const token = url.searchParams.get('token');
++    if (/^[a-f0-9]{32}$/.test(token || '')) ws.send(JSON.stringify({pair_token:token}));
++  } catch {}
++}
++chrome.tabs.onUpdated.addListener((id, info, tab) => { if (info.url || info.status === 'complete') announcePair(tab); });
++chrome.tabs.onCreated.addListener(announcePair);
+ 
+@@ -23,6 +36,12 @@ chrome.alarms.onAlarm.addListener(() => {
+ 
+-function connect() {
+-  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+-
++async function connect() {
++  if (connecting || (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN))) return;
++  connecting = true;
++  try {
++  if (!clientId) {
++    clientId = (await chrome.storage.local.get("bridgeClientId")).bridgeClientId || crypto.randomUUID();
++    await chrome.storage.local.set({bridgeClientId:clientId});
++  }
+   ws = new WebSocket(BRIDGE_URL);
++  const socket = ws;
+ 
+@@ -30,3 +49,4 @@ function connect() {
+     console.log("[XHS Bridge] 已连接到 bridge server");
+-    ws.send(JSON.stringify({ role: "extension" }));
++    socket.send(JSON.stringify({ role: "extension", client_id:clientId }));
++    chrome.tabs.query({}).then(tabs => tabs.forEach(announcePair));
+   };
+@@ -42,5 +62,5 @@ function connect() {
+       const result = await handleCommand(msg);
+-      ws.send(JSON.stringify({ id: msg.id, result: result ?? null }));
++      socket.send(JSON.stringify({ id: msg.id, result: result ?? null }));
+     } catch (err) {
+-      ws.send(JSON.stringify({ id: msg.id, error: String(err.message || err) }));
++      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ id: msg.id, error: String(err.message || err) }));
+     }
+@@ -56,2 +76,5 @@ function connect() {
+   };
++  } finally {
++    connecting = false;
++  }
+ }
 diff --git a/extension/content.js b/extension/content.js
 index e0f2904..9fa5110 100644
 --- a/extension/content.js
 +++ b/extension/content.js
-@@ -157,34 +157,60 @@ function cmdClickElement({ selector }) {
- function cmdInputText({ selector, text }) {
-   const el = document.querySelector(selector);
+@@ -159,5 +159,19 @@ function cmdInputText({ selector, text }) {
    if (!el) throw new Error(`元素不存在: ${selector}`);
 +  return typeIntoInput(el, text);
 +}
@@ -26,9 +80,8 @@ index e0f2904..9fa5110 100644
 +    if (Math.random() < 0.12) await sleep(randInt(180, 550));
 +  }
    el.dispatchEvent(new Event("change", { bubbles: true }));
-   return null;
- }
-
+@@ -166,14 +180,15 @@ function cmdInputText({ selector, text }) {
+ 
 -async function cmdInputContentEditable({ selector, text }) {
 -  const el = document.querySelector(selector);
 -  if (!el) throw new Error(`元素不存在: ${selector}`);
@@ -50,16 +103,14 @@ index e0f2904..9fa5110 100644
 +      if (Math.random() < 0.1) await sleep(randInt(150, 500));
 +    }
      if (i < lines.length - 1) {
-       el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+@@ -181,3 +196,4 @@ async function cmdInputContentEditable({ selector, text }) {
        el.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
 -      await sleep(40);
 +      document.execCommand("insertText", false, "\n");
 +      await sleep(randInt(120, 400));
      }
-   }
-   return null;
- }
-
+@@ -187,2 +203,12 @@ async function cmdInputContentEditable({ selector, text }) {
+ 
 +async function cmdInputContentEditable({ selector, text }) {
 +  const el = document.querySelector(selector);
 +  if (!el) throw new Error(`元素不存在: ${selector}`);
@@ -71,24 +122,188 @@ index e0f2904..9fa5110 100644
 +}
 +
  async function cmdSetFileInput({ selector, files }) {
-   const el = document.querySelector(selector);
-   if (!el) throw new Error(`文件输入框不存在: ${selector}`);
+diff --git a/extension/manifest.json b/extension/manifest.json
+index fb18808..cdc7667 100644
+--- a/extension/manifest.json
++++ b/extension/manifest.json
+@@ -3,3 +3,3 @@
+   "name": "XHS Bridge",
+-  "version": "1.0.0",
++  "version": "1.1.0",
+   "description": "小红书自动化 Bridge - 连接本地 Python CLI",
+@@ -7,2 +7,3 @@
+     "tabs",
++    "storage",
+     "cookies",
+diff --git a/scripts/bridge_server.py b/scripts/bridge_server.py
+index e22fe33..c9fa197 100644
+--- a/scripts/bridge_server.py
++++ b/scripts/bridge_server.py
+@@ -29,30 +29,20 @@ class BridgeServer:
+     def __init__(self) -> None:
+-        self._extension_ws: ServerConnection | None = None
+-        self._pending: dict[str, asyncio.Future[Any]] = {}
++        self._clients = {}
++        self._selected = None
++        self._pending = {}
++        self._pairs = {}
+ 
+-    async def handle(self, ws: ServerConnection) -> None:
++    async def handle(self, ws):
+         try:
+-            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+-        except (asyncio.TimeoutError, Exception) as e:
+-            logger.warning("握手超时或失败: %s", e)
++            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
++            if msg.get("role") == "extension":
++                await self._handle_extension(ws, str(msg.get("client_id") or "legacy"))
++            elif msg.get("role") == "cli":
++                await self._handle_cli(ws, msg)
++        except (asyncio.TimeoutError, ConnectionError, ValueError):
+             return
+ 
+-        try:
+-            msg = json.loads(raw)
+-        except json.JSONDecodeError:
+-            return
+-
+-        role = msg.get("role")
+-        if role == "extension":
+-            await self._handle_extension(ws)
+-        elif role == "cli":
+-            await self._handle_cli(ws, msg)
+-        else:
+-            logger.warning("未知 role: %s", role)
+-
+-    # ─── Extension 端（长连接） ───────────────────────────────────────
+-
+-    async def _handle_extension(self, ws: ServerConnection) -> None:
+-        logger.info("Extension 已连接")
+-        self._extension_ws = ws
++    async def _handle_extension(self, ws, client_id):
++        self._clients[client_id] = ws
++        logger.info("Extension connected")
+         try:
+@@ -61,49 +51,71 @@ class BridgeServer:
+                     msg = json.loads(raw)
+-                except json.JSONDecodeError:
++                except ValueError:
++                    continue
++                token = msg.get("pair_token")
++                if token and token in self._pairs:
++                    deadline, _ = self._pairs[token]
++                    if asyncio.get_running_loop().time() < deadline:
++                        self._pairs[token] = (deadline, client_id)
+                     continue
+                 msg_id = msg.get("id")
+-                if msg_id and msg_id in self._pending:
+-                    future = self._pending.pop(msg_id)
+-                    if not future.done():
+-                        future.set_result(msg)
++                entry = self._pending.get(msg_id)
++                if entry and entry[0] is ws:
++                    self._pending.pop(msg_id, None)
++                    if not entry[1].done():
++                        entry[1].set_result(msg)
+         finally:
+-            self._extension_ws = None
+-            logger.info("Extension 已断开")
+-            # 唤醒所有等待中的 CLI 请求并报错
+-            for future in self._pending.values():
+-                if not future.done():
+-                    future.set_exception(ConnectionError("Extension 断开连接"))
+-            self._pending.clear()
+-
+-    # ─── CLI 端（短连接，发一条命令，收一条回复） ─────────────────────
+-
+-    async def _handle_cli(self, ws: ServerConnection, msg: dict) -> None:
+-        # 特殊命令：查询 server/extension 状态，无需转发
+-        if msg.get("method") == "ping_server":
+-            await ws.send(json.dumps({
+-                "result": {"extension_connected": self._extension_ws is not None}
+-            }))
++            # A stale connection must not clear its replacement or another profile.
++            if self._clients.get(client_id) is ws:
++                self._clients.pop(client_id, None)
++            for key, (owner, future) in list(self._pending.items()):
++                if owner is ws:
++                    self._pending.pop(key, None)
++                    if not future.done():
++                        future.set_exception(ConnectionError("目标 Chrome 用户资料的扩展已断开"))
++
++    async def _handle_cli(self, ws, msg):
++        method, params = msg.get("method"), msg.get("params") or {}
++        result = None
++        if method == "ping_server":
++            result = {"extension_connected": bool(self._clients), "clients": list(self._clients),
++                      "selected_client": self._selected, "protocol": 2}
++        elif method == "begin_pair":
++            now = asyncio.get_running_loop().time()
++            self._pairs = {k:v for k,v in self._pairs.items() if v[0] > now}
++            token = uuid.uuid4().hex
++            self._pairs[token] = (now+60, None)
++            result = {"token": token}
++        elif method == "pair_status":
++            entry = self._pairs.get(params.get("token"))
++            result = {"client_id": entry[1] if entry and entry[0] > asyncio.get_running_loop().time() else None}
++        elif method == "select_client":
++            client = params.get("client_id")
++            if client not in self._clients or client == "legacy":
++                await ws.send(json.dumps({"error":"目标用户资料未连接新版扩展，请在该用户资料重新加载 XHS Bridge"}))
++                return
++            self._selected = client
++            result = {"client_id": client}
++        if result is not None:
++            await ws.send(json.dumps({"result": result}))
+             return
+-
+-        if not self._extension_ws:
+-            await ws.send(json.dumps({"error": "Extension 未连接，请确认浏览器已安装并启用 XHS Bridge 扩展"}))
++        client = msg.get("client_id") or self._selected
++        # Legacy single-profile CLI remains usable, but never guesses among profiles.
++        if not client and len(self._clients) == 1:
++            client = next(iter(self._clients))
++        target = self._clients.get(client)
++        if target is None:
++            await ws.send(json.dumps({"error":"目标 Chrome 用户资料未连接或未选择，请重新连接账号"}))
+             return
+-
+         msg_id = str(uuid.uuid4())
+         msg["id"] = msg_id
+-
+-        loop = asyncio.get_event_loop()
+-        future: asyncio.Future[Any] = loop.create_future()
+-        self._pending[msg_id] = future
+-
+-        await self._extension_ws.send(json.dumps(msg))
+-
++        future = asyncio.get_running_loop().create_future()
++        self._pending[msg_id] = (target, future)
+         try:
+-            result = await asyncio.wait_for(future, timeout=90.0)
+-            await ws.send(json.dumps(result))
+-        except asyncio.TimeoutError:
++            await target.send(json.dumps(msg))
++            response = await asyncio.wait_for(future, timeout=90)
++            await ws.send(json.dumps(response))
++        except (asyncio.TimeoutError, ConnectionError) as exc:
++            await ws.send(json.dumps({"error":str(exc) or "命令执行超时（90s）"}))
++        finally:
+             self._pending.pop(msg_id, None)
+-            await ws.send(json.dumps({"error": "命令执行超时（90s）"}))
+-        except ConnectionError as e:
+-            await ws.send(json.dumps({"error": str(e)}))
+ 
 diff --git a/scripts/cli.py b/scripts/cli.py
 index 20c459f..178800b 100644
 --- a/scripts/cli.py
 +++ b/scripts/cli.py
-@@ -14,6 +14,7 @@ import json
- import logging
- import os
+@@ -16,2 +16,3 @@ import os
  import sys
 +from typing import Any
-
- # Windows 控制台默认编码（如 cp1252）不支持中文，强制 UTF-8
- if sys.stdout and hasattr(sys.stdout, "reconfigure"):
-@@ -436,6 +437,23 @@ def cmd_user_profile(args: argparse.Namespace) -> None:
-         browser.close()
-
-
+ 
+@@ -438,2 +439,19 @@ def cmd_user_profile(args: argparse.Namespace) -> None:
+ 
 +def cmd_creator_profile(args: argparse.Namespace) -> None:
 +    """读取创作平台：本账号近 N 条笔记 + 数据中心画像文本（账号画像功能的数据源）。"""
 +    from xhs.creator import get_creator_notes, get_datacenter_snapshot
@@ -107,11 +322,7 @@ index 20c459f..178800b 100644
 +
 +
  def cmd_post_comment(args: argparse.Namespace) -> None:
-     """发表评论。"""
-     from xhs.comment import post_comment
-@@ -524,6 +542,11 @@ def cmd_publish(args: argparse.Namespace) -> None:
-                 schedule_time=args.schedule_at,
-                 is_original=args.original,
+@@ -526,2 +544,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
                  visibility=args.visibility or "",
 +                album=args.album or "",
 +                location=args.location or "",
@@ -119,11 +330,7 @@ index 20c459f..178800b 100644
 +                shooting_date=args.shooting_date or "",
 +                shooting_location=args.shooting_location or "",
              ),
-         )
-         _output({"success": True, "title": title, "images": len(image_paths), "status": "发布完成"})
-@@ -558,6 +581,11 @@ def cmd_fill_publish(args: argparse.Namespace) -> None:
-                 schedule_time=args.schedule_at,
-                 is_original=args.original,
+@@ -560,2 +583,7 @@ def cmd_fill_publish(args: argparse.Namespace) -> None:
                  visibility=args.visibility or "",
 +                album=args.album or "",
 +                location=args.location or "",
@@ -131,23 +338,15 @@ index 20c459f..178800b 100644
 +                shooting_date=args.shooting_date or "",
 +                shooting_location=args.shooting_location or "",
              ),
-         )
-         _output({"success": True, "title": title, "images": len(image_paths), "status": "表单已填写，等待确认发布"})
-@@ -599,8 +627,8 @@ def cmd_click_publish(args: argparse.Namespace) -> None:
-
-     browser, page = _connect_existing(args)
+@@ -601,4 +629,4 @@ def cmd_click_publish(args: argparse.Namespace) -> None:
      try:
 -        click_publish_button(page)
 -        _output({"success": True, "status": "发布完成"})
 +        confirmation = click_publish_button(page)
 +        _output({"success": True, "status": "发布完成", **confirmation})
      finally:
-         browser.close()
-
-@@ -781,6 +809,12 @@ def build_parser() -> argparse.ArgumentParser:
-     sub.add_argument("--xsec-token", required=True)
-     sub.set_defaults(func=cmd_user_profile)
-
+@@ -783,2 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
+ 
 +    # creator-profile：读创作平台本账号笔记+数据中心（账号画像数据源）
 +    sub = subparsers.add_parser("creator-profile", help="读取创作平台近 N 条笔记及数据中心画像")
 +    sub.add_argument("--max-count", type=int, default=20)
@@ -155,11 +354,7 @@ index 20c459f..178800b 100644
 +    sub.set_defaults(func=cmd_creator_profile)
 +
      # post-comment
-     sub = subparsers.add_parser("post-comment", help="发表评论")
-     sub.add_argument("--feed-id", required=True)
-@@ -820,6 +854,11 @@ def build_parser() -> argparse.ArgumentParser:
-     sub.add_argument("--schedule-at")
-     sub.add_argument("--original", action="store_true")
+@@ -822,2 +856,7 @@ def build_parser() -> argparse.ArgumentParser:
      sub.add_argument("--visibility")
 +    sub.add_argument("--album", default="")
 +    sub.add_argument("--location", default="")
@@ -167,11 +362,7 @@ index 20c459f..178800b 100644
 +    sub.add_argument("--shooting-date", default="")
 +    sub.add_argument("--shooting-location", default="")
      sub.set_defaults(func=cmd_publish)
-
-     # publish-video
-@@ -841,6 +880,11 @@ def build_parser() -> argparse.ArgumentParser:
-     sub.add_argument("--schedule-at")
-     sub.add_argument("--original", action="store_true")
+@@ -843,2 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
      sub.add_argument("--visibility")
 +    sub.add_argument("--album", default="")
 +    sub.add_argument("--location", default="")
@@ -179,40 +370,34 @@ index 20c459f..178800b 100644
 +    sub.add_argument("--shooting-date", default="")
 +    sub.add_argument("--shooting-location", default="")
      sub.set_defaults(func=cmd_fill_publish)
-
-     # fill-publish-video
+diff --git a/scripts/xhs/bridge.py b/scripts/xhs/bridge.py
+index ec0751c..e2dfc2a 100644
+--- a/scripts/xhs/bridge.py
++++ b/scripts/xhs/bridge.py
+@@ -34,2 +34,4 @@ class BridgePage:
+         msg: dict[str, Any] = {"role": "cli", "method": method}
++        if os.environ.get("XHS_BRIDGE_CLIENT"):
++            msg["client_id"] = os.environ["XHS_BRIDGE_CLIENT"]
+         if params:
 diff --git a/scripts/xhs/publish.py b/scripts/xhs/publish.py
-index 3863d67..6169c81 100644
+index 3863d67..a6184f7 100644
 --- a/scripts/xhs/publish.py
 +++ b/scripts/xhs/publish.py
-@@ -9,6 +9,7 @@ import re
- import time
-
+@@ -11,2 +11,3 @@ import time
  from .cdp import Page
 +from .human import sleep_random
  from .errors import ContentTooLongError, PublishError, TitleTooLongError, UploadTimeoutError
- from .selectors import (
-     CONTENT_EDITOR,
-@@ -75,7 +76,7 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
-
-     # 点击"上传图文" TAB
+@@ -77,3 +78,3 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
      _click_publish_tab(page, "上传图文")
 -    time.sleep(1)
 +    sleep_random(700, 1400)
-
-     # 上传图片
-     _upload_images(page, content.image_paths)
-@@ -86,13 +87,18 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
-         logger.warning("标签数量超过10，截取前10个")
-
+ 
+@@ -88,3 +89,3 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
      logger.info(
 -        "发布内容: title=%s, images=%d, tags=%d, schedule=%s, original=%s, visibility=%s",
 +        "发布内容: title=%s, images=%d, tags=%d, schedule=%s, original=%s, visibility=%s, album=%s, location=%s, topic_template=%s, shooting_date=%s, shooting_location=%s",
          content.title,
-         len(content.image_paths),
-         len(tags),
-         content.schedule_time,
-         content.is_original,
+@@ -95,2 +96,7 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
          content.visibility,
 +        content.album,
 +        content.location,
@@ -220,11 +405,7 @@ index 3863d67..6169c81 100644
 +        content.shooting_date,
 +        content.shooting_location,
      )
-
-     # 填写表单（不点击发布）
-@@ -104,39 +110,105 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
-         content.schedule_time,
-         content.is_original,
+@@ -106,2 +112,7 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
          content.visibility,
 +        content.album,
 +        content.location,
@@ -232,8 +413,8 @@ index 3863d67..6169c81 100644
 +        content.shooting_date,
 +        content.shooting_location,
      )
-
-
+@@ -109,25 +120,69 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
+ 
 -def click_publish_button(page: Page) -> None:
 -    """点击发布按钮。
 +def _publish_page_state(page: Page, initial_url: str) -> dict:
@@ -262,16 +443,16 @@ index 3863d67..6169c81 100644
 +        """
 +    )
 +    return state if isinstance(state, dict) else {"url": "", "confirmed": False, "alerts": []}
-
--    用文本内容精确匹配，避免点到旁边的"发布笔记"下拉按钮。
 +
+ 
+-    用文本内容精确匹配，避免点到旁边的"发布笔记"下拉按钮。
 +def click_publish_button(page: Page) -> dict:
 +    """触发平台真实发布事件，并等待平台确认。
 +
 +    新版创作平台的提交按钮是 closed-shadow custom element，普通 DOM 文本
 +    搜索只能找到“定时发布”开关，不能代表真正提交。因此优先派发组件公开
 +    的 ``publish`` 事件，再兼容旧版普通按钮。
-
+ 
      Raises:
 -        PublishError: 点击失败。
 +        PublishError: 找不到提交控件、提交被拒绝或平台未返回确认。
@@ -317,7 +498,7 @@ index 3863d67..6169c81 100644
 +            }
 +            return {clicked: false, reason: '未找到发布按钮'};
          })()
-         """
+@@ -135,6 +190,23 @@ def click_publish_button(page: Page) -> None:
      )
 -    if not clicked:
 -        raise PublishError("未找到发布按钮")
@@ -344,33 +525,21 @@ index 3863d67..6169c81 100644
 +    raise PublishError(
 +        f"已触发发布但未收到平台确认，状态不明{(': ' + detail) if detail else ''}"
 +    )
-
-
- def save_as_draft(page: Page) -> None:
-@@ -156,7 +228,7 @@ def save_as_draft(page: Page) -> None:
-         """
-     )
+ 
+@@ -158,3 +230,3 @@ def save_as_draft(page: Page) -> None:
      if clicked:
 -        time.sleep(2)
 +        sleep_random(1600, 2600)
          logger.info("已点击「暂存离开」，内容已保存到草稿箱")
-     else:
-         logger.warning("未找到「暂存离开」按钮")
-@@ -170,9 +242,9 @@ def _navigate_to_publish_page(page: Page) -> None:
-     """导航到发布页面。"""
-     page.navigate(PUBLISH_URL)
+@@ -172,5 +244,5 @@ def _navigate_to_publish_page(page: Page) -> None:
      page.wait_for_load(timeout=300)
 -    time.sleep(3)
 +    sleep_random(2400, 3800)
      page.wait_dom_stable()
 -    time.sleep(2)
 +    sleep_random(1600, 2600)
-
-
- def _click_publish_tab(page: Page, tab_name: str) -> None:
-@@ -183,26 +255,35 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
-         found = page.evaluate(
-             f"""
+ 
+@@ -185,3 +257,22 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
              (() => {{
 -                // 策略1: 查找 div.creator-tab（过滤隐藏元素）
 +                function isVisible(el) {{
@@ -394,9 +563,7 @@ index 3863d67..6169c81 100644
 +
 +                // 策略1: 查找真实 div.creator-tab（过滤隐藏/埋点诱饵元素）
                  let tabs = document.querySelectorAll({json.dumps(CREATOR_TAB)});
-                 for (const tab of tabs) {{
-                     const titleSpan = tab.querySelector('span.title');
-                     const tabText = titleSpan ? titleSpan.textContent.trim() : tab.textContent.trim();
+@@ -191,16 +282,6 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
                      if (tabText === {json.dumps(tab_name)}) {{
 -                        const rect = tab.getBoundingClientRect();
 -                        const style = window.getComputedStyle(tab);
@@ -417,11 +584,7 @@ index 3863d67..6169c81 100644
 +                        realClick(tab);
 +                        return 'clicked';
                      }}
-                 }}
-                 
-@@ -210,12 +291,8 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
-                 const allElements = document.querySelectorAll('*');
-                 for (const el of allElements) {{
+@@ -212,8 +293,4 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
                      if (el.children.length === 0 && el.textContent.trim() === {json.dumps(tab_name)}) {{
 -                        const rect = el.getBoundingClientRect();
 -                        const style = window.getComputedStyle(el);
@@ -432,38 +595,22 @@ index 3863d67..6169c81 100644
 +                        if (!isVisible(el)) continue;
 +                        realClick(el);
                          return 'clicked';
-                     }}
-                 }}
-@@ -232,7 +309,7 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
-             # 尝试移除弹窗
-             _remove_pop_cover(page)
-
+@@ -234,3 +311,3 @@ def _click_publish_tab(page: Page, tab_name: str) -> None:
+ 
 -        time.sleep(0.2)
 +        sleep_random(120, 260)
-
-     # 调试：输出页面信息
-     debug_info = page.evaluate("""
-@@ -277,7 +354,7 @@ def _upload_images(page: Page, image_paths: list[str]) -> None:
-
-         page.set_file_input(selector, [path])
+ 
+@@ -279,3 +356,3 @@ def _upload_images(page: Page, image_paths: list[str]) -> None:
          _wait_for_upload_complete(page, i + 1)
 -        time.sleep(1)
 +        sleep_random(700, 1400)
-
-
- def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
-@@ -290,7 +367,7 @@ def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
-         if count >= expected_count:
-             logger.info("图片上传完成: %d", count)
+ 
+@@ -292,3 +369,3 @@ def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
              return
 -        time.sleep(0.5)
 +        sleep_random(350, 700)
-
-     raise UploadTimeoutError(f"第{expected_count}张图片上传超时(60s)")
-
-@@ -334,6 +411,11 @@ def _fill_publish_form(
-     schedule_time: str | None,
-     is_original: bool,
+ 
+@@ -336,2 +413,7 @@ def _fill_publish_form(
      visibility: str,
 +    album: str = "",
 +    location: str = "",
@@ -471,12 +618,8 @@ index 3863d67..6169c81 100644
 +    shooting_date: str = "",
 +    shooting_location: str = "",
  ) -> None:
-     """填写表单（不点击发布）。"""
-     # 从正文末尾提取 hashtag 并合并到 tags
-@@ -346,25 +428,42 @@ def _fill_publish_form(
-     if title_len > 20:
-         raise TitleTooLongError(str(title_len), "20")
-
+@@ -348,7 +430,7 @@ def _fill_publish_form(
+ 
 +    started = time.monotonic()
      page.input_text(TITLE_INPUT, title)
 -    time.sleep(0.5)
@@ -485,18 +628,15 @@ index 3863d67..6169c81 100644
 -    logger.info("标题长度检查通过")
 -    time.sleep(1)
 +    logger.info("标题长度检查通过，填表开始")
-
-     # 正文
-     content_selector = _find_content_element(page)
-     page.input_content_editable(content_selector, content)
-
+ 
+@@ -359,3 +441,3 @@ def _fill_publish_form(
      # 回点标题（增强稳定性）
 -    time.sleep(1)
 +    time.sleep(0.2)
      page.click_element(TITLE_INPUT)
-     logger.info("已回点标题输入框")
-
-+    # 话题模板优先使用小红书官方功能；失败时再回退到逐个输入 tags。
+@@ -363,6 +445,23 @@ def _fill_publish_form(
+ 
++    # A requested template must match; silently substituting tags changes the post.
 +    template_applied = False
 +    if topic_template:
 +        try:
@@ -504,11 +644,11 @@ index 3863d67..6169c81 100644
 +            if template_applied:
 +                logger.info("已应用官方话题模板: %s", topic_template)
 +            else:
-+                logger.warning("未能应用官方话题模板，回退到逐个输入话题: %s", topic_template)
++                raise PublishError(f"未找到或未能应用话题模板：{topic_template}")
 +        except PublishError:
 +            raise
 +        except Exception as e:
-+            logger.warning("应用官方话题模板失败，回退到逐个输入话题: %s", e)
++            raise PublishError(f"应用话题模板失败：{topic_template}：{e}") from e
 +
      # 标签
      if tags:
@@ -520,12 +660,13 @@ index 3863d67..6169c81 100644
 +            _input_tags(page, content_selector, missing)
 +    sleep_random(700, 1400)
      _check_content_max_length(page)
-     logger.info("正文长度检查通过")
-
-@@ -375,6 +474,15 @@ def _fill_publish_form(
-     # 可见范围
-     _set_visibility(page, visibility)
-
+@@ -373,2 +472,4 @@ def _fill_publish_form(
+         _set_schedule_publish(page, schedule_time)
++    else:
++        _set_schedule_enabled(page, False)
+ 
+@@ -377,2 +478,11 @@ def _fill_publish_form(
+ 
 +    # 专辑/合集和地点是网页端频繁改版区域；这里做 best-effort，失败只写日志，不中断核心填表。
 +    if album:
 +        _set_album_best_effort(page, album)
@@ -536,12 +677,8 @@ index 3863d67..6169c81 100644
 +        _restore_title_if_needed(page, title)
 +
      # 原创声明
-     if is_original:
-         try:
-@@ -383,7 +491,193 @@ def _fill_publish_form(
-         except Exception as e:
-             logger.warning("设置原创声明失败: %s", e)
-
+@@ -385,3 +495,188 @@ def _fill_publish_form(
+ 
 -    logger.info("表单填写完成，等待确认发布")
 +    if shooting_date or shooting_location:
 +        try:
@@ -616,8 +753,7 @@ index 3863d67..6169c81 100644
 +            }};
 +            const inputs = Array.from(document.querySelectorAll('input')).filter(visible);
 +            const input = inputs.find(el => (el.placeholder || '').includes('搜索'))
-+                || inputs.find(el => (el.placeholder || '').includes('合集'))
-+                || inputs.find(el => el.type === 'text' || el.type === 'search');
++                || inputs.find(el => (el.placeholder || '').includes('合集'));
 +            if (!input) return false;
 +            const proto = Object.getPrototypeOf(input);
 +            const desc = Object.getOwnPropertyDescriptor(proto, 'value');
@@ -730,35 +866,23 @@ index 3863d67..6169c81 100644
 +        logger.info("已尝试填写地点/位置: %s", location)
 +    else:
 +        logger.warning("未找到地点/位置控件，请手动选择: %s", location)
-
-
- def _find_content_element(page: Page) -> str:
-@@ -444,7 +738,7 @@ def _check_content_max_length(page: Page) -> None:
-
- def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
+ 
+@@ -446,3 +741,3 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
      """输入标签。"""
 -    time.sleep(1)
 +    sleep_random(700, 1400)
-
-     # 先记录当前段落数（insertParagraph 之前），之后用于精确定位正文最后一段
-     # 注意：必须在 insertParagraph 之前记录，否则 para_count_before 会包含新增的 tags 行
-@@ -470,7 +764,7 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
-         }})()
-         """
+ 
+@@ -472,3 +767,3 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
      )
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
-
-     for tag in tags:
-         tag = tag.lstrip("#")
-@@ -498,39 +792,201 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
-         }})()
-         """
+ 
+@@ -500,3 +795,3 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
      )
 -    time.sleep(0.3)
 +    sleep_random(200, 450)
-
-
+ 
+@@ -504,31 +799,193 @@ def _input_tags(page: Page, content_selector: str, tags: list[str]) -> None:
  def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
 -    """输入单个标签。"""
 -    # 输入 #
@@ -775,7 +899,7 @@ index 3863d67..6169c81 100644
 -    clicked = False
 +    """One bridge input per topic; choose an exact suggestion, never a random first row."""
 +    started = time.monotonic()
-+    page.type_text("#" + tag, delay_ms=0)
++    page.type_text("#" + tag, delay_ms=100)
 +    deadline = time.monotonic() + 2.5
      while time.monotonic() < deadline:
 -        time.sleep(0.5)
@@ -903,7 +1027,7 @@ index 3863d67..6169c81 100644
 +        while time.monotonic() < deadline:
 +            state = _template_state(page)
 +            if state.get("found"):
-+                break
+                 break
 +            time.sleep(0.2)
 +        for _ in range(12):
 +            state = _template_state(page)
@@ -915,19 +1039,19 @@ index 3863d67..6169c81 100644
 +                logger.info("话题模板 %s 匹配 %s，耗时 %.1fs", template_name, found["name"], time.monotonic()-started)
 +                return bool(applied)
 +            if not _template_state(page, "scroll").get("moved"):
-                 break
++                break
 +            time.sleep(0.15)
 +        logger.warning("话题模板 %s 未找到唯一匹配，将使用指定话题", template_name)
 +        return False
 +    finally:
 +        # Cleanup on success, no match, timeout and exceptions alike.
 +        _close_topic_template(page)
-
+ 
 -    if not clicked:
 -        # 没有联想，直接空格
 -        logger.warning("未找到标签联想，直接输入空格: %s", tag)
 -        page.type_text(" ", delay_ms=0)
-
+ 
 -    time.sleep(0.8)
 +def _click_topic_template_entry(page: Page) -> bool:
 +    opened_topic_menu = page.evaluate(
@@ -976,24 +1100,39 @@ index 3863d67..6169c81 100644
 +    if not created:
 +        created = _click_visible_text_best_effort(page, "话题模版")
 +    return bool(created)
-
-
- # ========== 定时发布 ==========
-@@ -546,15 +1002,99 @@ def _set_schedule_publish(page: Page, schedule_time: str) -> None:
-     except ValueError as e:
-         raise PublishError(f"定时发布时间格式错误: {e}") from e
-
+ 
+@@ -538,2 +995,25 @@ def _input_single_tag(page: Page, content_selector: str, tag: str) -> None:
+ 
++def _set_schedule_enabled(page: Page, enabled: bool) -> None:
++    def read_state():
++        return page.evaluate(r"""(() => {
++          const e = document.querySelector('.post-time-wrapper .d-switch');
++          if (!e) return null;
++          const input = e.querySelector('input[type="checkbox"]');
++          if (input) return input.checked;
++          const aria = e.getAttribute('aria-checked');
++          if (aria === 'true' || aria === 'false') return aria === 'true';
++          if (/(?:^|\s)(?:checked|active|is-checked|d-switch-checked)(?:\s|$)/.test(e.className)) return true;
++          return false;
++        })()""")
++
++    current = read_state()
++    if current is None:
++        raise PublishError("无法确认发布页定时开关状态，请检查页面")
++    if current != enabled:
++        page.click_element(SCHEDULE_SWITCH)
++        sleep_random(350, 700)
++        if read_state() != enabled:
++            raise PublishError("发布页定时开关未切换到所选模式")
++
++
+ def _set_schedule_publish(page: Page, schedule_time: str) -> None:
+@@ -548,11 +1028,88 @@ def _set_schedule_publish(page: Page, schedule_time: str) -> None:
+ 
 -    # 点击定时发布开关
 -    page.click_element(SCHEDULE_SWITCH)
 -    time.sleep(0.8)
-+    # 点击定时发布开关；页面改版时退回到文本查找。
-+    try:
-+        page.click_element(SCHEDULE_SWITCH)
-+    except Exception:
-+        clicked = _click_visible_text_best_effort(page, "定时发布")
-+        if not clicked:
-+            raise PublishError("未找到定时发布开关")
-+    sleep_random(550, 1000)
++    _set_schedule_enabled(page, True)
 +
 +    # Native ``datetime-local`` inputs only accept the ``T`` separator.  Older
 +    # custom inputs accept a space, so try both and verify the value the page
@@ -1001,7 +1140,12 @@ index 3863d67..6169c81 100644
 +    datetime_str = dt.strftime("%Y-%m-%dT%H:%M")
 +    legacy_datetime_str = dt.strftime("%Y-%m-%d %H:%M")
 +    expected_prefix = legacy_datetime_str
-+
+ 
+-    # 设置日期时间
+-    datetime_str = dt.strftime("%Y-%m-%d %H:%M")
+-    page.select_all_text(DATETIME_INPUT)
+-    page.input_text(DATETIME_INPUT, datetime_str)
+-    time.sleep(0.5)
 +    def read_datetime_value() -> str:
 +        value = page.evaluate(
 +            f"""
@@ -1025,12 +1169,7 @@ index 3863d67..6169c81 100644
 +
 +    def matches_expected(value: str) -> bool:
 +        return value.replace("T", " ").startswith(expected_prefix)
-
--    # 设置日期时间
--    datetime_str = dt.strftime("%Y-%m-%d %H:%M")
--    page.select_all_text(DATETIME_INPUT)
--    page.input_text(DATETIME_INPUT, datetime_str)
--    time.sleep(0.5)
++
 +    def set_datetime_with_script(value: str) -> bool:
 +        result = page.evaluate(
 +            f"""
@@ -1084,21 +1223,23 @@ index 3863d67..6169c81 100644
 +            f"定时发布时间未写入输入框（期望 {datetime_str}，实际 {actual or '空'}）"
 +        )
 +    sleep_random(350, 700)
-
-     logger.info("已设置定时发布: %s", datetime_str)
-
-@@ -576,7 +1116,7 @@ def _set_visibility(page: Page, visibility: str) -> None:
-
-     # 点击下拉框
+ 
+@@ -566,7 +1123,6 @@ def _set_visibility(page: Page, visibility: str) -> None:
+     """设置可见范围。"""
+-    if not visibility or visibility == "公开可见":
+-        logger.info("可见范围: 公开可见（默认）")
++    if not visibility:
+         return
+ 
+-    supported = {"仅自己可见", "仅互关好友可见"}
++    supported = {"公开可见", "仅自己可见", "仅互关好友可见"}
+     if visibility not in supported:
+@@ -578,3 +1134,3 @@ def _set_visibility(page: Page, visibility: str) -> None:
      page.click_element(VISIBILITY_DROPDOWN)
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
-
-     # 查找并点击目标选项
-     clicked = page.evaluate(
-@@ -598,7 +1138,219 @@ def _set_visibility(page: Page, visibility: str) -> None:
-         raise PublishError(f"未找到可见范围选项: {visibility}")
-
+ 
+@@ -600,3 +1156,215 @@ def _set_visibility(page: Page, visibility: str) -> None:
      logger.info("已设置可见范围: %s", visibility)
 -    time.sleep(0.2)
 +    sleep_random(120, 260)
@@ -1314,39 +1455,23 @@ index 3863d67..6169c81 100644
 +        """
 +    )
 +    return bool(result)
-
-
- # ========== 原创声明 ==========
-@@ -632,7 +1384,7 @@ def _set_original(page: Page) -> None:
-     if result == "not_found":
-         raise PublishError("未找到原创声明选项")
-
+ 
+@@ -634,3 +1402,3 @@ def _set_original(page: Page) -> None:
+ 
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
-
-     # 处理确认弹窗
-     _confirm_original_declaration(page)
-@@ -640,7 +1392,7 @@ def _set_original(page: Page) -> None:
-
- def _confirm_original_declaration(page: Page) -> None:
+ 
+@@ -642,3 +1410,3 @@ def _confirm_original_declaration(page: Page) -> None:
      """处理原创声明确认弹窗。"""
 -    time.sleep(0.8)
 +    sleep_random(550, 1000)
-
-     # 勾选 checkbox
-     page.evaluate(
-@@ -656,7 +1408,7 @@ def _confirm_original_declaration(page: Page) -> None:
-         })()
-         """
+ 
+@@ -658,3 +1426,3 @@ def _confirm_original_declaration(page: Page) -> None:
      )
 -    time.sleep(0.5)
 +    sleep_random(350, 700)
-
-     # 点击声明原创按钮
-     result = page.evaluate(
-@@ -687,4 +1439,4 @@ def _confirm_original_declaration(page: Page) -> None:
-         raise PublishError("声明原创按钮仍处于禁用状态")
-
+ 
+@@ -689,2 +1457,2 @@ def _confirm_original_declaration(page: Page) -> None:
      logger.info("已成功点击声明原创按钮")
 -    time.sleep(0.3)
 +    sleep_random(200, 450)
@@ -1354,142 +1479,11 @@ diff --git a/scripts/xhs/types.py b/scripts/xhs/types.py
 index d14fbd5..67484a4 100644
 --- a/scripts/xhs/types.py
 +++ b/scripts/xhs/types.py
-@@ -421,6 +421,11 @@ class PublishImageContent:
-     schedule_time: str | None = None  # ISO8601 格式，None 表示立即发布
-     is_original: bool = False
+@@ -423,2 +423,7 @@ class PublishImageContent:
      visibility: str = ""  # 公开可见(默认)|仅自己可见|仅互关好友可见
 +    album: str = ""
 +    location: str = ""
 +    topic_template: str = ""
 +    shooting_date: str = ""
 +    shooting_location: str = ""
-
-
- @dataclass
-diff --git a/scripts/xhs/creator.py b/scripts/xhs/creator.py
-new file mode 100644
-index 0000000..e3ec4f5
---- /dev/null
-+++ b/scripts/xhs/creator.py
-@@ -0,0 +1,121 @@
-+"""创作平台数据中心：读取本账号近 N 条笔记 + 首页数据总览，用于账号画像自动生成。
-+
-+2026-10 实测（新版创作平台，路由已改为 /new/ 前缀）：
-+- 笔记管理：https://creator.xiaohongshu.com/new/note-manager
-+  列表元素 [class*="note-card"]，innerText 结构：
-+    [置顶]\n[仅自己可见]\n标题\nYYYY-MM-DD HH:MM\n浏览\n评论\n点赞\n收藏\n分享
-+- 首页 https://creator.xiaohongshu.com/new/home 正文含：
-+  账号名/粉丝数/获赞与收藏/近7日数据总览/最新笔记标题
-+"""
-+
-+from __future__ import annotations
-+
-+import json
-+import logging
-+import time
-+from typing import Any
-+
-+from .cdp import Page
-+
-+logger = logging.getLogger(__name__)
-+
-+NOTE_MANAGER_URL = "https://creator.xiaohongshu.com/new/note-manager"
-+HOME_URL = "https://creator.xiaohongshu.com/new/home"
-+
-+# 从 note-card DOM 提取笔记列表
-+_EXTRACT_NOTES_JS = """
-+(() => {
-+    const cards = document.querySelectorAll('[class*="note-card"]');
-+    const notes = [];
-+    const seen = new Set();
-+    cards.forEach(card => {
-+        const text = (card.innerText || '').trim();
-+        if (!text || seen.has(text)) return;
-+        seen.add(text);
-+        const lines = text.split('\\n').map(s => s.trim()).filter(Boolean);
-+        if (lines.length < 3) return;
-+        // 过滤掉"置顶"/"仅自己可见"标记，找到日期行定位标题
-+        let pinned = false, private_ = false;
-+        const rest = [];
-+        for (const ln of lines) {
-+            if (ln === '置顶') { pinned = true; continue; }
-+            if (ln === '仅自己可见') { private_ = true; continue; }
-+            rest.push(ln);
-+        }
-+        // 找日期行（YYYY-MM-DD）
-+        const di = rest.findIndex(l => /^\\d{4}-\\d{2}-\\d{2}/.test(l));
-+        if (di < 1) return;
-+        const title = rest.slice(0, di).join(' ');
-+        const nums = rest.slice(di + 1).filter(l => /^[\\d,]+$/.test(l)).map(l => parseInt(l.replace(/,/g, ''), 10));
-+        notes.push({
-+            title: title.slice(0, 60),
-+            time: rest[di],
-+            pinned: pinned,
-+            private: private_,
-+            views: nums[0] !== undefined ? nums[0] : '',
-+            likes: nums[2] !== undefined ? nums[2] : '',
-+            collects: nums[3] !== undefined ? nums[3] : '',
-+            comments: nums[4] !== undefined ? nums[4] : '',
-+        });
-+    });
-+    // 按 标题+日期 去重（同一条笔记可能因"仅自己可见"标记被解析成两条）
-+    const dedup = new Map();
-+    for (const n of notes) {
-+        const key = n.title + '|' + n.time;
-+        if (!dedup.has(key) || n.private) dedup.set(key, n);
-+    }
-+    const final = Array.from(dedup.values());
-+    return JSON.stringify({ count: final.length, notes: final.slice(0, 60) });
-+})()
-+"""
-+
-+_EXTRACT_HOME_JS = """
-+(() => {
-+    const text = (document.body.innerText || '').slice(0, 8000);
-+    return JSON.stringify({ url: location.href, text: text });
-+})()
-+"""
-+
-+
-+def get_creator_notes(page: Page, max_count: int = 20, scroll_rounds: int = 5) -> dict[str, Any]:
-+    """读取创作平台笔记管理页，返回近 N 条笔记及数据。"""
-+    try:
-+        page.navigate(NOTE_MANAGER_URL)
-+        page.wait_for_load(timeout=40)
-+        time.sleep(4)
-+
-+        for _ in range(scroll_rounds):
-+            page.evaluate("window.scrollBy(0, 1500)")
-+            time.sleep(1.2)
-+
-+        raw = page.evaluate(_EXTRACT_NOTES_JS)
-+        data = json.loads(raw or "{}")
-+        notes = (data.get("notes") or [])[:max_count]
-+        if notes:
-+            return {"success": True, "url": NOTE_MANAGER_URL, "total": data.get("count"), "notes": notes}
-+        return {"success": False, "error": "笔记管理页未提取到笔记（页面结构可能已变化）"}
-+    except Exception as e:  # noqa: BLE001
-+        logger.warning("笔记管理页读取失败: %s", e)
-+        return {"success": False, "error": str(e)}
-+
-+
-+def get_home_snapshot(page: Page) -> dict[str, Any]:
-+    """读取创作平台首页正文（账号名/粉丝/获赞收藏/近7日数据总览），供 AI 总结。"""
-+    try:
-+        page.navigate(HOME_URL)
-+        page.wait_for_load(timeout=40)
-+        time.sleep(4)
-+        raw = page.evaluate(_EXTRACT_HOME_JS)
-+        data = json.loads(raw or "{}")
-+        text = (data.get("text") or "").strip()
-+        if text and "创作服务平台" in text:
-+            return {"success": True, "url": data.get("url"), "text": text}
-+        return {"success": False, "error": "首页内容异常"}
-+    except Exception as e:  # noqa: BLE001
-+        logger.warning("首页读取失败: %s", e)
-+        return {"success": False, "error": str(e)}
-+
-+
-+def get_datacenter_snapshot(page: Page) -> dict[str, Any]:
-+    """兼容旧接口名：数据中心现以首页数据总览代替。"""
-+    return get_home_snapshot(page)
+ 

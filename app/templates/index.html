@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>小红书发布助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=2026.11.8-materials" />
+    <link rel="stylesheet" href="/static/styles.css?v=2026.11.9-materials" />
     <link rel="stylesheet" href="/static/automation.css?v=1" />
   </head>
   <body>
@@ -247,7 +247,8 @@
                 </label>
                 <label class="plain-field">
                   <span>合集（自动加入）</span>
-                  <input id="defaultAlbum" placeholder="如：女生艺考照" />
+                  <input id="defaultAlbum" list="accountAlbumOptions" placeholder="同步后选择，或填写准确名称" />
+                  <datalist id="accountAlbumOptions"></datalist>
                 </label>
               </div>
               <label class="plain-field">
@@ -335,8 +336,14 @@
               </div>
 
               <div class="setting-group">
-                <div class="setting-label">话题模板管理（每行一个）</div>
-                <textarea id="topicTemplates" rows="3" placeholder="演员资料&#10;艺考录制"></textarea>
+                <div class="setting-label">本地话题模板（按账号保存）</div>
+                <label class="plain-field"><span>模板名称</span><input id="localTemplateName" placeholder="如：艺考照常用" /></label>
+                <label class="plain-field"><span>1–10 个话题，支持一次粘贴</span><textarea id="localTemplateTopics" rows="4" placeholder="#艺考照 #演员资料照&#10;也可每行一个话题"></textarea></label>
+                <div class="profile-actions"><button id="saveLocalTemplateBtn" class="ghost" type="button">保存此模板</button><button id="deleteLocalTemplateBtn" class="ghost" type="button">删除此模板</button></div>
+                <p id="localTemplateStatus" class="muted" role="status"></p>
+                <details><summary>平台模板名称（同步或手动填写）</summary><textarea id="topicTemplates" rows="3" placeholder="每行一个小红书平台已有模板名称"></textarea></details>
+                <button id="syncResourcesBtn" class="ghost" type="button">同步平台话题模板与合集</button>
+                <p id="resourcesStatus" class="muted" role="status">平台同步需要当前账号停留在发布编辑页；本地模板无需同步。</p>
               </div>
 
               <div class="setting-group">
@@ -350,6 +357,15 @@
 
         <!-- ---------- 账号画像视图 ---------- -->
         <section id="pageAutomation" style="display:none" aria-label="自动发布计划"></section>
+        <div id="pageHot" style="display:none">
+          <section class="card">
+            <div class="card-head"><h2 class="block-title">行业热点</h2></div>
+            <p class="muted explain">使用当前账号的 Chrome 用户资料打开小红书搜索，可在小红书页面选择时间和排序条件。</p>
+            <label class="plain-field"><span>搜索关键词</span><input id="hotKeyword" placeholder="输入摄影方向或搜索关键词" /></label>
+            <div class="profile-actions"><button id="hotUseProfileBtn" class="ghost" type="button">使用已保存的账号关键词</button><button id="hotOpenBtn" class="primary" type="button">在 Chrome 中搜索</button></div>
+            <p id="hotStatus" class="muted" role="status"></p>
+          </section>
+        </div>
         <div id="pageProfile" style="display:none">
           <section class="card account-profile-card">
             <div class="card-head">
@@ -359,12 +375,21 @@
             <div class="profile-account-context"><span class="account-avatar" id="profileAvatar" aria-hidden="true"></span><div><strong id="profileAccountName">当前账号</strong><p id="profileAccountStatus" class="muted"></p></div></div>
             <p class="muted explain">填写账号定位，也可结合最近 20 条笔记生成画像。生成成功后自动保存，后续 AI 文案会沿用此账号的定位。</p>
             <div class="two-cols profile-inputs">
-              <label class="plain-field"><span>账号关键词</span><input id="profileKeywords" placeholder="如：艺考照、演员资料照、摄影工作室" /></label>
-              <label class="plain-field"><span>长期话题</span><input id="profileTopics" placeholder="如：艺考照 北京写真 演员资料" /></label>
+              <label class="plain-field"><span>账号关键词</span><textarea id="profileKeywords" rows="5" placeholder="如：艺考照、演员资料照、摄影工作室"></textarea></label>
+              <label class="plain-field"><span>长期话题</span><textarea id="profileTopics" rows="5" placeholder="如：艺考照 北京写真 演员资料"></textarea></label>
             </div>
             <label class="plain-field"><span>账号补充说明</span><textarea id="profileNotes" rows="4" placeholder="手动说明账号服务对象、语气、不能写什么等"></textarea></label>
-            <div class="profile-actions"><button id="genProfileBtn" class="primary" type="button">生成并保存画像</button><span id="profileStatus" class="muted" role="status"></span></div>
+            <label class="plain-field"><span>生成画像的资料来源</span><select id="profileSourceMode"><option value="recent">读取近 20 条笔记，并结合人工补充</option><option value="manual">只用手动填写的资料，不读取平台</option></select></label>
+            <div class="profile-actions"><button id="saveProfileBtn" class="primary" type="button">保存画像和提示词</button><button id="genProfileBtn" class="ghost" type="button">读取近20条并生成画像</button><span id="profileStatus" class="muted" role="status"></span></div>
             <div id="profileBox" class="empty profile-box">尚未生成。生成后文案会按账号定位/赛道/受众自动定制（约需 1-2 分钟）。</div>
+            <div class="setting-group"><div class="setting-label">文案提示词</div>
+              <p class="muted explain">AI 生成时会自动附加当前账号已保存的画像、关键词和补充说明，再结合本组拍摄备注。修改后请先保存；本地模板文案不调用 AI。</p>
+              <label class="plain-field"><span>当前账号已保存的画像信息</span><textarea id="profileApplied" rows="6" readonly></textarea></label>
+              <label class="plain-field"><span>生成前缀</span><textarea id="promptGenerate" rows="4"></textarea></label>
+              <label class="plain-field"><span>重新生成</span><textarea id="promptRegenerate" rows="3"></textarea></label>
+              <label class="plain-field"><span>更自然</span><textarea id="promptNatural" rows="3"></textarea></label>
+            </div>
+            <div id="profileModelSettings"></div>
           </section>
         </div>
 
@@ -393,8 +418,13 @@
             </label>
 
             <div class="setting-group">
-              <div class="setting-label">文案 AI（DeepSeek）</div>
-              <div class="two-cols">
+              <div class="setting-label">文案与账号画像模型 API</div>
+              <label class="plain-field"><span>模型平台</span><select id="textProvider"><option value="deepseek">DeepSeek 官方</option><option value="pptoken">PPToken / OpenAI 兼容接口</option></select></label>
+              <div id="pptokenSettings">
+                <label class="plain-field"><span>API 基础地址（按平台文档填写，包含所需 /v1）</span><input id="textBaseUrl" placeholder="https://你的平台地址/v1" /></label>
+                <div class="two-cols"><label class="plain-field"><span>模型名称</span><input id="pptokenModel" placeholder="平台提供的完整模型 ID" /></label><label class="plain-field"><span>PPToken API Key</span><input id="pptokenKey" type="password" autocomplete="off" placeholder="已保存可留空" /></label></div>
+              </div>
+              <div class="two-cols" id="deepseekSettings">
                 <label class="plain-field">
                   <span>模型</span>
                   <select id="deepseekModel">
@@ -407,11 +437,13 @@
                   <input id="deepseekKey" type="password" placeholder="已保存则可留空" />
                 </label>
               </div>
+              <button id="testModelBtn" class="ghost" type="button">保存并测试文案模型连接</button>
+              <p id="modelStatus" class="muted" role="status"></p>
               <label class="plain-field">
                 <span>文案策略</span>
                 <select id="copyEngineSelect">
                   <option value="auto">自动：AI 优先，失败用模板</option>
-                  <option value="deepseek">DeepSeek：失败时保留当前文案并提示</option>
+                  <option value="deepseek">所选模型平台：失败时保留当前文案并提示</option>
                   <option value="local">本地模板</option>
                   <option value="anthropic">Anthropic 兼容接口</option>
                 </select>
@@ -565,6 +597,8 @@
     <!-- 底部悬浮按钮 -->
     <div class="bottom-bar" id="bottomBar">
       <button id="prefillPublishBtn" class="bottom-btn white" type="button">仅填入发布页</button>
+      <button id="confirmManualPublishBtn" class="bottom-btn white" type="button" hidden>到笔记管理核验</button>
+      <button id="discardManualPublishBtn" class="bottom-btn white" type="button" hidden>放弃待确认记录</button>
       <button id="immediatePublishBtn" class="bottom-btn white" type="button">立即发布</button>
       <button id="schedulePublishBtn" class="bottom-btn red" type="button">定时发布（入队）</button>
     </div>
@@ -597,9 +631,9 @@
       </div>
     </div>
 
-    <div id="runLog" class="run-log">等待操作（版本 2026.11.4）。</div>
+    <div id="runLog" class="run-log">等待操作（版本 2026.11.9）。</div>
 
-    <script src="/static/app.js?v=2026.11.8-materials"></script>
-    <script src="/static/automation.js?v=2026.11.8-materials"></script>
+    <script src="/static/app.js?v=2026.11.9-materials"></script>
+    <script src="/static/automation.js?v=2026.11.9-materials"></script>
   </body>
 </html>

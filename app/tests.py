@@ -51,7 +51,34 @@ class AssistantTests(unittest.TestCase):
         )
         self.assertTrue(copy["title"])
         self.assertTrue(copy["content"])
-        self.assertIn("张三", copy["tags"])
+        self.assertNotIn("张三", copy["tags"])
+
+    def test_publish_preferences_are_account_scoped_and_validated(self) -> None:
+        server.db_set_setting("account_defaults:Profile 1:schedule_windows", ["19:00-21:00"])
+        server.save_publish_preferences("Default", {"visibility": "公开可见", "publish_mode": "immediate"})
+        server.save_publish_preferences("Profile 1", {
+            "visibility": "仅自己可见",
+            "publish_mode": "scheduled",
+            "default_schedule_window": "19:00-21:00",
+            "original_enabled": False,
+        })
+        self.assertEqual(server.account_setting("visibility", profile_dir="Default"), "公开可见")
+        self.assertEqual(server.account_setting("publish_mode", profile_dir="Profile 1"), "scheduled")
+        self.assertEqual(server.account_setting("default_schedule_window", profile_dir="Profile 1"), "19:00-21:00")
+        self.assertFalse(server.account_setting("original_enabled", True, profile_dir="Profile 1"))
+        self.assertTrue(server.account_setting("original_enabled", True, profile_dir="Default"))
+        with self.assertRaises(ValueError):
+            server.save_publish_preferences("Default", {"visibility": "错误"})
+        with self.assertRaises(ValueError):
+            server.save_publish_preferences("Profile 1", {"default_schedule_window": "21:00-22:00"})
+        with self.assertRaises(ValueError):
+            server.save_publish_preferences("Profile 1", {"original_enabled": 0})
+        server.save_publish_preferences("Profile 2", {
+            "default_schedule_window": "早上 10:00",
+            "original_enabled": True,
+        })
+        self.assertEqual(server.account_setting("default_schedule_window", profile_dir="Profile 2"), "早上 10:00")
+        self.assertEqual(server.account_setting("visibility", profile_dir="Default"), "公开可见")
 
     def test_scan_folders_finds_image_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -62,8 +89,53 @@ class AssistantTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].model_name, "张三")
         self.assertEqual(items[0].image_count, 1)
-        self.assertEqual(items[0].duplicate_status, "new")
+        self.assertEqual(items[0].duplicate_status, "not_scored")
         self.assertEqual(items[0].shooting_date, "2026-05-14")
+
+    def test_published_folder_is_not_scanned(self) -> None:
+        root = Path(self.tmp.name) / "materials"
+        (root / "已发布" / "old").mkdir(parents=True)
+        (root / "已发布" / "old" / "old.jpg").write_bytes(b"old")
+        (root / "new").mkdir()
+        (root / "new" / "new.jpg").write_bytes(b"new")
+        self.assertEqual([x.name for x in scan_folders(str(root))], ["new"])
+
+    def test_archive_moves_only_unchanged_group_and_preserves_hierarchy(self) -> None:
+        root = Path(self.tmp.name) / "materials"
+        folder = root / "2026" / "09" / "组一"
+        folder.mkdir(parents=True)
+        image = folder / "one.jpg"
+        image.write_bytes(b"image")
+        payload = {"material_mode": "folder", "material_root": str(root), "folder_path": str(folder), "images": [str(image)]}
+        info = server.make_archive_info(payload)
+        history = server.record_history({**payload, "archive_info": info}, "accepted")
+        result = server.archive_history(history)
+        self.assertIn("已归档", result)
+        self.assertFalse(folder.exists())
+        self.assertEqual((root / "已发布" / "2026" / "09" / "组一" / "one.jpg").read_bytes(), b"image")
+        self.assertEqual(server.archive_history(history), result)
+
+    def test_archive_keeps_mixed_changed_and_conflicting_folders(self) -> None:
+        root = Path(self.tmp.name) / "materials"
+        folder = root / "组一"
+        folder.mkdir(parents=True)
+        image = folder / "one.jpg"
+        image.write_bytes(b"image")
+        payload = {"material_mode": "folder", "material_root": str(root), "folder_path": str(folder), "images": [str(image)]}
+        self.assertIn("skip", server.make_archive_info({**payload, "material_mode": "mixed"}))
+        self.assertIn("skip", server.make_archive_info({**payload, "folder_path": str(root)}))
+        info = server.make_archive_info(payload)
+        history = server.record_history({**payload, "archive_info": info}, "scheduled")
+        (folder / "new.jpg").write_bytes(b"new")
+        self.assertIn("已变化", server.archive_history(history))
+        self.assertTrue(image.exists())
+        (folder / "new.jpg").unlink()
+        info = server.make_archive_info(payload)
+        history = server.record_history({**payload, "archive_info": info}, "accepted")
+        target = root / "已发布" / "组一"
+        target.mkdir(parents=True)
+        self.assertIn("已存在", server.archive_history(history))
+        self.assertTrue(image.exists())
 
     def test_scan_folders_recurses_year_month_and_keeps_hierarchy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,7 +273,7 @@ class AssistantTests(unittest.TestCase):
     def test_manual_profile_continues_when_platform_read_fails(self) -> None:
         captured: dict[str, str] = {}
 
-        def fake_ai(_system: str, prompt: str, timeout: int = 120):
+        def fake_ai(_system: str, prompt: str, timeout: int = 120, profile_dir: str | None = None):
             captured["prompt"] = prompt
             return {
                 "account_type": "摄影工作室",

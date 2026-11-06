@@ -10,7 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def git_apply_check(vendor_dir: Path, patch_file: Path, reverse: bool = False) -> subprocess.CompletedProcess[str]:
-    command = ["git", "-C", str(vendor_dir), "apply"]
+    # Upstream contains harmless whitespace-only changes between snapshots;
+    # keep the integration patch focused on behavior rather than indentation.
+    command = ["git", "-C", str(vendor_dir), "apply", "--ignore-space-change"]
     if reverse:
         command.append("--reverse")
     command.extend(["--check", str(patch_file)])
@@ -33,7 +35,7 @@ def prepare(vendor_dir: Path, patch_file: Path) -> bool:
         raise RuntimeError(f"vendor 补丁无法应用，可能需要人工解决上游冲突：\n{detail}")
 
     result = subprocess.run(
-        ["git", "-C", str(vendor_dir), "apply", str(patch_file)],
+        ["git", "-C", str(vendor_dir), "apply", "--ignore-space-change", str(patch_file)],
         capture_output=True,
         text=True,
         check=False,

@@ -24,7 +24,7 @@ DEFAULT_PLAN = {
     "styles": ["praise", "professional", "process", "opinion", "story"],
     "copy_library": [], "allow_template_fallback": False, "tags": [], "mentions": [],
     "album": "", "location": "", "topic_template": "", "original": True,
-    "visibility": "仅自己可见", "expected_user_id": "", "account_name": "",
+    "visibility": "公开可见", "expected_user_id": "", "account_name": "",
     "fx_params": {}, "submission_hour_limit": 3, "submission_day_limit": 12,
 }
 
@@ -76,6 +76,7 @@ class AutomationEngine:
             result["config"] = {**DEFAULT_PLAN, **json.loads(result["config"])}
             return result
         config = {**DEFAULT_PLAN, "root_path": self.app.account_setting("root_path", "", profile),
+                  "visibility": self.app.account_setting("visibility", "公开可见", profile),
                   "fx_params": self.app.get_fx_params(profile_dir=profile)}
         return {"profile_dir": profile, "config": config, "enabled": False, "state": "paused", "last_error": ""}
 
@@ -309,8 +310,9 @@ class AutomationEngine:
                 else:
                     copy = self.app.generate_template_copy(args)
             self.validate_copy(copy)
-            tags = list(dict.fromkeys([*config["tags"], *copy.get("tags", [])]))[:10]
+            tags = list(dict.fromkeys(config["tags"]))[:10]
             payload = {"automation": True, "profile_dir": profile, "folder_path": folder.path,
+                       "material_mode": "folder", "material_root": config["root_path"], "archive_source_images": selected,
                        "folder_name": folder.name, "images": images, "model_name": folder.model_name,
                        "style": style, "title": copy["title"], "content": copy["content"], "tags": tags,
                        "publish_mode": "scheduled", "schedule_time": slot.strftime("%Y-%m-%dT%H:%M"),
@@ -385,33 +387,76 @@ class AutomationEngine:
                 self.incident(profile, f"自动制作失败：{exc}。请检查规则或素材后恢复计划。", "prepare_error")
         self.reconcile_due()
 
-    def reconcile_due(self):
-        """Verify accepted scheduled notes after their due time; never resubmit them."""
-        now = time.time()
+    def next_receipt_job(self, now=None):
+        """Return one submitted task ready for a management-page receipt check."""
+        now = time.time() if now is None else float(now)
         with self.app.db_connection() as db:
             db.row_factory = sqlite3.Row
-            row = db.execute("""SELECT j.* FROM publish_jobs j JOIN publish_history h ON h.id=j.history_id
+            rows = db.execute("""SELECT j.*,h.created_at AS history_created_at,h.status AS history_status,
+                r.next_check AS receipt_next_check,r.receipt AS receipt_json
+                FROM publish_jobs j JOIN publish_history h ON h.id=j.history_id
                 LEFT JOIN automation_receipts r ON r.job_id=j.id
-                WHERE j.status='submitted' AND json_extract(j.payload,'$.automation')=1
+                WHERE j.status='submitted'
                 AND h.status IN ('scheduled','reviewing','accepted')
-                AND json_extract(j.payload,'$.schedule_epoch')<? AND COALESCE(r.next_check,0)<=?
-                ORDER BY j.id LIMIT 1""", (now-300, now)).fetchone()
+                AND COALESCE(r.next_check,0)<=?
+                ORDER BY j.id""", (now,)).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            completed = row.get("completed_at") or row.get("started_at") or row.get("history_created_at")
+            try:
+                completed_epoch = datetime.fromisoformat(completed).timestamp()
+            except (TypeError, ValueError):
+                completed_epoch = 0
+            if completed_epoch and completed_epoch <= now - 20:
+                return row
+        return None
+
+    def reconcile_due(self):
+        """Verify all accepted tasks in note management; never resubmit them."""
+        now = time.time()
+        row = self.next_receipt_job(now)
         if not row:
             return
         payload = json.loads(row["payload"])
+        payload["receipt_reference_time"] = row.get("completed_at") or row.get("started_at") or row.get("history_created_at")
         try:
             from publish_checks import read_management, match_receipt
             with self.app.BROWSER_LOCK:
+                if self.app.manual_pending(row["profile_dir"]):
+                    return  # Never navigate away from a human's unsubmitted draft.
                 self.app.switch_chrome_profile(row["profile_dir"])
                 self.app.check_task_identity(payload)
                 receipt = match_receipt(read_management(self.app.XHS_SKILL_DIR), payload)
-            if receipt["status"] in {"published", "reviewing", "scheduled"}:
+            if receipt["status"] in {"published", "reviewing", "scheduled", "rejected"}:
                 self.app.update_history_status(row["history_id"], receipt["status"])
-            if receipt["status"] == "rejected" or (now-payload["schedule_epoch"] > 7200 and receipt["status"] != "published"):
+            if receipt["status"] == "published":
+                with self.app.db_connection() as db:
+                    archive_row = db.execute(
+                        "SELECT archive_result FROM publish_history WHERE id=?", (row["history_id"],)
+                    ).fetchone()
+                archive_result = str((archive_row or [""])[0] or "")
+                if archive_result.startswith("未自动归档"):
+                    notifications.add_alert(
+                        self.app,
+                        row["profile_dir"],
+                        row["profile_dir"],
+                        "archive_error",
+                        f"任务 #{row['id']} 已在笔记管理确认发布，但素材{archive_result}。请手动核对归档。",
+                    )
+            due_epoch = float(payload.get("schedule_epoch") or 0)
+            reference_epoch = due_epoch or datetime.fromisoformat(payload["receipt_reference_time"]).timestamp()
+            if receipt["status"] == "rejected" or (now-reference_epoch > 7200 and receipt["status"] != "published"):
+                self.app.db_set_setting("queue_enabled", False)
                 self.incident(row["profile_dir"], f"任务 #{row['id']} 到点后的平台结果需要处理：{receipt.get('reason')}。请在平台核对。", "receipt_error")
-            next_check = now + 1800
+            if receipt["status"] == "scheduled" and due_epoch > now:
+                next_check = max(now + 1800, due_epoch + 300)
+            elif receipt["status"] in {"reviewing", "unconfirmed"}:
+                next_check = now + 600
+            else:
+                next_check = now + 1800
         except Exception as exc:
             receipt = {"status": "unconfirmed", "reason": str(exc)[:300]}
+            self.app.db_set_setting("queue_enabled", False)
             self.incident(row["profile_dir"], f"任务 #{row['id']} 无法核对平台结果：{exc}。已暂停后续发布。", "receipt_error")
             next_check = now + 3600
         with self.app.db_connection() as db:

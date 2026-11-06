@@ -109,9 +109,26 @@ def read_management(skill_dir):
     page.wait_for_load(timeout=30)
     for _ in range(8):
         cards = page.evaluate(r"""(() => {
-          const cards=Array.from(document.querySelectorAll('[class*="note-card"]'));
-          return [...new Map(cards.map(e=>[(e.innerText||'').trim(),{
-            text:(e.innerText||'').trim(),url:e.querySelector('a[href*="/explore/"],a[href*="/discovery/item/"]')?.href||''}])).values()];
+          const cards=Array.from(document.querySelectorAll('.note-card'));
+          const rows=cards.map(e=>{
+            const text=(e.innerText||'').trim();
+            let noteId='';
+            try {
+              const raw=JSON.parse(e.getAttribute('data-impression')||'{}');
+              noteId=String(raw?.noteTarget?.value?.noteId||raw?.noteId||'');
+            } catch (_) {}
+            return {
+              text,
+              title:(e.querySelector('.note-card__title')?.innerText||'').trim(),
+              time:(e.querySelector('.note-card__time')?.innerText||'').trim(),
+              note_id:noteId,
+              private:/(?:^|\n)仅自己可见(?:\n|$)/.test(text),
+              scheduled:/(?:^|\n)定时发布(?:\n|$)/.test(text),
+              url:e.querySelector('a[href*="/explore/"],a[href*="/discovery/item/"]')?.href||''
+            };
+          });
+          const key=row=>row.note_id||row.text;
+          return [...new Map(rows.map(row=>[key(row),row])).values()];
         })()""")
         if cards:
             return cards
@@ -121,26 +138,36 @@ def read_management(skill_dir):
 
 def match_receipt(cards, payload):
     from datetime import datetime
-    expected = datetime.fromisoformat(payload["schedule_time"])
+    schedule_time = str(payload.get("schedule_time") or "").strip()
+    reference_time = str(payload.get("receipt_reference_time") or "").strip()
+    expected = datetime.fromisoformat(schedule_time or reference_time) if (schedule_time or reference_time) else None
+    tolerance = 300
     matches = []
     for card in cards:
         lines = [line.strip() for line in card.get("text", "").splitlines() if line.strip()]
-        if payload["title"] not in lines:
+        title = str(card.get("title") or "").strip()
+        if not title:
+            title = next((line for line in lines if line == payload["title"]), "")
+        if title != payload["title"]:
             continue
-        dates = [re.search(r"20\d{2}-\d{2}-\d{2}[ T]\d{2}:\d{2}", line) for line in lines]
+        time_lines = [str(card.get("time") or "").strip(), *lines]
+        dates = [re.search(r"20\d{2}-\d{2}-\d{2}[ T]\d{2}:\d{2}", line) for line in time_lines]
         dates = [datetime.fromisoformat(m[0]) for m in dates if m]
-        if any(abs((dt-expected).total_seconds()) <= 180 for dt in dates):
+        if expected is None or any(abs((dt-expected).total_seconds()) <= tolerance for dt in dates):
             matches.append(card)
     if len(matches) != 1:
         return {"status": "unconfirmed", "reason": "未找到唯一匹配标题和时间的笔记"}
     card = matches[0]
     text = card["text"]
+    is_private = card.get("private") is True or "仅自己可见" in text
+    if payload.get("visibility") == "仅自己可见" and not is_private:
+        return {"status": "unconfirmed", "reason": "匹配到标题和时间，但管理页没有显示“仅自己可见”"}
     if re.search(r"审核不通过|发布失败|违规|不予通过|已删除", text):
         return {"status": "rejected", "reason": text[:300]}
     if re.search(r"审核中|待审核", text):
         return {"status": "reviewing", "reason": "平台仍在审核"}
-    if re.search(r"定时发布|待发布|草稿", text):
+    if card.get("scheduled") is True or re.search(r"定时发布|待发布|草稿", text):
         return {"status": "scheduled", "reason": "平台仍显示待发布"}
     if re.search(r"已发布|发布成功", text) or all(word in text for word in ("浏览", "点赞")):
-        return {"status": "published", "url": card.get("url", ""), "reason": "管理页匹配到已发布笔记"}
+        return {"status": "published", "note_id": card.get("note_id", ""), "url": card.get("url", ""), "reason": "管理页匹配到已发布笔记"}
     return {"status": "unconfirmed", "reason": "找到匹配笔记，但无法确认平台最终状态"}

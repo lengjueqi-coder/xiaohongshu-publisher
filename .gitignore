@@ -14,6 +14,7 @@ moments/logs/
 *.log
 .xhs-update-*/
 dist/
+.playwright-cli/
 build/
 *.sqlite3
 *.db

@@ -115,7 +115,21 @@ class PreviewCopyTests(unittest.TestCase):
     def test_topic_is_sent_in_one_bridge_call(self):
         page=Mock(); page.evaluate.return_value=True
         form._input_single_tag(page,".ql-editor","演员资料照")
-        page.type_text.assert_called_once_with("#演员资料照",delay_ms=0)
+        page.type_text.assert_called_once_with("#演员资料照",delay_ms=100)
+
+    def test_publish_mode_only_changes_switch_when_needed(self):
+        page = Mock()
+        page.evaluate.side_effect = [True, True, False]
+        with patch.object(form, "sleep_random"):
+            form._set_schedule_enabled(page, True)
+            page.click_element.assert_not_called()
+            form._set_schedule_enabled(page, False)
+        page.click_element.assert_called_once_with(form.SCHEDULE_SWITCH)
+
+    def test_publish_mode_stops_if_switch_cannot_be_confirmed(self):
+        page = Mock(); page.evaluate.return_value = None
+        with self.assertRaisesRegex(form.PublishError, "无法确认"):
+            form._set_schedule_enabled(page, True)
 
 
 if __name__ == "__main__":
