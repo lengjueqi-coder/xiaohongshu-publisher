@@ -379,6 +379,246 @@ index ec0751c..e2dfc2a 100644
 +        if os.environ.get("XHS_BRIDGE_CLIENT"):
 +            msg["client_id"] = os.environ["XHS_BRIDGE_CLIENT"]
          if params:
+diff --git a/scripts/xhs/creator.py b/scripts/xhs/creator.py
+new file mode 100644
+index 0000000..edf1330
+--- /dev/null
++++ b/scripts/xhs/creator.py
+@@ -0,0 +1,234 @@
++"""Read recent creator notes without changing or submitting platform content.
++
++The creator note manager only renders titles and counters. Full text and
++topics are loaded by the platform's existing note-update page, so this module
++opens each eligible note read-only and records per-note completeness. A
++failed detail read is kept as an explicit error; it is never represented as
++an empty but successfully analysed note.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++import json
++import logging
++import re
++import time
++from typing import Any
++from urllib.parse import quote
++
++from .cdp import Page
++
++logger = logging.getLogger(__name__)
++
++NOTE_MANAGER_URL = "https://creator.xiaohongshu.com/new/note-manager"
++HOME_URL = "https://creator.xiaohongshu.com/new/home"
++UPDATE_NOTE_URL = "https://creator.xiaohongshu.com/publish/update"
++_NOTE_ID_RE = re.compile(r"^[0-9a-fA-F]{16,64}$")
++
++
++_EXTRACT_NOTES_JS = r"""
++(() => {
++    const cards = [...document.querySelectorAll('.note-card')];
++    const notes = [];
++    const seen = new Set();
++    const noteId = card => {
++        try {
++            const raw = JSON.parse(card.getAttribute('data-impression') || '{}');
++            return String(raw?.noteTarget?.value?.noteId || '');
++        } catch (_) { return ''; }
++    };
++    for (const card of cards) {
++        const id = noteId(card);
++        const title = (card.querySelector('.note-card__title')?.innerText || '').trim();
++        const publishedAt = (card.querySelector('.note-card__time')?.innerText || '').trim();
++        const text = (card.innerText || '').trim();
++        if (!id || !title || seen.has(id)) continue;
++        seen.add(id);
++        const stats = [...card.querySelectorAll('.note-card__stat')]
++            .map(e => Number((e.innerText || '').replace(/,/g, '').trim()))
++            .filter(Number.isFinite);
++        notes.push({
++            note_id: id,
++            title,
++            time: publishedAt,
++            pinned: /(?:^|\n)置顶(?:\n|$)/.test(text),
++            private: /(?:^|\n)仅自己可见(?:\n|$)/.test(text),
++            scheduled: /(?:^|\n)定时发布(?:\n|$)/.test(text),
++            views: stats.length > 0 ? stats[0] : '',
++            comments: stats.length > 1 ? stats[1] : '',
++            likes: stats.length > 2 ? stats[2] : '',
++            collects: stats.length > 3 ? stats[3] : '',
++            shares: stats.length > 4 ? stats[4] : '',
++        });
++    }
++    return JSON.stringify({ count: notes.length, notes });
++})()
++"""
++
++
++_EXTRACT_UPDATE_NOTE_JS = r"""
++(() => {
++    const url = location.href;
++    const titleInput = [...document.querySelectorAll('input')]
++        .find(e => (e.getAttribute('placeholder') || '').includes('填写标题'));
++    const editor = document.querySelector('.tiptap.ProseMirror[contenteditable="true"], [contenteditable="true"].ProseMirror');
++    if (!titleInput || !editor) {
++        const body = (document.body?.innerText || '').slice(0, 500);
++        return { ready: false, url, login: /\/login(?:\?|$)/.test(url), body };
++    }
++    const tags = [];
++    for (const node of editor.querySelectorAll('[data-topic], .tiptap-topic')) {
++        let name = '';
++        try { name = JSON.parse(node.getAttribute('data-topic') || '{}').name || ''; }
++        catch (_) {}
++        name = String(name || node.innerText || '')
++            .replace(/\[话题\]/g, '').replace(/^#|#$/g, '').trim();
++        if (name && !tags.includes(name)) tags.push(name);
++    }
++    const clone = editor.cloneNode(true);
++    clone.querySelectorAll('[data-topic], .tiptap-topic, .ProseMirror-separator').forEach(e => e.remove());
++    clone.querySelectorAll('br').forEach(e => e.replaceWith('\n'));
++    clone.querySelectorAll('p,div,li').forEach(e => e.append('\n'));
++    const content = (clone.textContent || '')
++        .replace(/\u00a0/g, ' ')
++        .replace(/[ \t]+\n/g, '\n')
++        .replace(/\n{3,}/g, '\n\n')
++        .trim();
++    return {
++        ready: true,
++        url,
++        title: String(titleInput.value || '').trim(),
++        content,
++        tags,
++    };
++})()
++"""
++
++
++_EXTRACT_HOME_JS = r"""
++(() => {
++    const text = (document.body.innerText || '').slice(0, 8000);
++    return JSON.stringify({ url: location.href, text: text });
++})()
++"""
++
++
++def _published_sort_key(note: dict[str, Any]) -> tuple[datetime, str]:
++    """Sort newest first while keeping malformed timestamps deterministic."""
++    raw = str(note.get("time") or "").strip()
++    try:
++        parsed = datetime.strptime(raw[:16], "%Y-%m-%d %H:%M")
++    except ValueError:
++        parsed = datetime.min
++    return parsed, str(note.get("note_id") or "")
++
++
++def _detail_url(note_id: str) -> str:
++    if not _NOTE_ID_RE.fullmatch(note_id):
++        raise ValueError("笔记 ID 格式无效")
++    return f"{UPDATE_NOTE_URL}?id={quote(note_id)}&noteType=normal"
++
++
++def _read_note_detail(page: Page, note: dict[str, Any], timeout: float = 12.0) -> dict[str, Any]:
++    note_id = str(note.get("note_id") or "")
++    page.navigate(_detail_url(note_id))
++    page.wait_for_load(timeout=min(40.0, max(1.0, timeout)))
++    deadline = time.monotonic() + timeout
++    state: Any = None
++    while time.monotonic() < deadline:
++        state = page.evaluate(_EXTRACT_UPDATE_NOTE_JS)
++        if isinstance(state, dict) and state.get("ready"):
++            return state
++        if isinstance(state, dict) and state.get("login"):
++            raise RuntimeError("创作平台登录已失效")
++        time.sleep(0.35)
++    url = state.get("url") if isinstance(state, dict) else ""
++    raise RuntimeError(f"笔记详情未加载完成{f'（{url}）' if url else ''}")
++
++
++def _enrich_note_details(page: Page, notes: list[dict[str, Any]]) -> None:
++    for note in notes:
++        note["content"] = ""
++        note["tags"] = []
++        try:
++            detail = _read_note_detail(page, note)
++            if detail.get("title"):
++                note["title"] = str(detail["title"])[:100]
++            note["content"] = str(detail.get("content") or "")[:10000]
++            note["tags"] = [str(tag)[:100] for tag in (detail.get("tags") or [])[:30] if str(tag).strip()]
++            note["detail_status"] = "complete" if note["content"] or note["tags"] else "empty"
++            if note["detail_status"] == "empty":
++                note["detail_error"] = "详情页没有可读取的正文或话题"
++        except Exception as exc:  # noqa: BLE001 - one bad note must not discard the rest
++            note["detail_status"] = "failed"
++            note["detail_error"] = f"{type(exc).__name__}: {exc}"[:300]
++            logger.warning("笔记 %s 详情读取失败: %s", note.get("note_id"), exc)
++
++
++def get_creator_notes(page: Page, max_count: int = 20, scroll_rounds: int = 5) -> dict[str, Any]:
++    """Return recent published notes plus read-only detail completeness."""
++    navigated_to_detail = False
++    try:
++        page.navigate(NOTE_MANAGER_URL)
++        page.wait_for_load(timeout=40)
++        time.sleep(2)
++
++        for _ in range(scroll_rounds):
++            page.evaluate("window.scrollBy(0, 1500)")
++            time.sleep(0.8)
++
++        raw = page.evaluate(_EXTRACT_NOTES_JS)
++        data = json.loads(raw or "{}")
++        all_notes = data.get("notes") or []
++        published = [note for note in all_notes if not note.get("scheduled")]
++        published.sort(key=_published_sort_key, reverse=True)
++        notes = published[:max_count]
++        if not notes:
++            return {"success": False, "error": "笔记管理页未提取到已发布笔记（页面结构可能已变化）"}
++
++        navigated_to_detail = True
++        _enrich_note_details(page, notes)
++        complete = sum(note.get("detail_status") == "complete" for note in notes)
++        failed = sum(note.get("detail_status") == "failed" for note in notes)
++        return {
++            "success": True,
++            "url": NOTE_MANAGER_URL,
++            "total": len(published),
++            "manager_total": data.get("count"),
++            "detail_complete": complete,
++            "detail_failed": failed,
++            "notes": notes,
++        }
++    except Exception as exc:  # noqa: BLE001
++        logger.warning("笔记管理页读取失败: %s", exc)
++        return {"success": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
++    finally:
++        if navigated_to_detail:
++            try:
++                page.navigate(NOTE_MANAGER_URL)
++                page.wait_for_load(timeout=30)
++            except Exception as exc:  # noqa: BLE001
++                logger.warning("返回笔记管理页失败: %s", exc)
++
++
++def get_home_snapshot(page: Page) -> dict[str, Any]:
++    """Read the creator home overview used as supplementary profile context."""
++    try:
++        page.navigate(HOME_URL)
++        page.wait_for_load(timeout=40)
++        time.sleep(4)
++        raw = page.evaluate(_EXTRACT_HOME_JS)
++        data = json.loads(raw or "{}")
++        text = (data.get("text") or "").strip()
++        if text and "创作服务平台" in text:
++            return {"success": True, "url": data.get("url"), "text": text}
++        return {"success": False, "error": "首页内容异常"}
++    except Exception as exc:  # noqa: BLE001
++        logger.warning("创作平台首页读取失败: %s", exc)
++        return {"success": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
++
++
++def get_datacenter_snapshot(page: Page) -> dict[str, Any]:
++    """Compatibility alias: the current platform exposes its overview on home."""
++    return get_home_snapshot(page)
 diff --git a/scripts/xhs/publish.py b/scripts/xhs/publish.py
 index 3863d67..a6184f7 100644
 --- a/scripts/xhs/publish.py

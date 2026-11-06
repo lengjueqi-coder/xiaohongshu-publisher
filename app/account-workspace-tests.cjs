@@ -712,9 +712,9 @@ test("latest-version and network-failure states are visible even for automatic c
   app.context.fetch=async()=>({ok:true,json:async()=>({ok:true,update_available:false,current_version:"2026.11.7"})});
   await app.checkForUpdates(true);
   assert.match(app.get("updateStatus").textContent,/2026.11.7.*已是最新/);
-  app.context.fetch=async()=>({ok:true,json:async()=>({ok:true,update_available:false,current_version:"2026.11.9",latest_version:"2026.11.8"})});
+  app.context.fetch=async()=>({ok:true,json:async()=>({ok:true,update_available:false,current_version:"2026.11.10",latest_version:"2026.11.9"})});
   await app.checkForUpdates(true);
-  assert.match(app.get("updateStatus").textContent,/本地 v2026\.11\.9.*GitHub 最新 v2026\.11\.8/);
+  assert.match(app.get("updateStatus").textContent,/本地 v2026\.11\.10.*GitHub 最新 v2026\.11\.9/);
   app.context.fetch=async()=>{throw Error("offline");};
   await app.checkForUpdates(true);
   assert.match(app.get("updateStatus").textContent,/检查失败/);

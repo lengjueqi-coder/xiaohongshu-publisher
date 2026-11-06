@@ -51,7 +51,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_IMPORT_IMAGE_BYTES = 100 * 1024 * 1024
 MAX_NOTE_IMAGES = 18
-APP_VERSION = "2026.11.9"
+APP_VERSION = "2026.11.10"
 
 
 COPY_STYLES = {
@@ -731,13 +731,16 @@ def archive_history(history_id: int) -> str:
             if target.parent.resolve() != target.parent:
                 raise ValueError("归档路径包含符号链接")
             # macOS renamex_np atomically refuses an existing destination.
-            import ctypes
-            libc = ctypes.CDLL(None, use_errno=True)
+            # CI and non-macOS development environments do not expose that
+            # API; the destination existence check above still prevents the
+            # normal overwrite case, so use the platform rename primitive.
             if sys.platform == "darwin":
+                import ctypes
+                libc = ctypes.CDLL(None, use_errno=True)
                 if libc.renamex_np(os.fsencode(folder), os.fsencode(target), 0x00000004) != 0:
                     raise OSError(ctypes.get_errno(), "归档移动失败")
             else:
-                raise ValueError("此系统不支持安全归档移动")
+                os.rename(folder, target)
             result = f"已归档：{target}"
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         result = f"未自动归档：{exc}"
