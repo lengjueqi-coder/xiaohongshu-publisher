@@ -167,6 +167,12 @@ async function officialPage(p) {
       return true;
     }
     case 'blur_editor':editor().blur();return true;
+    case 'external_repost_selected': {
+      const dialog=vis('.semi-modal-content').find(e=>text(e).includes('对作品内容添加声明'));
+      if(!dialog)return false;
+      const selected=all('label.semi-radio-checked',dialog).map(text);
+      return selected.includes('取材站外') && /作者声明[：:]\s*内容来源于\s*站外/.test(text(dialog));
+    }
     case 'radio_checked':return radio(p.value).some(e=>e.querySelector('input').checked);
     case 'read_field':return readField(p.field);
     case 'topic_exists':return vis('[class*=tag-hash-view-name]').some(e=>text(e)===p.value);

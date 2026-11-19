@@ -251,7 +251,33 @@ class Page:
         if actual != value:
             raise ValueError(f'定时读回不一致：期望 {value}，官方页面为 {actual}')
 
+    def verify_repost_origin(self):
+        self.call('focus')
+        self.click(field='declaration')
+        try:
+            self.wait_repost_origin()
+        finally:
+            self.click(button='取消', dialog=True)
+
+    def wait_repost_origin(self):
+        for _ in range(12):
+            if self.dom('external_repost_selected'):
+                return
+            time.sleep(.15)
+        raise ValueError('抖音没有确认转载声明为取材站外')
+
     def declaration(self, payload):
+        if self.platform=='douyin' and payload['declaration']=='内容为转载信息':
+            self.call('focus')
+            self.click(field='declaration')
+            self.dom('activate', option='内容为转载信息', field='declaration')
+            self.click(radio='取材站外')
+            self.wait_repost_origin()
+            self.click(button='确定', dialog=True)
+            time.sleep(.4)
+            if self.dom('exists', selector='.semi-modal-content'):
+                raise ValueError('抖音转载声明弹窗尚未确认')
+            return
         self.choose('declaration', payload['declaration'])
         if self.platform != 'channels':
             return

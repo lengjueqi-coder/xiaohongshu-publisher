@@ -201,8 +201,12 @@ def focus_declaration_page(page):
         end tell
     end run"""
     result = subprocess.run(["osascript", "-e", script, url], capture_output=True, timeout=8)
-    if result.returncode:
-        raise ValueError("请将本次绑定的小红书发布页切到前台，再继续核对声明")
+    if result.returncode == 0:
+        for _ in range(6):
+            if page.evaluate("document.hasFocus() && !document.hidden"):
+                return
+            time.sleep(.15)
+    raise ValueError("小红书发布页未获得焦点，请解锁 Mac 并将绑定发布页切到前台，再继续核对声明")
 
 
 def apply_extra_settings(skill_dir, payload):

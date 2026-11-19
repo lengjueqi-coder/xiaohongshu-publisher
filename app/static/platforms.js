@@ -18,7 +18,7 @@
   function schedule(){return radio('publish_mode',s.active==='douyin'?'发布时间':'定时发表',[['immediate',s.active==='douyin'?'立即发布':'不定时'],['scheduled',s.active==='douyin'?'定时发布':'定时']])+`<div class="mp-row mp-schedule" ${s.settings[s.active].publish_mode!=='scheduled'?'hidden':''}><span>北京时间</span><div><input type="datetime-local" data-field="schedule_time" value="${esc(s.settings[s.active].schedule_time.replace(' ','T'))}"><small>2 小时后、14 天内；填写后核对到分钟。</small></div></div>`;}
   function upload(){return `<section class="mp-upload"><input id="mpFileInput" type="file" hidden ${s.kind==='image'?'multiple accept="image/*"':'accept="video/*"'}><button class="mp-drop" type="button" data-action="choose"><span class="mp-plus">＋</span><strong>${s.kind==='image'?'选择图片':'选择视频'}</strong><small>${s.kind==='image'?(s.active==='douyin'?'最多 35 张，单张不超过 50MB':'最多 18 张，单张不超过 20MB'):(s.active==='douyin'?'3 小时以内，单个不超过 64GB':'8 小时以内，单个不超过 20GB')}</small></button><ol class="mp-files">${s.shared.files.map((f,i)=>`<li><span>${i+1}. ${esc(f.split('/').pop())}</span><button type="button" data-remove="${i}" aria-label="移除素材">×</button></li>`).join('')}</ol><div class="mp-inline"><button type="button" data-action="upload">上传到${names[s.active]}</button><button type="button" data-action="reuse">从小红书带入素材和文案</button></div></section>`;}
   function caption(){return `${input('title',s.active==='douyin'?'作品标题':s.kind==='image'?'图文标题':'共用标题',s.active==='douyin'?'添加作品标题':s.kind==='image'?'填写标题，22 个字符内':'用作其他平台标题与本平台短标题')}<div class="mp-row mp-description"><span>${s.active==='douyin'?'作品正文':s.kind==='image'?'图文描述':'视频描述'}</span><div class="mp-editor"><textarea data-field="content" placeholder="${s.active==='douyin'?'添加作品描述…':'添加描述'}">${esc(s.shared.content)}</textarea><div class="mp-editor-foot"><button type="button" data-action="topic">#${s.active==='douyin'?'添加话题':'话题'}</button><button type="button" data-action="native" title="此项需在官方页面选择，暂不支持自动分发">@${s.active==='douyin'?'好友':'视频号'}</button><span>${s.shared.content.length} / 1000</span></div></div></div>${input('tags','话题','用逗号或 # 分隔，例如 摄影,光影')}<p class="mp-common-note">标题、正文、话题和素材在抖音、视频号之间共用。平台设置分别保存。自动核对覆盖本页所列字段；自定义封面、@、链接需在官方页面操作，尚不属于自动分发核对范围。</p>`;}
-  function declaration(){return `<label class="mp-row"><span>${s.active==='douyin'?'自主声明':'视频标注'}</span><select data-field="declaration">${declarations[s.active].map(v=>`<option ${s.settings[s.active].declaration===v?'selected':''}>${esc(v)}</option>`).join('')}</select></label>${s.active==='channels'&&s.settings.channels.declaration==='内容为自行拍摄'?input('shoot_date','拍摄日期','','type="date"')+input('shoot_region','拍摄地点','官方名称，用 / 分隔，例如 中国 / 北京'):''}${s.active==='channels'&&s.settings.channels.declaration==='内容为转载'?input('repost_source','转载来源','填写转载来源'):''}`;}
+  function declaration(){return `<label class="mp-row"><span>${s.active==='douyin'?'自主声明':'视频标注'}</span><select data-field="declaration">${declarations[s.active].map(v=>`<option ${s.settings[s.active].declaration===v?'selected':''}>${esc(v)}</option>`).join('')}</select></label>${s.active==='douyin'&&s.settings.douyin.declaration==='内容为转载信息'?`<label class="mp-row"><span>取材来源</span><select data-field="repost_origin"><option value="">请选择</option><option value="external" ${s.settings.douyin.repost_origin==='external'?'selected':''}>取材站外</option><option value="internal" ${s.settings.douyin.repost_origin==='internal'?'selected':''}>取材站内（需在抖音选原作品）</option></select></label>`:''}${s.active==='channels'&&s.settings.channels.declaration==='内容为自行拍摄'?input('shoot_date','拍摄日期','','type="date"')+input('shoot_region','拍摄地点','官方名称，用 / 分隔，例如 中国 / 北京'):''}${s.active==='channels'&&s.settings.channels.declaration==='内容为转载'?input('repost_source','转载来源','填写转载来源'):''}`;}
   function render(){if(!s.active)return;const p=s.active;const connected=s.bindings[p];const snapshot=s.snapshots[p];const d=s.settings[p];
     $('pagePlatforms').innerHTML=`<div class="mp-workspace mp-${p}">
       <div class="mp-heading"><div><span>${p==='douyin'?'抖音创作者中心':'视频号 · 助手'}</span><h1>${p==='douyin'?'作品发布':s.kind==='image'?'图文管理 / 发表动态':'视频管理 / 发表动态'}</h1></div><button type="button" data-action="history">发布记录</button></div>
@@ -132,6 +132,10 @@
           location:x.location||'不显示位置',visibility:dy?visibility:'public',
           declaration:declarationsFromXhs[x.declaration]?.[dy?0:1]||declarations[platform][0]};
         d.shoot_region=(d.shoot_region||'').split('/').map(v=>v.trim()).filter(Boolean);
+        if(dy&&d.declaration==='内容为转载信息'){
+          if(x.repost_origin!=='external')throw Error('请在小红书转载设置选择抖音取材来源。站内转载需到抖音关联原作品。');
+          d.repost_origin=x.repost_origin;
+        }
         if(video)delete d.music;
         if(!dy){
           delete d.hotspot;delete d.allow_download;
@@ -143,7 +147,7 @@
         if(x.declaration&&!declarationsFromXhs[x.declaration]?.[dy?0:1])warnings.push(names[platform]+'没有对应的“'+x.declaration+'”选项。');
         targets[platform]=d;
         summary.push([names[platform],binding.account,dy?{'public':'公开','private':'仅自己可见','friends':'好友可见'}[visibility]:'公开',
-          d.collection,d.location,d.declaration,d.activity,d.music,d.hotspot,dy?(d.allow_download?'允许下载':'禁止下载'):'',video&&!dy?'短标题：'+(d.short_title||'留空'):''].filter(Boolean).join(' · '));
+          d.collection,d.location,d.declaration,dy&&d.declaration==='内容为转载信息'?'取材站外':'',d.activity,d.music,d.hotspot,dy?(d.allow_download?'允许下载':'禁止下载'):'',video&&!dy?'短标题：'+(d.short_title||'留空'):''].filter(Boolean).join(' · '));
       }
       if(targetNames.length&&(x.mentions.length||x.activities.length||x.original||!x.allow_copy))warnings.push('小红书的 @、关联活动、原创和正文复制设置仅用于小红书。');
       const caption=[(prepareOnly?'填写并停在提交前':'确认发布')+'《'+x.title+'》',x.schedule_time||'立即发布',...summary,...warnings].join('\n');

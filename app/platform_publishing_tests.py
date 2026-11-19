@@ -34,6 +34,13 @@ class PlatformPublishingTests(unittest.TestCase):
         self.snapshot['radios'][0]='公开'
         self.assertFalse(all(x['ok'] for x in compare(self.payload,self.snapshot)))
 
+    def test_douyin_repost_requires_an_explicit_origin(self):
+        self.payload['declaration'] = '内容为转载信息'
+        for origin in ('', 'internal'):
+            with self.subTest(origin=origin), self.assertRaisesRegex(ValueError, '站内转载'):
+                validate({**self.payload, 'repost_origin': origin})
+        self.assertEqual(validate({**self.payload, 'repost_origin': 'external'})['repost_origin'], 'external')
+
     def test_private_scheduled_is_rejected(self):
         self.payload.update(publish_mode='scheduled',schedule_time='2026-11-19 10:25')
         with self.assertRaisesRegex(ValueError,'恢复为公开'):validate(self.payload)

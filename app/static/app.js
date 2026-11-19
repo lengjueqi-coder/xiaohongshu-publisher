@@ -319,6 +319,7 @@ function xhsUiValues() {
     allowCopy: values.allowCopy !== false,
     visibility: typeof values.visibility === "string" ? values.visibility : "",
     declaration: typeof values.declaration === "string" ? values.declaration : "",
+    repostOrigin: values.repostOrigin || "",
     repostSource: String(values.repostSource || ""),
     activityOptions: Array.isArray(values.activityOptions) ? values.activityOptions : [],
     activities: values.activities && typeof values.activities === "object" ? values.activities : {},
@@ -344,6 +345,7 @@ function renderXhsUiSettings() {
   if ($("xhsRepostField")) {
     $("xhsRepostField").hidden = values.declaration !== "内容来源声明：来源转载";
     $("xhsRepostSource").value = values.repostSource;
+    $("xhsRepostOrigin").value = values.repostOrigin;
   }
   $("xhsDeclarationLabel").classList.toggle("has-value", Boolean(values.declaration));
   $("xhsAllowCopyChk").checked = values.allowCopy;
@@ -479,6 +481,7 @@ function currentPayload() {
     profile_dir: state.activeProfile || "Default",
     original: $("originalChk").checked,
     declaration: xhsUiValues().declaration,
+    repost_origin: xhsUiValues().declaration === "内容来源声明：来源转载" ? xhsUiValues().repostOrigin : "",
     repost_source: xhsUiValues().declaration === "内容来源声明：来源转载" ? xhsUiValues().repostSource.trim() : "",
     activities: Object.entries(xhsUiValues().activities).filter(([, selected]) => selected).map(([name]) => name),
     allow_copy: $("xhsAllowCopyChk").checked,
@@ -3720,6 +3723,7 @@ function bindEvents() {
       log(`「${button.dataset.xhsComponent}」已按官方界面保留，自动填页暂未接入。`);
     });
   });
+  $("xhsRepostOrigin").addEventListener("change", () => saveXhsUi({ repostOrigin: $("xhsRepostOrigin").value }));
   $("xhsRepostSource").addEventListener("input", () => saveXhsUi({ repostSource: $("xhsRepostSource").value }));
   $("xhsActivityMoreBtn").addEventListener("click", async () => {
     const profile = state.activeProfile;

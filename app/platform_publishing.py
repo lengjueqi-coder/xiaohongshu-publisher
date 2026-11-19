@@ -20,7 +20,7 @@ DECLARATIONS={
  'douyin':['无需添加自主声明','内容由AI生成','内容为个人观点或见解','内容为转载信息','内容含营销推广信息','虚构演绎，仅供娱乐'],
  'channels':['无需标注','含AI生成内容','内容为虚构剧情，仅供娱乐','个人观点，仅供参考','内容包含营销广告','内容为自行拍摄','内容为转载'],
 }
-FIELDS={'platform','media_type','title','short_title','content','tags','files','visibility','allow_download','publish_mode','schedule_time','declaration','location','collection','activity','music','hotspot','native_settings','shoot_date','shoot_region','repost_source'}
+FIELDS={'platform','media_type','title','short_title','content','tags','files','visibility','allow_download','publish_mode','schedule_time','declaration','location','collection','activity','music','hotspot','native_settings','shoot_date','shoot_region','repost_source','repost_origin'}
 EMPTY_OPTIONS={'collection':'不选择合集','location':'不显示位置','activity':'不参与活动','music':'不添加音乐','hotspot':'不关联热点'}
 
 
@@ -66,6 +66,11 @@ def validate(payload, now=None):
     if platform=='channels' and d.get('visibility','public')!='public':raise ValueError('当前视频号官方网页没有私密/好友可见选项，已阻止提交')
     if 'allow_download' in d and type(d['allow_download']) is not bool:raise ValueError('保存权限格式错误')
     if d.get('declaration') not in DECLARATIONS[platform]:raise ValueError('请选择官方内容声明')
+    if platform=='douyin' and d['declaration']=='内容为转载信息':
+        if d.get('repost_origin') != 'external':
+            raise ValueError('请选择抖音取材来源。站内转载需在抖音选择原作品')
+    else:
+        d.pop('repost_origin', None)
     if platform=='channels' and d['declaration']=='内容为自行拍摄':
         try:shoot=datetime.strptime(d.get('shoot_date',''),'%Y-%m-%d').date()
         except ValueError:raise ValueError('请填写有效的拍摄日期') from None
@@ -348,6 +353,7 @@ class Publisher:
         d=validate(request);page=self.page(d['platform']);snapshot=page.snapshot()
         uploaded=self.uploads.get((d['platform'],page.tab_id))
         if not uploaded or uploaded['files']!=d['files'] or uploaded['stats']!=file_stats(d['files']):raise ValueError('素材上传记录失效，请重新上传')
+        if d.get('repost_origin')=='external':page.verify_repost_origin()
         checks=compare(d,snapshot,uploaded['media'])
         ok=all(c['ok'] for c in checks)
         token=uuid.uuid4().hex if ok else ''
@@ -371,7 +377,9 @@ class Publisher:
             raise ValueError('素材在核对后发生变化，请重新上传核对')
         if self.binding(row[0])!=binding:raise ValueError('连接已变化，请重新核对')
         if request.get('payload_digest') and request['payload_digest']!=digest(d):raise ValueError('文案或设置已修改，请重新填写核验')
-        page.call('focus');s=page.snapshot();checks=compare(d,s,json.loads(row[3]))
+        page.call('focus')
+        if d.get('repost_origin')=='external':page.verify_repost_origin()
+        s=page.snapshot();checks=compare(d,s,json.loads(row[3]))
         if not all(c['ok'] for c in checks):raise ValueError('官方页面在校验后发生变化，已阻止提交：'+','.join(c['field'] for c in checks if not c['ok']))
         # Claim BEFORE the click. If the process dies after clicking, never submit again.
         with self.app.db_connection() as db:
