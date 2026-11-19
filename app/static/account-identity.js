@@ -13,6 +13,7 @@
   const paths = [
     ["user", "userInfo"], ["user", "info"], ["userInfo"],
     ["account", "userInfo"], ["login", "userInfo"], ["user", "currentUser"], ["currentUser"],
+    ["Auth", "userInfo"], ["Auth", "permission", "res", "isLogin"],
   ];
   for (const root of roots) {
     for (const path of paths) {
@@ -21,7 +22,7 @@
       if (!user || user.guest || user.isGuest) continue;
       const own = unwrap(user.basicInfo) || user;
       const userId = firstString(user.userId, user.user_id, own.userId, own.user_id);
-      const nickname = firstString(own.nickname, own.nickName, own.nick_name);
+      const nickname = firstString(own.nickname, own.nickName, own.nick_name, own.userName);
       if (userId && nickname) {
         return {
           logged_in: true, user_id: userId, nickname,
@@ -37,12 +38,14 @@
     const headers = document.querySelectorAll(
       'header .user-info, .header .user-info, .creator-header .user-info, ' +
       '.header .account-info, header .account-info, .header .user, ' +
-      '[class*="header"] [class*="userInfo"], [class*="header"] [class*="user-info"]',
+      '[class*="header"] [class*="userInfo"], [class*="header"] [class*="user-info"], ' +
+      '.d-topbar .user-info, .d-topbar-default .user-info, ' +
+      '#header-area .user-info, .user-info',
     );
     for (const header of headers) {
       const name = header.querySelector(
-        '.user-name, .user-nickname, .nickname, .username, .name, [class*="nickName"], [class*="user-name"]',
-      );
+        '.user-name, .user-nickname, .nickname, .username, .name-box, .name, [class*="nickName"], [class*="user-name"]',
+      ) || header;
       const nickname = name?.textContent?.trim() || "";
       if (!nickname || nickname.length > 100 || ["登录", "退出登录", "创作服务平台"].includes(nickname)) continue;
       const avatar = header.querySelector('img[class*="avatar"], [class*="avatar"] img, img');

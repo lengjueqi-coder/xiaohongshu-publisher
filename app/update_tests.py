@@ -29,7 +29,12 @@ from updater import (
     validate_asset_url,
     verify_sha256,
 )
-from tools import package_release
+try:
+    from tools import package_release
+except ModuleNotFoundError as exc:
+    if exc.name not in {"tools", "tools.package_release"}:
+        raise
+    package_release = None
 
 
 REPOSITORY = "lengjueqi-coder/xiaohongshu-publisher"
@@ -224,6 +229,9 @@ class UpdateQueueTests(unittest.TestCase):
         self.plan_patch = patch.object(server, "has_active_plans", return_value=False)
         self.plan_patch.start()
         self.addCleanup(self.plan_patch.stop)
+        self.manual_queue_patch = patch.object(server, "any_manual_queue_enabled", return_value=False)
+        self.manual_queue_patch.start()
+        self.addCleanup(self.manual_queue_patch.stop)
 
     def test_updates_are_blocked_while_queue_is_enabled_or_submitting(self) -> None:
         with patch.object(server, "db_get_setting", return_value=True):
@@ -241,6 +249,7 @@ class UpdateQueueTests(unittest.TestCase):
             self.assertEqual(server.update_install_block_reason(), "")
 
 
+@unittest.skipIf(package_release is None, "安装包不包含开发用 tools/package_release.py；发布打包测试需在完整源码仓库运行")
 class ReleasePackageTests(unittest.TestCase):
     def test_release_archive_is_versioned_and_excludes_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

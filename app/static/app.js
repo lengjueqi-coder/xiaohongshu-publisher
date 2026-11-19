@@ -6,7 +6,7 @@ const state = {
   current: null,
   style: "professional",
   generated: null,
-  styleCopies: {}, // 5 种风格预生成结果 { style: {title, content, tags} }
+  styleCopies: {}, // 8 种风格预生成结果 { style: {title, content, tags} }
   styleLoading: {},
   copyEpoch: 0,
   collageSelection: [],
@@ -34,9 +34,23 @@ const state = {
   manualPublish: null,
   manualPublishes: new Map(),
   localTopicTemplates: [],
+  manualAlbums: [],
   publishingResources: {},
-  appliedLocalTemplate: "",
+  selectedLocalTemplate: "",
+  platformImportRows: [],
+  platformImportError: "",
+  editingTemplateName: "",
   queuePreview: null,
+  accountEpoch: 0,
+  accountWorkspaceProfile: "",
+  restoringAccount: false,
+  draftSaveTimer: null,
+  draftDirty: false,
+  configLoadId: 0,
+  fxLoadId: 0,
+  historyLoadId: 0,
+  queueLoadId: 0,
+  draftLoadId: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -53,7 +67,9 @@ async function api(path, body = null) {
   const data = await res.json();
   if (!res.ok || data.ok === false) {
     const msg = data.error || data.result?.stderr || data.result?.stdout || "请求失败";
-    throw new Error(msg);
+    const error = new Error(msg);
+    error.data = data;
+    throw error;
   }
   return data;
 }
@@ -189,8 +205,7 @@ function tagsFromInput() {
   return $("tagsInput").value
     .split(/[，,\s#]+/)
     .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 10);
+    .filter(Boolean);
 }
 
 function parseWindowLabel(label) {
@@ -239,39 +254,11 @@ function scheduleWindowsFromEditor() {
     .filter(Boolean);
 }
 
-function topicTemplatesFromInput() {
-  return $("topicTemplates").value
-    .split(/\n+/)
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(0, 50);
-}
-
 function resourceNames(items = []) {
   return items
     .map((item) => typeof item === "string" ? item : item?.name)
     .map((name) => String(name || "").trim())
     .filter(Boolean);
-}
-
-function platformTopicTemplateNames(manual = topicTemplatesFromInput()) {
-  return [...new Set([...manual, ...resourceNames(state.publishingResources.templates || [])])];
-}
-
-function topicTemplateLabel(name) {
-  const synced = resourceNames(state.publishingResources.templates || []).includes(name);
-  return synced ? `[平台已同步] ${name}` : `[未验证名称] ${name}`;
-}
-
-function localTemplateValue(name) {
-  return `local:${name}`;
-}
-
-function selectedTopicTemplate() {
-  const value = $("topicTemplate").value || "";
-  return value.startsWith("local:")
-    ? { local: value.slice(6), platform: "" }
-    : { local: "", platform: value };
 }
 
 function parseLocalTemplateTopics(value) {
@@ -280,10 +267,168 @@ function parseLocalTemplateTopics(value) {
     .map((item) => item.trim().replace(/^#+/, ""))
     .filter(Boolean))];
   if (topics.length < 1 || topics.length > 10) {
-    throw new Error("每个本地模板需要 1–10 个话题；超过 10 个请拆成多个模板。");
+    throw new Error("每个话题模板需要 1–10 个话题；超过 10 个请拆成多个模板。");
   }
   if (topics.some((item) => item.length > 50)) throw new Error("单个话题不能超过 50 字。");
   return topics;
+}
+
+function renderTopicTemplateTabs() {
+  const wrap = $("topicTemplateTabs");
+  if (!wrap) return;
+  const templates = (state.localTopicTemplates || []).slice(0, 10);
+  wrap.innerHTML = templates.map((item) => {
+    const topics = (item.tags || []).map((tag) => `#${tag}`).join(" ");
+    return `<button type="button" class="template-tab${item.name === state.selectedLocalTemplate ? " selected" : ""}" data-template="${escapeHtml(item.name)}" title="${escapeHtml(topics)}">${escapeHtml(item.name)}</button>`;
+  }).join("");
+  wrap.querySelectorAll("[data-template]").forEach((button) => {
+    button.addEventListener("click", () => applyLocalTopicTemplate(button.dataset.template));
+  });
+}
+
+function applyLocalTopicTemplate(name) {
+  const template = (state.localTopicTemplates || []).find((item) => item.name === name);
+  if (!template) return;
+  state.selectedLocalTemplate = template.name;
+  $("tagsInput").value = template.tags.map((tag) => `#${tag}`).join(" ");
+  $("tagPreview").innerHTML = template.tags.map((tag) => `<span class="tag-chip">#${escapeHtml(tag)}</span>`).join("");
+  renderTopicTemplateTabs();
+  updateChecklist();
+  savePublishPreferences({ tags: template.tags, local_topic_template: template.name })
+    .catch((error) => log(`保存话题模板失败：${error.message}`));
+}
+
+function clearSelectedLocalTemplate() {
+  state.selectedLocalTemplate = "";
+  renderTopicTemplateTabs();
+}
+
+const XHS_UI_KEY = "xhsPublishUi.v1";
+
+function xhsUiStore() {
+  try {
+    return JSON.parse(localStorage.getItem(XHS_UI_KEY) || "{}") || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function xhsUiValues() {
+  const values = xhsUiStore()[state.activeProfile] || {};
+  return {
+    allowCopy: values.allowCopy !== false,
+    visibility: typeof values.visibility === "string" ? values.visibility : "",
+    declaration: typeof values.declaration === "string" ? values.declaration : "",
+    repostSource: String(values.repostSource || ""),
+    activityOptions: Array.isArray(values.activityOptions) ? values.activityOptions : [],
+    activities: values.activities && typeof values.activities === "object" ? values.activities : {},
+  };
+}
+
+function saveXhsUi(patch = {}) {
+  const store = xhsUiStore();
+  store[state.activeProfile] = { ...(store[state.activeProfile] || {}), ...patch };
+  try {
+    localStorage.setItem(XHS_UI_KEY, JSON.stringify(store));
+  } catch (_) {
+    // localStorage 不可用时只保留本次会话内的界面状态。
+  }
+}
+
+function renderXhsUiSettings() {
+  if (!$("xhsVisibilityLabel")) return;
+  const values = xhsUiValues();
+  const visibility = values.visibility || $("visibility").value || "公开可见";
+  $("xhsVisibilityLabel").textContent = visibility;
+  $("xhsDeclarationLabel").textContent = values.declaration || "添加内容类型声明";
+  if ($("xhsRepostField")) {
+    $("xhsRepostField").hidden = values.declaration !== "内容来源声明：来源转载";
+    $("xhsRepostSource").value = values.repostSource;
+  }
+  $("xhsDeclarationLabel").classList.toggle("has-value", Boolean(values.declaration));
+  $("xhsAllowCopyChk").checked = values.allowCopy;
+
+  const album = $("defaultAlbum").value.trim();
+  $("xhsCollectionName").textContent = album;
+  $("xhsCollectionName").hidden = !album;
+  $("xhsCollectionClear").hidden = !album;
+
+  const location = $("defaultLocation").value.trim();
+  $("xhsLocationLabel").textContent = location || "添加地点";
+  $("xhsLocationLabel").classList.toggle("has-value", Boolean(location));
+
+  const activityList = $("xhsActivityList");
+  if (activityList) {
+    const names = new Set([...values.activityOptions, ...Object.keys(values.activities).filter(name => values.activities[name])]);
+    const cards = Array.from(names, name => {
+      const card = document.createElement("div");
+      card.className = "xhs-activity-card";
+      const label = document.createElement("b");
+      label.textContent = name;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.activity = name;
+      button.className = "xhs-activity-action";
+      button.classList.toggle("is-linked", Boolean(values.activities[name]));
+      button.textContent = values.activities[name] ? "取消关联" : "关联";
+      card.append(label, button);
+      return card;
+    });
+    activityList.replaceChildren(...cards);
+  }
+  document.querySelectorAll("#xhsVisibilityMenu [data-visibility]").forEach((item) => {
+    item.classList.toggle("is-selected", item.dataset.visibility === visibility);
+  });
+  document.querySelectorAll("#xhsDeclarationMenu [data-declaration]").forEach((item) => {
+    item.classList.toggle("is-selected", item.dataset.declaration === values.declaration);
+  });
+}
+
+function toggleXhsSection(button) {
+  const body = $(button.dataset.collapse);
+  if (!body) return;
+  const expanded = button.getAttribute("aria-expanded") !== "false";
+  button.setAttribute("aria-expanded", String(!expanded));
+  const label = button.querySelector("span");
+  if (label) label.textContent = expanded ? "展开" : "收起";
+  body.hidden = expanded;
+}
+
+function setXhsVisibility(value) {
+  const supported = ["公开可见", "仅自己可见", "仅互关好友可见"];
+  saveXhsUi({ visibility: value });
+  if (supported.includes(value)) {
+    $("visibility").value = value;
+    savePublishPreferences({ visibility: value }).catch((error) => log(`保存可见范围失败：${error.message}`));
+  } else {
+    if ($("visibility").value !== "公开可见") $("visibility").value = "公开可见";
+    log(`「${value}」目前只保留在软件界面，自动填入小红书时按公开可见处理。`);
+  }
+  updateChecklist();
+  renderXhsUiSettings();
+}
+
+function restorePublishMemory() {
+  const template = (state.localTopicTemplates || []).find(
+    (item) => item.name === state.config.last_local_topic_template,
+  );
+  state.selectedLocalTemplate = template ? template.name : "";
+  const tags = template
+    ? template.tags
+    : (Array.isArray(state.config.last_tags) ? state.config.last_tags : []);
+  $("tagsInput").value = tags.map((tag) => `#${tag}`).join(" ");
+  $("tagPreview").innerHTML = tags.map((tag) => `<span class="tag-chip">#${escapeHtml(tag)}</span>`).join("");
+  $("defaultAlbum").value = state.config.default_album || "";
+  $("defaultLocation").value = state.config.default_location || "";
+  $("visibility").value = state.config.visibility || "公开可见";
+  $("publishMode").value = state.config.publish_mode || "scheduled";
+  const windows = Array.isArray(state.config.schedule_windows) ? state.config.schedule_windows : [];
+  const wantedWindow = state.config.default_schedule_window || "";
+  if (wantedWindow && windows.includes(wantedWindow)) $("scheduleWindow").value = wantedWindow;
+  $("originalChk").checked = state.config.original_enabled !== false;
+  syncPublishRadios();
+  renderTopicTemplateTabs();
+  renderXhsUiSettings();
 }
 
 function refreshScheduleWindowOptions(windows = scheduleWindowsFromEditor()) {
@@ -296,52 +441,19 @@ function refreshScheduleWindowOptions(windows = scheduleWindowsFromEditor()) {
   }
 }
 
-function refreshTopicTemplateOptions(templates = topicTemplatesFromInput(), localTemplates = state.localTopicTemplates, preserveTemplate = "") {
-  const current = $("topicTemplate").value;
-  const manual = resourceNames(templates);
-  const synced = resourceNames(state.publishingResources.templates || []);
-  if (preserveTemplate && !preserveTemplate.startsWith("local:")) manual.push(preserveTemplate);
-  const platform = [...new Set([...manual, ...synced])];
-  const local = Array.isArray(localTemplates) ? localTemplates : [];
-  $("topicTemplate").innerHTML = '<option value="">不使用模板</option>' +
-    local.map((item) => `<option value="${escapeHtml(localTemplateValue(item.name))}">[本地] ${escapeHtml(item.name)}</option>`).join("") +
-    platform.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(topicTemplateLabel(item))}</option>`).join("");
-  const validValues = new Set([...platform, ...local.map((item) => localTemplateValue(item.name))]);
-  if (validValues.has(current)) {
-    $("topicTemplate").value = current;
-  } else {
-    $("topicTemplate").value = "";
-  }
-}
-
-function applyTopicTemplateSelection() {
-  const selected = selectedTopicTemplate();
-  if (!selected.local && state.appliedLocalTemplate) {
-    const previous = state.localTopicTemplates.find((item) => item.name === state.appliedLocalTemplate);
-    const expected = previous?.tags.map((tag) => `#${tag}`).join(" ") || "";
-    if ($("tagsInput").value === expected) {
-      $("tagsInput").value = "";
-      $("tagPreview").innerHTML = "";
-    }
-    state.appliedLocalTemplate = "";
-  }
-  if (selected.local) {
-    const template = state.localTopicTemplates.find((item) => item.name === selected.local);
-    if (template) {
-      $("localTemplateName").value = template.name;
-      $("localTemplateTopics").value = template.tags.map((tag) => `#${tag}`).join(" ");
-      $("tagsInput").value = template.tags.map((tag) => `#${tag}`).join(" ");
-      $("tagPreview").innerHTML = template.tags.map((tag) => `<span class="tag-chip">#${escapeHtml(tag)}</span>`).join("");
-      state.appliedLocalTemplate = template.name;
-    }
-  }
-  updateChecklist();
+function ensureCurrentTemplateValid() {
+  if (!state.selectedLocalTemplate) return;
+  const names = new Set((state.localTopicTemplates || []).map((item) => item.name));
+  if (names.has(state.selectedLocalTemplate)) return;
+  state.selectedLocalTemplate = "";
+  renderTopicTemplateTabs();
+  log("当前话题模板不属于这个账号，已自动清空，请重新选择模板。");
 }
 
 function currentPayload() {
+  ensureCurrentTemplateValid();
   const current = state.current || {};
   const publishMode = $("publishMode").value;
-  const selectedTemplate = selectedTopicTemplate();
   const allImages = current.selected_images || [];
   const images = allImages.filter((p) => !state.excluded.has(p));
   return {
@@ -357,8 +469,8 @@ function currentPayload() {
     tags: tagsFromInput(),
     album: $("defaultAlbum").value.trim(),
     location: $("defaultLocation").value.trim(),
-    topic_template: selectedTemplate.platform,
-    local_topic_template: selectedTemplate.local,
+    topic_template: "",
+    local_topic_template: state.selectedLocalTemplate,
     shooting_date: $("shootingDate").value,
     shooting_location: $("defaultLocation").value.trim(),
     publish_mode: publishMode,
@@ -366,6 +478,10 @@ function currentPayload() {
     schedule_time: publishMode === "scheduled" ? $("schedulePreview").value.replace(" ", "T") : "",
     profile_dir: state.activeProfile || "Default",
     original: $("originalChk").checked,
+    declaration: xhsUiValues().declaration,
+    repost_source: xhsUiValues().declaration === "内容来源声明：来源转载" ? xhsUiValues().repostSource.trim() : "",
+    activities: Object.entries(xhsUiValues().activities).filter(([, selected]) => selected).map(([name]) => name),
+    allow_copy: $("xhsAllowCopyChk").checked,
     fx_params: fxParamsFromUI(),
     mentions: ($("mentionsInput")?.value || "").split(/\n+/).map((s) => s.trim()).filter(Boolean),
     visibility: $("visibility").value,
@@ -373,40 +489,147 @@ function currentPayload() {
 }
 
 function updateChecklist() {
+  // 发布确认清单 UI 已移除。发布设置不做提前缓存：仅填入发布页 / 立即发布 /
+  // 定时发布三个入口都会在点击瞬间调用 currentPayload() 读取当时界面上的全部设置。
+  scheduleDraftSave();
+}
+
+function draftSnapshot() {
   const payload = currentPayload();
-  const templateLabel = payload.local_topic_template
-    ? `[本地] ${payload.local_topic_template}`
-    : payload.topic_template ? topicTemplateLabel(payload.topic_template) : "未选择";
-  // 折叠态摘要：一眼看关键信息，无需展开
-  const summary = $("checklistSummary");
-  if (summary) {
-    const mode = payload.publish_mode === "scheduled" ? "定时" : "立即";
-    const time = payload.publish_mode === "scheduled" && payload.schedule_time
-      ? ` ${payload.schedule_time.replace("T", " ")}`
-      : "";
-    summary.textContent = `${payload.images.length} 张图 · ${mode}${time} · 点开查看全部项`;
+  const current = state.current || {};
+  const allImages = current.selected_images || [];
+  return {
+    title: payload.title,
+    content: payload.content,
+    tags: payload.tags,
+    mentions: payload.mentions,
+    selected_local_template: payload.local_topic_template,
+    model_name: payload.model_name,
+    shooting_date: payload.shooting_date,
+    notes: $("notes")?.value || "",
+    album: payload.album,
+    location: payload.location,
+    visibility: payload.visibility,
+    publish_mode: payload.publish_mode,
+    schedule_window: payload.schedule_window,
+    schedule_preview: $("schedulePreview")?.value || "",
+    original: payload.original,
+    style: state.style,
+    folder: current.path
+      ? {
+          path: current.path,
+          name: current.name || "",
+          material_root: current.materialRoot || "",
+          material_mode: current.materialMode || "mixed",
+          all_images: allImages,
+          excluded: [...state.excluded],
+        }
+      : null,
+  };
+}
+
+function scheduleDraftSave() {
+  if (!state.activeProfile || state.restoringAccount || state.queuePreview) return;
+  state.draftDirty = true;
+  clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = setTimeout(() => {
+    state.draftSaveTimer = null;
+    if (!state.draftDirty || state.restoringAccount || state.queuePreview) return;
+    state.draftDirty = false;
+    saveActiveDraft().catch(() => {});
+  }, 700);
+}
+
+async function saveActiveDraft({ profile = state.activeProfile, silent = true } = {}) {
+  if (!profile || state.queuePreview) return null;
+  // 工作区尚未加载完成时不要用空表单覆盖该账号已保存的草稿。
+  if (!state.config || !Object.keys(state.config).length) return null;
+  try {
+    const data = await api("/api/draft", { profile_dir: profile, draft: draftSnapshot() });
+    return data.draft || null;
+  } catch (error) {
+    if (!silent) log(`保存账号草稿失败：${error.message}`);
+    throw error;
   }
-  const items = [
-    ["素材文件夹", payload.folder_path || "未选择"],
-    ["图片数量", `${payload.images.length} 张`],
-    ["标题", payload.title || "未生成"],
-    ["正文", payload.content ? `${payload.content.length} 字` : "未生成"],
-    ["话题", payload.tags.length ? payload.tags.map((t) => `#${t}`).join(" ") : "未生成"],
-    ["话题模板", templateLabel],
-    ["专辑", payload.album || "未设置"],
-    ["拍摄地点", payload.shooting_location || "未设置"],
-    ["拍摄日期", payload.shooting_date || "未识别"],
-    ["发布方式", payload.publish_mode === "scheduled" ? "定时发布" : "立即发布"],
-    ["时间段", payload.publish_mode === "scheduled" ? payload.schedule_window || "未选择" : "不使用"],
-    ["原创声明", "自动勾选"],
-    ["Logo/水印", fxParamsFromUI().fx_enabled ? (fxParamsFromUI().logo_enabled || fxParamsFromUI().watermark_enabled ? "启用，发布时自动叠加" : "启用（未选图，发原图）") : "关闭，发原图"],
-    ["输出方式", { merge: "合并发布不动原图", suffix: "另存 -logo 后缀", replace: "替换原图（有备份）" }[fxParamsFromUI().output_mode] || "不动原图"],
-    ["可见范围", payload.visibility],
-    ["最终发布", "确认入队后由后台按账号串行提交"],
-  ];
-  $("checklist").innerHTML = items
-    .map(([k, v]) => `<li><b>${escapeHtml(k)}</b><span>${escapeHtml(v)}</span></li>`)
+}
+
+async function loadDraft(profile) {
+  const requestId = ++state.draftLoadId;
+  const data = await api(`/api/draft?profile_dir=${encodeURIComponent(profile)}`);
+  if (requestId !== state.draftLoadId || profile !== state.activeProfile) return null;
+  return data.draft || null;
+}
+
+function restoreDraft(draft) {
+  if (!draft) return false;
+  const folder = draft.folder;
+  const tags = Array.isArray(draft.tags) ? draft.tags : [];
+  const hasContent = Boolean(draft.title || draft.content || tags.length || draft.notes);
+  if (folder?.path && Array.isArray(folder.all_images) && folder.all_images.length) {
+    renderRecommendation(
+      {
+        name: folder.name || folder.path.split("/").pop() || "账号草稿",
+        display_name: folder.name || folder.path.split("/").pop() || "账号草稿",
+        path: folder.path,
+        model_name: draft.model_name || "",
+        shooting_date: draft.shooting_date || "",
+        image_count: folder.all_images.length,
+        images: folder.all_images,
+        selected_images: folder.all_images,
+        materialMode: folder.material_mode || "mixed",
+        materialRoot: folder.material_root || "",
+        latest_mtime_label: "账号草稿",
+        score_reason: "从本账号草稿恢复",
+        hierarchy: [],
+        year: "",
+        month: "",
+      },
+      { prefetch: false },
+    );
+    state.excluded = new Set(folder.excluded || []);
+    renderThumbStrip(folder.all_images);
+  } else if (hasContent) {
+    resetMaterialSelection("当前账号有一份未配图片的草稿，请选择素材。");
+  } else {
+    return false;
+  }
+  const template = (state.localTopicTemplates || []).find((item) => item.name === draft.selected_local_template);
+  state.selectedLocalTemplate = template ? template.name : "";
+  $("titleInput").value = draft.title || "";
+  $("contentInput").value = draft.content || "";
+  $("contentCount").textContent = String((draft.content || "").length);
+  $("copyEngine").textContent = "已恢复账号草稿";
+  $("tagsInput").value = tags.map((tag) => `#${tag}`).join(" ");
+  $("tagPreview").innerHTML = tags
+    .map((tag) => `<span class="tag-chip">#${escapeHtml(tag)}</span>`)
     .join("");
+  $("modelName").value = draft.model_name || "";
+  $("shootingDate").value = draft.shooting_date || "";
+  if ($("notes")) $("notes").value = draft.notes || "";
+  $("defaultAlbum").value = draft.album || "";
+  $("defaultLocation").value = draft.location || "";
+  $("visibility").value = draft.visibility || $("visibility").value;
+  $("publishMode").value = draft.publish_mode || $("publishMode").value;
+  const windows = scheduleWindowsFromEditor();
+  if (draft.schedule_window && windows.includes(draft.schedule_window)) {
+    $("scheduleWindow").value = draft.schedule_window;
+  }
+  if ($("schedulePreview")) $("schedulePreview").value = draft.schedule_preview || "";
+  $("originalChk").checked = draft.original !== false;
+  renderManualAlbumChips();
+  renderXhsUiSettings();
+  state.style = draft.style || "professional";
+  document.querySelectorAll("[data-style]").forEach((button) => {
+    button.classList.toggle("selected", button.dataset.style === state.style);
+  });
+  if ($("mentionsInput")) {
+    $("mentionsInput").value = (Array.isArray(draft.mentions) ? draft.mentions : []).join("\n");
+  }
+  renderTopicTemplateTabs();
+  syncPublishRadios();
+  updateCoverPreview();
+  updateChecklist();
+  return true;
 }
 
 function escapeHtml(value) {
@@ -436,27 +659,18 @@ function validatePublishImageCount(images) {
   }
 }
 
-function renderRecommendation(item) {
+function renderRecommendation(item, opts = {}) {
   item.materialMode ||= "folder";
   item.materialRoot ||= $("rootPath").value.trim();
   leaveQueuePreview();
   state.current = item;
   state.excluded = new Set();
   invalidateCopies();
-  ["titleInput", "contentInput", "tagsInput"].forEach(id => { $(id).value = ""; });
+  ["titleInput", "contentInput"].forEach(id => { $(id).value = ""; });
   $("contentCount").textContent = "0";
   $("copyEngine").textContent = "等待生成";
   $("tagPreview").innerHTML = "";
-  state.appliedLocalTemplate = "";
-  $("defaultAlbum").value = state.config.default_album || "";
-  $("defaultLocation").value = state.config.default_location || "";
-  $("visibility").value = state.config.visibility || "公开可见";
-  $("publishMode").value = state.config.publish_mode || "scheduled";
-  if (state.config.default_schedule_window) $("scheduleWindow").value = state.config.default_schedule_window;
-  $("originalChk").checked = state.config.original_enabled !== false;
-  syncPublishRadios();
-  refreshTopicTemplateOptions();
-  applyTopicTemplateSelection();
+  restorePublishMemory();
   $("modelName").value = item.model_name || "";
   $("shootingDate").value = item.shooting_date || "";
   $("recommendation").className = "recommend-card collapsed";
@@ -489,10 +703,10 @@ function renderRecommendation(item) {
   renderThumbStrip(selected);
   updateCoverPreview();
   updateChecklist();
-  prefetchAllStyles();
+  if (opts.prefetch !== false) prefetchAllStyles();
 }
 
-// 推荐后自动生成全部 5 种风格文案：当前风格立即应用，其余后台静默生成
+// 推荐后自动生成全部 8 种风格文案：当前风格立即应用，其余后台静默生成
 function invalidateCopies() {
   state.copyEpoch += 1;
   state.styleCopies = {};
@@ -503,7 +717,7 @@ function invalidateCopies() {
 
 function prefetchAllStyles() {
   const selected = state.style;
-  for (const style of [selected, ...["praise", "professional", "process", "opinion", "story"].filter(s => s !== selected)]) {
+  for (const style of [selected, ...["praise", "professional", "process", "opinion", "story", "painpoint", "knowledge", "advantage"].filter(s => s !== selected)]) {
     generateCopy(style, {apply:style === selected, randomize:false})
       .catch(e => log(`${styleLabel(style)}生成失败：${e.message}`));
   }
@@ -863,6 +1077,7 @@ function renderQueue() {
     if (item.history_status === "published") return "done";
     if (item.history_status === "rejected") return "failed";
     if (["reviewing", "scheduled"].includes(item.history_status)) return "running";
+    if (item.status === "draft" && item.payload?.reviewed) return "confirmed";
     return ({ submitted: "done", submitting: "running", reviewed_page: "running", unknown: "unknown", failed: "failed" }[item.status] || "ready");
   };
   const statusText = (item) => {
@@ -875,7 +1090,7 @@ function renderQueue() {
     if (item.history_status === "rejected") return "管理页确认未通过";
     if (item.history_status === "reviewing") return "管理页确认审核中，素材未归档";
     if (item.history_status === "scheduled") return "管理页确认定时待发布，素材未归档";
-    return ({ submitted: "平台已接收，待管理页核验", submitting: "提交中", reviewed_page: "页面已填入", unknown: "状态不明", failed: "失败", draft: "待审核", paused: "已暂停", cancelled: "已取消" }[item.status] || "待提交");
+    return ({ submitted: "平台已接收，待管理页核验", submitting: "提交中", reviewed_page: "页面已填入", unknown: "状态不明", failed: "失败", draft: item.payload?.reviewed ? "已确认，待按队列发布" : "待审核，点编号查看", paused: "已暂停", cancelled: "已取消" }[item.status] || "待提交");
   };
   list.innerHTML = state.queue.length
     ? state.queue
@@ -896,12 +1111,18 @@ function renderQueue() {
   $("startQueueBtn").style.display = pending && !state.queueEnabled ? "" : "none";
   $("pauseQueueBtn").style.display = state.queueEnabled ? "" : "none";
   $("startQueueBtn").disabled = state.queueEnabled;
+  $("clearCurrentQueueBtn").disabled = !state.queuePreview;
+  const planItem = currentPlanItem();
+  $("planConfirmCurrentBtn").disabled = !planItem;
+  $("planSaveCurrentBtn").disabled = !planItem;
+  $("planConfirmCurrentBtn").textContent = planItem?.payload?.reviewed ? "再次确认当前队列" : "确认当前队列";
   updatePlanBar();
 }
 
 function updateQueuePreviewControls() {
   const previewing = !!state.queuePreview;
-  for (const id of ["prefillPublishBtn", "immediatePublishBtn", "schedulePublishBtn"]) {
+  $("clearCurrentQueueBtn").disabled = !previewing;
+  for (const id of ["prefillPublishBtn", "publishBtn"]) {
     const button = $(id);
     const blockedByPending = !!state.manualPublishes.get(state.activeProfile);
     button.disabled = previewing || blockedByPending;
@@ -912,7 +1133,8 @@ function updateQueuePreviewControls() {
   const publishPage = $("pagePublish");
   const escapeActions = new Set([
     "changeGroupBtn", "recommendBtn", "chooseMaterialFolderBtn", "nextQueueBtn",
-    "pauseQueueBtn", "startQueueBtn", "checklistToggle", "collapseImagesBtn",
+    "clearCurrentQueueBtn", "clearAllQueueBtn",
+    "pauseQueueBtn", "startQueueBtn", "collapseImagesBtn", "planToggleBtn",
     "mediaTabImage", "mediaTabVideo",
   ]);
   const controls = [
@@ -920,9 +1142,12 @@ function updateQueuePreviewControls() {
     $("planTotal"),
     $("dailyLimit"),
   ].filter(Boolean);
+  const draftEditing = previewing && !!currentPlanItem();
+  const planActions = new Set(["planSaveCurrentBtn", "planConfirmCurrentBtn"]);
   for (const control of controls) {
     if (escapeActions.has(control.id)) continue;
-    if (previewing) {
+    const allowEdit = draftEditing && control.tagName !== "BUTTON";
+    if (previewing && !allowEdit && !planActions.has(control.id)) {
       if (!queuePreviewDisabledControls.has(control)) queuePreviewDisabledControls.set(control, control.disabled);
       control.disabled = true;
     } else if (queuePreviewDisabledControls.has(control)) {
@@ -944,7 +1169,8 @@ function captureQueuePreviewPreferences() {
     publishMode: $("publishMode").value,
     scheduleWindow: $("scheduleWindow").value,
     schedulePreview: $("schedulePreview").value,
-    topicTemplate: $("topicTemplate").value,
+    tags: $("tagsInput").value,
+    localTemplate: state.selectedLocalTemplate,
     original: $("originalChk").checked,
     mentions: $("mentionsInput").value,
   };
@@ -976,37 +1202,41 @@ function leaveQueuePreview() {
   $("originalChk").checked = previous.original ?? (state.config.original_enabled !== false);
   $("mentionsInput").value = previous.mentions ?? "";
   syncPublishRadios();
-  refreshTopicTemplateOptions(undefined, state.localTopicTemplates, previous.topicTemplate || "");
-  const valid = [
-    ...state.localTopicTemplates.map((item) => localTemplateValue(item.name)),
-    ...platformTopicTemplateNames(),
-    ...(previous.topicTemplate ? [previous.topicTemplate] : []),
-  ];
-  $("topicTemplate").value = valid.includes(previous.topicTemplate) ? previous.topicTemplate : "";
-  applyTopicTemplateSelection();
+  state.selectedLocalTemplate = previous.localTemplate || "";
+  $("tagsInput").value = previous.tags || "";
+  $("tagPreview").innerHTML = tagsFromInput()
+    .map((tag) => `<span class="tag-chip">#${escapeHtml(tag)}</span>`).join("");
+  renderTopicTemplateTabs();
+  renderManualAlbumChips();
+  renderXhsUiSettings();
   updateQueuePreviewControls();
 }
 
-async function loadQueue() {
-  const data = await api("/api/queue");
-  state.queue = data.items || [];
+async function loadQueue(expectedProfile = state.activeProfile) {
+  const origin = expectedProfile || state.activeProfile;
+  const requestId = ++state.queueLoadId;
+  const data = await api(`/api/queue?profile_dir=${encodeURIComponent(origin)}`);
+  if (requestId !== state.queueLoadId || origin !== state.activeProfile) return;
+  state.queue = Array.isArray(data.items) ? data.items : [];
   state.queueEnabled = !!data.enabled;
   renderQueue();
 }
 
 // 队列串行执行：逐条填表 → 拟人停留 → 软件模拟人工点击「定时发布」→ 随机间隔 → 下一条
 async function runQueue() {
+  const profile = state.activeProfile;
   const pending = state.queue.filter((q) => q.status === "queued");
   if (!pending.length) {
     log("队列里没有待执行的任务。");
     return;
   }
   try {
-    await api("/api/queue/start", {});
+    await api("/api/queue/start", { profile_dir: profile });
+    if (profile !== state.activeProfile) return;
     state.queueEnabled = true;
     renderQueue();
-    log(`已启动后台提交：${pending.length} 条任务。即使刷新页面，队列仍保存在 SQLite 中。遇到登录、网络或页面异常会自动暂停。`);
-    await loadQueue();
+    log(`已启动「${profile}」的后台提交：${pending.length} 条任务。即使刷新页面，队列仍保存在 SQLite 中。遇到登录、网络或页面异常会自动暂停。`);
+    await loadQueue(profile);
   } catch (e) {
     log(`启动队列失败：${e.message}`);
     throw e;
@@ -1014,13 +1244,83 @@ async function runQueue() {
 }
 
 async function pauseQueue() {
-  await api("/api/queue/pause", {});
+  const profile = state.activeProfile;
+  await api("/api/queue/pause", { profile_dir: profile });
+  if (profile !== state.activeProfile) return;
   state.queueEnabled = false;
   renderQueue();
   log("后台队列已暂停，已提交任务不会撤回；待提交任务保留在数据库中。 ");
 }
 
-async function enqueueCurrent() {
+async function clearCurrentQueue() {
+  const preview = state.queuePreview;
+  if (!preview) {
+    log("请先点队列编号回看要清除的那一条任务。");
+    return;
+  }
+  const index = state.queue.findIndex((item) => String(item.id) === String(preview.id));
+  const label = index >= 0 ? `第 ${index + 1} 条` : "当前回看的";
+  if (!confirm(`确定清除${label}任务？只删除队列记录，不影响已发布到平台的笔记。`)) return;
+  const profile = state.activeProfile;
+  const data = await api("/api/queue/clear", { profile_dir: profile, scope: "current", job_id: preview.id });
+  if (profile !== state.activeProfile) return;
+  state.queue = Array.isArray(data.items) ? data.items : [];
+  state.queueEnabled = !!data.enabled;
+  leaveQueuePreview();
+  renderQueue();
+  log(`已清除 ${data.cleared || 0} 条队列任务${data.unknown_cleared ? `（其中 ${data.unknown_cleared} 条结果不明，请到小红书创作中心核对）` : ""}。`);
+  await loadQueue(profile);
+}
+
+async function clearAllQueue() {
+  const profile = state.activeProfile;
+  const total = state.queue.length;
+  if (!total) {
+    log("当前账号的队列已经是空的。");
+    return;
+  }
+  const count = (status) => state.queue.filter((item) => item.status === status).length;
+  const summary = [
+    ["待提交", count("queued")],
+    ["待审核", count("draft")],
+    ["已暂停", count("paused")],
+    ["结果不明", count("unknown")],
+  ].filter(([, value]) => value).map(([label, value]) => `${label} ${value}`).join("、");
+  const unknown = count("unknown");
+  const warning = unknown ? `\n其中 ${unknown} 条结果不明，清除后请自行到小红书创作中心核对。` : "";
+  if (!confirm(`确定清除「${profile}」的全部 ${total} 条队列任务${summary ? `（${summary}）` : ""}？${warning}\n不会暂停自动发布计划，计划可能在下一次扫描时重新生成任务。`)) return;
+  const data = await api("/api/queue/clear", { profile_dir: profile, scope: "all" });
+  if (profile !== state.activeProfile) return;
+  state.queue = Array.isArray(data.items) ? data.items : [];
+  state.queueEnabled = !!data.enabled;
+  if (state.queuePreview) leaveQueuePreview();
+  renderQueue();
+  log(`已清除 ${data.cleared || 0} 条队列任务${data.unknown_cleared ? `（其中 ${data.unknown_cleared} 条结果不明，请到小红书创作中心核对）` : ""}。`);
+  await loadQueue(profile);
+}
+
+async function handleDirectSubmit(data, snapshot, options = {}) {
+  const profile = state.activeProfile;
+  const scheduleLabel = data.schedule_time ? data.schedule_time.replace("T", " ") : "";
+  const warnings = data.warnings?.length ? `\n提醒：${data.warnings.join("；")}` : "";
+  if (data.submitted) {
+    setManualPending(profile, null);
+    await refreshHistory().catch((error) => log(`已提交，但刷新记录失败：${error.message}`));
+    log(`${options.successLabel || "已填入发布页并提交"}${scheduleLabel ? `，发布时间 ${scheduleLabel}` : ""}，历史记录 #${data.history_id}。${warnings}`);
+    await finishCurrentDraft(snapshot);
+    return;
+  }
+  setManualPending(profile, {
+    history_id: data.history_id,
+    title: options.title || "",
+    created_at: new Date().toLocaleString(),
+    snapshot,
+  });
+  await refreshHistory().catch((error) => log(`已填入，但刷新记录失败：${error.message}`));
+  log(`已填入小红书发布页，但自动提交未确认：${data.message || "平台未返回发布确认"}。\n请到小红书页面人工检查：已发出就点「到笔记管理核验」；未发出可手动点击发布后再核验，或点「放弃待确认记录」。${warnings}`);
+}
+
+async function publishScheduled() {
   if (state.queuePreview) throw new Error("这是队列任务快照，不能从回看页面重复提交；请选择新素材后再发布。");
   if (state.manualPublishes.get(state.activeProfile)) {
     throw new Error("当前账号还有待确认的发布页面，请先确认已发布或放弃该记录，避免覆盖。");
@@ -1028,63 +1328,36 @@ async function enqueueCurrent() {
   $("publishMode").value = "scheduled";
   syncPublishRadios();
   await savePublishPreferences({publish_mode: "scheduled"});
+  if (!$("scheduleWindow").value) throw new Error("请先选择发布时间段");
+  if (!$("schedulePreview").value) await previewSchedule();
   const payload = currentPayload();
   validatePublishImageCount(payload.images);
   if (!payload.images.length) throw new Error("没有可发布图片");
   if (!payload.title || !payload.content) throw new Error("请先生成或填写标题、正文");
-  if (payload.publish_mode === "scheduled") {
-    if (!payload.schedule_window) throw new Error("请先选择时间段");
-    if (!payload.schedule_time) await previewSchedule();
+  if (!payload.schedule_time) throw new Error("没有可用的定时发布时间，请重新选择时间段");
+  const timeLabel = payload.schedule_time.replace("T", " ");
+  if (!confirm(`定时发布到当前账号？\n${payload.title}\n${payload.images.length} 张图片 · ${payload.visibility}\n发布时间 ${timeLabel}\n\n点击后软件会填入发布页并提交，由小红书到点发布。`)) return;
+  if (JSON.stringify(currentPayload()) !== JSON.stringify(payload)) {
+    throw new Error("确认期间发布内容或账号发生变化，请重新点击定时发布。");
   }
-  const input = $("dialogTimeInput");
-  const preview = $("schedulePreview").value;
-  if (payload.publish_mode === "scheduled" && preview) {
-    input.value = preview.replace(" ", "T");
-  } else {
-    const d = new Date(Date.now() + 60 * 60 * 1000);
-    d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
-    input.value = d.toISOString().slice(0, 16);
-  }
-  $("scheduleDialog").style.display = "flex";
-}
-
-async function confirmEnqueue() {
-  if (state.queuePreview) throw new Error("这是队列任务快照，不能从回看页面重复入队；请选择新素材后再发布。");
-  if (state.manualPublishes.get(state.activeProfile)) {
-    throw new Error("当前账号还有待确认的发布页面，请先确认已发布或放弃该记录，避免覆盖。");
-  }
-  const snapshot = JSON.stringify(currentPayload());
-  const current = {...currentPayload(), publish_mode:"scheduled"};
-  validatePublishImageCount(current.images);
-  const time = $("dialogTimeInput").value;
-  if (!time) throw new Error("请选择发布时间");
-  const normalizedTime = time.replace(" ", "T").slice(0, 16);
-  const payload = {
-    ...current,
-    schedule_time: normalizedTime,
-    // Only an unchanged, actually displayed suggestion may be replanned by
-    // the backend. A blank suggestion means the user chose the time manually.
-    schedule_auto: Boolean(state.scheduleSuggestion && normalizedTime === state.scheduleSuggestion),
-  };
-  const data = await api("/api/queue/enqueue", { payload, schedule_time: normalizedTime });
-  state.queue = [...state.queue.filter((q) => q.id !== data.job.id), data.job];
-  state.queueEnabled = true;
-  state.scheduleSuggestion = data.job.schedule_time || "";
-  $("scheduleDialog").style.display = "none";
-  renderQueue();
-  await loadQueue().catch((error) => log(`任务已入队，但刷新队列状态失败：${error.message}`));
-  log(`第 ${state.queue.length} 条已入队，发布时间 ${(data.job.schedule_time || normalizedTime).replace("T", " ")}。正在加载下一组…`);
-  await finishCurrentDraft(snapshot);
+  const snapshot = JSON.stringify(payload);
+  log(`正在填入发布页并提交定时发布（${timeLabel}），请不要操作浏览器窗口...`);
+  const data = await api("/api/xhs/submit-publish", payload);
+  await handleDirectSubmit(data, snapshot, {
+    successLabel: "已填入发布页并提交定时发布",
+    title: payload.title,
+  });
 }
 
 function resetEditorForm() {
-  ["titleInput", "contentInput", "tagsInput", "modelName", "notes", "shootingDate"].forEach((id) => ($(id).value = ""));
+  ["titleInput", "contentInput", "modelName", "notes", "shootingDate"].forEach((id) => ($(id).value = ""));
   $("contentCount").textContent = "0";
   $("tagPreview").innerHTML = "";
   $("schedulePreview").value = "";
   state.scheduleSuggestion = "";
   state.collageSelection = [];
-  state.appliedLocalTemplate = "";
+  state.selectedLocalTemplate = "";
+  restorePublishMemory();
   $("copyEngine").textContent = "等待生成";
 }
 
@@ -1122,10 +1395,10 @@ function loadQueueItem(idx) {
   $("visibility").value = p.visibility || "公开可见";
   $("publishMode").value = p.publish_mode || (q.schedule_time ? "scheduled" : "immediate");
   syncPublishRadios();
-  refreshTopicTemplateOptions();
-  $("topicTemplate").value = p.local_topic_template
-    ? localTemplateValue(p.local_topic_template)
-    : p.topic_template || "";
+  renderManualAlbumChips();
+  renderXhsUiSettings();
+  state.selectedLocalTemplate = p.local_topic_template || "";
+  renderTopicTemplateTabs();
   $("mentionsInput").value = (p.mentions || []).join("\n");
   $("schedulePreview").value = (q.schedule_time || "").replace("T", " ");
   state.scheduleSuggestion = "";
@@ -1182,20 +1455,114 @@ function updateTextProviderUI() {
   $("modelStatus").textContent = `画像和文案将使用：${currentTextModelLabel()}`;
 }
 
+function renderManualAlbumChips() {
+  const wrap = $("manualAlbumChips");
+  if (!wrap) return;
+  const current = $("defaultAlbum").value.trim();
+  const names = [...new Set((state.manualAlbums || []).map((name) => String(name || "").trim()).filter(Boolean))];
+  wrap.innerHTML = names.map((name) => `
+    <span class="album-chip${name === current ? " selected" : ""}">
+      <button type="button" class="album-chip-name" data-album="${escapeHtml(name)}">${escapeHtml(name)}</button>
+      <button type="button" class="album-chip-del" data-remove-album="${escapeHtml(name)}" title="从常用合集移除">×</button>
+    </span>`).join("");
+  wrap.querySelectorAll("[data-album]").forEach((button) => {
+    button.addEventListener("click", () => {
+      $("defaultAlbum").value = button.dataset.album;
+      setCollectionEdit(false);
+      $("xhsCollectionPanel").hidden = true;
+      $("xhsCollectionBtn").setAttribute("aria-expanded", "false");
+      renderManualAlbumChips();
+      renderXhsUiSettings();
+      savePublishPreferences({ album: button.dataset.album })
+        .catch((error) => log(`保存合集失败：${error.message}`));
+    });
+  });
+  wrap.querySelectorAll("[data-remove-album]").forEach((button) => {
+    button.addEventListener("click", () => {
+      removeManualAlbum(button.dataset.removeAlbum).catch((error) => log(error.message));
+    });
+  });
+}
+
+async function persistManualAlbums(names) {
+  const profile = state.activeProfile;
+  await api("/api/config", { profile_dir: profile, manual_albums: names });
+  if (profile !== state.activeProfile) return;
+  state.manualAlbums = names;
+  state.config.manual_albums = names;
+  renderManualAlbumChips();
+}
+
+async function addManualAlbum() {
+  const name = $("defaultAlbum").value.trim();
+  if (!name) throw new Error("请先在合集输入框填写小红书上的合集名称。");
+  if (name.length > 100) throw new Error("合集名称不能超过 100 字。");
+  const names = [...new Set([...(state.manualAlbums || []), name])].slice(0, 50);
+  await persistManualAlbums(names);
+  await savePublishPreferences({ album: name });
+  log(`已保存常用合集「${name}」。发布时会按这个名称在小红书合集列表里匹配。`);
+}
+
+async function removeManualAlbum(name) {
+  const names = (state.manualAlbums || []).filter((item) => item !== name);
+  await persistManualAlbums(names);
+  log(`已从常用合集移除「${name}」。`);
+}
+
+function setCollectionEdit(open) {
+  const edit = $("xhsCollectionEdit");
+  if (!edit) return;
+  edit.hidden = !open;
+  $("xhsCollectionBtn").setAttribute("aria-expanded", "false");
+  if (open) {
+    $("xhsCollectionPanel").hidden = true;
+    requestAnimationFrame(() => {
+      $("defaultAlbum").focus();
+      $("defaultAlbum").select();
+    });
+  }
+}
+
+async function syncAccountAlbums() {
+  const button = $("syncAlbumsBtn");
+  const profile = state.activeProfile;
+  button.disabled = true;
+  button.textContent = "同步中…";
+  try {
+    const data = await api("/api/publishing/resources/sync", { profile_dir: profile });
+    if (profile !== state.activeProfile) return;
+    renderPublishingResources(data.resources || {});
+    const count = resourceNames(data.resources?.albums || []).length;
+    const errors = (Array.isArray(data.resources?.errors) ? data.resources.errors : []).filter(Boolean);
+    log(errors.length
+      ? `账号合集同步完成，共 ${count} 个；${errors.join("；")}`
+      : `已同步账号合集：${count} 个。`);
+  } catch (error) {
+    log(`同步账号合集失败：${error.message}`);
+    throw error;
+  } finally {
+    button.disabled = false;
+    button.textContent = "同步账号合集";
+  }
+}
+
 function renderPublishingResources(resources = state.publishingResources) {
   state.publishingResources = resources && typeof resources === "object" ? resources : {};
-  refreshTopicTemplateOptions();
+  renderTopicTemplateTabs();
   const albums = [...new Set(resourceNames(state.publishingResources.albums || []))];
   $("accountAlbumOptions").innerHTML = albums
     .map((name) => `<option value="${escapeHtml(name)}"></option>`)
     .join("");
+  renderManualAlbumChips();
+  const statusEl = $("resourcesStatus");
+  if (!statusEl) return;
   const errors = (state.publishingResources.errors || []).filter(Boolean);
   const status = state.publishingResources.status && typeof state.publishingResources.status === "object"
     ? state.publishingResources.status : {};
   const templateStatus = status.templates && typeof status.templates === "object" ? status.templates : null;
   const albumStatus = status.albums && typeof status.albums === "object" ? status.albums : null;
   if (!state.publishingResources.checked_at && !state.publishingResources.synced_at) {
-    $("resourcesStatus").textContent = "尚未同步平台资源；本地模板可直接使用。";
+    statusEl.textContent = "尚未同步平台资源；本地模板可直接使用。";
     return;
   }
   const checked = state.publishingResources.checked_at || state.publishingResources.synced_at;
@@ -1223,7 +1590,7 @@ function renderPublishingResources(resources = state.publishingResources) {
     : failedRead
       ? `${successfulReads ? "部分读取失败" : "读取失败"}：${messages.join("；") || "平台未返回完整资源"}`
       : messages.join("；") || "读取结果不完整";
-  $("resourcesStatus").textContent = `${summary} · ${outcome}`;
+  statusEl.textContent = `${summary} · ${outcome}`;
 }
 
 function normalizeManualPending(pending, existing = null) {
@@ -1243,7 +1610,7 @@ function renderManualPending() {
   state.manualPublish = pending;
   $("confirmManualPublishBtn").hidden = !pending;
   $("discardManualPublishBtn").hidden = !pending;
-  for (const id of ["prefillPublishBtn", "immediatePublishBtn", "schedulePublishBtn"]) {
+  for (const id of ["prefillPublishBtn", "publishBtn"]) {
     $(id).disabled = !!pending;
     $(id).title = pending ? "当前账号还有待确认的发布页面，请先确认已发布或放弃该记录。" : "";
   }
@@ -1263,62 +1630,232 @@ function setManualPending(profile, pending) {
   return normalized;
 }
 
-async function saveLocalTopicTemplate() {
+async function persistLocalTemplates(previous) {
   const profile = state.activeProfile;
-  const name = $("localTemplateName").value.trim();
-  if (!name || name.length > 60) throw new Error("模板名称不能为空或超过 60 字。");
-  const tags = parseLocalTemplateTopics($("localTemplateTopics").value);
-  const previous = state.localTopicTemplates.map((item) => ({...item, tags:[...item.tags]}));
-  const next = previous.filter((item) => item.name !== name);
-  next.push({name, tags, source:"local"});
-  state.localTopicTemplates = next;
-  refreshTopicTemplateOptions();
-  $("topicTemplate").value = localTemplateValue(name);
-  applyTopicTemplateSelection();
   try {
-    await saveConfig();
+    await api("/api/config", {
+      profile_dir: profile,
+      local_topic_templates: state.localTopicTemplates,
+    });
+    state.config.local_topic_templates = state.localTopicTemplates;
   } catch (error) {
-    if (state.activeProfile === profile) {
+    if (profile === state.activeProfile && previous) {
       state.localTopicTemplates = previous;
-      refreshTopicTemplateOptions();
+      state.config.local_topic_templates = previous;
     }
+    renderTopicTemplateTabs();
+    renderTemplateManagerList();
     throw error;
   }
-  $("localTemplateStatus").textContent = `已为当前账号保存「${name}」（${tags.length} 个话题）。`;
 }
 
-async function deleteLocalTopicTemplate() {
-  const selected = selectedTopicTemplate();
-  const name = selected.local || $("localTemplateName").value.trim();
-  if (!name || !state.localTopicTemplates.some((item) => item.name === name)) throw new Error("请先选择要删除的本地模板。");
-  if (!confirm(`删除当前账号的本地模板「${name}」？`)) return;
-  const previous = state.localTopicTemplates.map((item) => ({...item, tags:[...item.tags]}));
-  state.localTopicTemplates = previous.filter((item) => item.name !== name);
-  refreshTopicTemplateOptions();
-  $("localTemplateName").value = "";
-  $("localTemplateTopics").value = "";
+function renderTemplateManagerList() {
+  const list = $("templateList");
+  if (!list) return;
+  const templates = state.localTopicTemplates || [];
+  list.innerHTML = templates.length
+    ? templates.map((item) => `
+      <div class="template-manager-row${item.name === state.editingTemplateName ? " active" : ""}">
+        <button type="button" class="template-manager-name" data-edit-template="${escapeHtml(item.name)}">${escapeHtml(item.name)}</button>
+        <span class="muted">${item.tags.length} 个话题</span>
+      </div>`).join("")
+    : '<p class="muted">还没有本地模板。点「从平台读取模板」一键导入，或新建空白模板。</p>';
+  list.querySelectorAll("[data-edit-template]").forEach((button) => {
+    button.addEventListener("click", () => editTemplate(button.dataset.editTemplate));
+  });
+}
+
+function editTemplate(name) {
+  const template = (state.localTopicTemplates || []).find((item) => item.name === name);
+  if (!template) return;
+  state.editingTemplateName = name;
+  $("templateNameInput").value = template.name;
+  $("templateTopicsInput").value = template.tags.map((tag) => `#${tag}`).join(" ");
+  $("templateDialogStatus").textContent = `正在编辑「${name}」。`;
+  renderTemplateManagerList();
+}
+
+function openTemplateDialog() {
+  state.editingTemplateName = "";
+  $("templateNameInput").value = "";
+  $("templateTopicsInput").value = "";
+  $("templateImportPanel").hidden = true;
+  $("templateImportHint").textContent = "";
+  $("templateImportList").innerHTML = "";
+  $("templateDialogStatus").textContent = "";
+  renderTemplateManagerList();
+  if (typeof $("templateDialog").showModal === "function") $("templateDialog").showModal();
+  else $("templateDialog").setAttribute("open", "");
+}
+
+function closeTemplateDialog() {
+  if (typeof $("templateDialog").close === "function") $("templateDialog").close();
+  else $("templateDialog").removeAttribute("open");
+}
+
+async function saveTemplateFromDialog() {
+  const name = $("templateNameInput").value.trim();
+  if (!name || name.length > 60) throw new Error("模板名称不能为空或超过 60 字。");
+  const tags = parseLocalTemplateTopics($("templateTopicsInput").value);
+  const duplicate = state.localTopicTemplates.find(
+    (item) => item.name === name && item.name !== state.editingTemplateName,
+  );
+  if (duplicate) throw new Error(`已存在同名模板「${name}」，请换一个名称。`);
+  const existing = state.localTopicTemplates.find((item) => item.name === state.editingTemplateName);
+  if (!existing && state.localTopicTemplates.length >= 10) {
+    throw new Error("最多保存 10 个模板，请先删除不用的模板。");
+  }
+  const previous = state.localTopicTemplates.map((item) => ({ ...item, tags: [...item.tags] }));
+  if (existing) {
+    if (state.selectedLocalTemplate === existing.name) state.selectedLocalTemplate = name;
+    existing.name = name;
+    existing.tags = tags;
+    existing.source = "local";
+  } else {
+    state.localTopicTemplates.push({ name, tags, source: "local" });
+  }
+  state.editingTemplateName = name;
+  renderTopicTemplateTabs();
+  renderTemplateManagerList();
   try {
-    await saveConfig();
+    await persistLocalTemplates(previous);
   } catch (error) {
-    state.localTopicTemplates = previous;
-    refreshTopicTemplateOptions();
-    throw error;
+    $("templateDialogStatus").textContent = `保存失败：${error.message}`;
+    return;
   }
-  $("localTemplateStatus").textContent = `已删除「${name}」。`;
+  $("templateDialogStatus").textContent = `已保存「${name}」（${tags.length} 个话题）。`;
 }
 
-async function syncPublishingResources() {
-  const profile = state.activeProfile;
-  const button = $("syncResourcesBtn");
-  button.disabled = true;
-  $("resourcesStatus").textContent = "正在读取当前账号的平台话题模板与合集…";
+async function deleteTemplateFromDialog() {
+  const name = state.editingTemplateName || state.selectedLocalTemplate;
+  if (!name) throw new Error("请先选择要删除的模板。");
+  if (!confirm(`删除当前账号的话题模板「${name}」？`)) return;
+  const previous = state.localTopicTemplates.map((item) => ({ ...item, tags: [...item.tags] }));
+  state.localTopicTemplates = state.localTopicTemplates.filter((item) => item.name !== name);
+  if (state.selectedLocalTemplate === name) state.selectedLocalTemplate = "";
+  state.editingTemplateName = "";
+  $("templateNameInput").value = "";
+  $("templateTopicsInput").value = "";
+  renderTopicTemplateTabs();
+  renderTemplateManagerList();
   try {
-    const data = await api("/api/publishing/resources/sync", {profile_dir:profile});
+    await persistLocalTemplates(previous);
+  } catch (error) {
+    $("templateDialogStatus").textContent = `删除失败：${error.message}`;
+    return;
+  }
+  $("templateDialogStatus").textContent = `已删除「${name}」。`;
+}
+
+function renderPlatformImportRows() {
+  const rows = state.platformImportRows || [];
+  const list = $("templateImportList");
+  if (!rows.length) {
+    list.innerHTML = "";
+    $("templateImportHint").textContent = state.platformImportError
+      ? `读取失败：${state.platformImportError}`
+      : "没有读到平台模板。请确认小红书发布页已填入一组素材并停留在编辑页。";
+    return;
+  }
+  const withTopics = rows.filter((row) => row.topics.length).length;
+  $("templateImportHint").textContent =
+    `读到 ${rows.length} 个模板，其中 ${withTopics} 个识别到话题。没有话题的模板需要先补充再导入。`;
+  list.innerHTML = rows.map((row, index) => `
+    <div class="template-import-row">
+      <input type="checkbox" data-import-index="${index}" ${row.topics.length ? "checked" : "disabled"} />
+      <span class="meta">
+        <b>${escapeHtml(row.name)}</b>
+        <div class="topics">${row.topics.length ? row.topics.map((tag) => `#${escapeHtml(tag)}`).join(" ") : "未识别到话题"}</div>
+      </span>
+      ${row.topics.length
+        ? `<span class="flag">${row.confirmed ? "可导入" : "话题未读全，需补充"}</span>`
+        : `<button type="button" class="mini-text ghost" data-supplement-index="${index}">补充</button>`}
+    </div>`).join("");
+  list.querySelectorAll("[data-supplement-index]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const row = state.platformImportRows[Number(button.dataset.supplementIndex)];
+      if (!row) return;
+      state.editingTemplateName = "";
+      $("templateNameInput").value = row.name;
+      $("templateTopicsInput").value = "";
+      $("templateDialogStatus").textContent = `请为「${row.name}」补充 1–10 个话题后保存。`;
+      $("templateTopicsInput").focus();
+    });
+  });
+}
+
+async function readPlatformTemplates() {
+  const button = $("templateReadPlatformBtn");
+  button.disabled = true;
+  $("templateImportPanel").hidden = false;
+  $("templateImportHint").textContent = "正在读取平台话题模板…请保持小红书发布编辑页打开。";
+  $("templateImportList").innerHTML = "";
+  state.platformImportError = "";
+  try {
+    const profile = state.activeProfile;
+    const data = await api("/api/publishing/resources/sync", { profile_dir: profile });
     if (profile !== state.activeProfile || data.profile_dir !== profile) return;
     renderPublishingResources(data.resources || {});
+    const templates = Array.isArray(data.resources?.templates) ? data.resources.templates : [];
+    state.platformImportError = (Array.isArray(data.resources?.errors) ? data.resources.errors : [])
+      .map((item) => String(item || "").trim())
+      .filter(Boolean)
+      .join("；");
+    state.platformImportRows = templates
+      .map((item) => ({
+        name: String(item.name || "").trim(),
+        topics: Array.isArray(item.topics) ? item.topics.slice(0, 10) : [],
+        confirmed: item.topics_confirmed !== false,
+      }))
+      .filter((item) => item.name);
+    renderPlatformImportRows();
+  } catch (error) {
+    $("templateImportHint").textContent = `读取失败：${error.message}`;
   } finally {
     button.disabled = false;
   }
+}
+
+async function importPlatformTemplates() {
+  const chosen = [...$("templateImportList").querySelectorAll("[data-import-index]:checked")]
+    .map((input) => state.platformImportRows[Number(input.dataset.importIndex)])
+    .filter(Boolean);
+  if (!chosen.length) throw new Error("请先勾选要导入的模板。");
+  const previous = state.localTopicTemplates.map((item) => ({ ...item, tags: [...item.tags] }));
+  let imported = 0;
+  let skipped = 0;
+  for (const row of chosen) {
+    if (!row.topics.length) { skipped += 1; continue; }
+    const existing = state.localTopicTemplates.find((item) => item.name === row.name);
+    if (existing) {
+      if (!confirm(`本地已有同名模板「${row.name}」，用平台话题覆盖？取消则跳过。`)) {
+        skipped += 1;
+        continue;
+      }
+      existing.tags = row.topics;
+      existing.source = "platform";
+    } else {
+      if (state.localTopicTemplates.length >= 10) {
+        throw new Error("最多保存 10 个模板，请先删除不用的模板再导入。");
+      }
+      state.localTopicTemplates.push({ name: row.name, tags: row.topics, source: "platform" });
+    }
+    imported += 1;
+  }
+  renderTopicTemplateTabs();
+  renderTemplateManagerList();
+  if (!imported) {
+    $("templateDialogStatus").textContent = "没有导入任何模板。";
+    return;
+  }
+  try {
+    await persistLocalTemplates(previous);
+  } catch (error) {
+    $("templateDialogStatus").textContent = `导入失败：${error.message}`;
+    return;
+  }
+  $("templateDialogStatus").textContent =
+    `已导入 ${imported} 个模板${skipped ? `，跳过 ${skipped} 个` : ""}。`;
 }
 
 async function testTextModel() {
@@ -1349,11 +1886,16 @@ async function discardManualPublish() {
   await refreshHistory();
 }
 
-async function loadConfig() {
+async function loadConfig(expectedProfile = null) {
+  const requestId = ++state.configLoadId;
   const data = await api("/api/config");
+  const active = data.config.active_profile || "Default";
+  if (requestId !== state.configLoadId) return false;
+  if (expectedProfile && active !== expectedProfile) return false;
   state.config = data.config;
-  state.activeProfile = data.config.active_profile || "Default";
+  state.activeProfile = active;
   state.localTopicTemplates = Array.isArray(data.config.local_topic_templates) ? data.config.local_topic_templates : [];
+  state.manualAlbums = Array.isArray(data.config.manual_albums) ? data.config.manual_albums : [];
   state.publishingResources = data.config.publishing_resources || {};
   $("rootPath").value = data.config.root_path || "";
   $("defaultAlbum").value = data.config.default_album || "";
@@ -1365,15 +1907,22 @@ async function loadConfig() {
   $("scheduleWindow").value = scheduleWindows.includes(preferredWindow)
     ? preferredWindow
     : scheduleWindows[0] || "";
-  $("topicTemplates").value = (data.config.topic_templates || []).join("\n");
+  if ($("commonWindowStatus")) {
+    $("commonWindowStatus").textContent = scheduleWindows.length ? `已保存 ${scheduleWindows.length} 个常用时间段` : "";
+  }
   renderPublishingResources(state.publishingResources);
   $("dailyLimit").value = data.config.daily_limit || 3;
+  $("paceMin").value = data.config.pace_min ?? 40;
+  $("paceMax").value = data.config.pace_max ?? 90;
+  $("paceCap").value = data.config.pace_cap ?? 0;
+  $("paceTest").checked = !!data.config.pace_test;
   $("visibility").value = data.config.visibility || "公开可见";
   $("publishMode").value = data.config.publish_mode || "scheduled";
   $("originalChk").checked = data.config.original_enabled !== false;
   $("schedulePreview").value = "";
   state.scheduleSuggestion = "";
   syncPublishRadios();
+  restorePublishMemory();
   $("copyEngineSelect").value = data.config.copy_engine || "auto";
   $("textProvider").value = data.config.text_provider || "deepseek";
   $("textBaseUrl").value = data.config.text_base_url || "";
@@ -1390,11 +1939,16 @@ async function loadConfig() {
   setManualPending(state.activeProfile, data.config.manual_pending || null);
   setBridge(`今日 ${data.config.today_usage_count || 0}/${data.config.daily_limit || 3}`, null);
   updateChecklist();
+  return true;
 }
 
 function syncPublishRadios() {
   document.querySelectorAll("input[name='visibilityRadio']").forEach(r => { r.checked = r.value === $("visibility").value; });
   document.querySelectorAll("input[name='publishRadio']").forEach(r => { r.checked = r.value === $("publishMode").value; });
+  const scheduled = $("publishMode").value === "scheduled";
+  const button = $("publishBtn");
+  button.textContent = scheduled ? "定时发布" : "立即发布";
+  button.title = scheduled ? "填入发布页并提交，由小红书到点发布" : "填入发布页并立即提交";
 }
 
 let preferenceWrites = Promise.resolve();
@@ -1406,7 +1960,13 @@ function savePublishPreferences(values) {
   const profile_dir = state.activeProfile;
   preferenceWrites = preferenceWrites.catch(() => {}).then(async () => {
     const result = await api("/api/publish/preferences", {profile_dir, ...values});
-    if (profile_dir === state.activeProfile) Object.assign(state.config, values);
+    if (profile_dir === state.activeProfile) {
+      Object.assign(state.config, values);
+      if ("tags" in values) state.config.last_tags = values.tags;
+      if ("local_topic_template" in values) state.config.last_local_topic_template = values.local_topic_template;
+      if ("album" in values) state.config.default_album = values.album;
+      if ("location" in values) state.config.default_location = values.location;
+    }
     return result;
   });
   return preferenceWrites;
@@ -1414,16 +1974,18 @@ function savePublishPreferences(values) {
 
 async function saveConfig() {
   if (state.queuePreview) leaveQueuePreview();
+  const windows = scheduleWindowsFromEditor();
   const payload = {
     profile_dir: state.activeProfile,
     root_path: $("rootPath").value.trim(),
     default_album: $("defaultAlbum").value.trim(),
     default_location: $("defaultLocation").value.trim(),
-    default_schedule_window: $("scheduleWindow").value,
-    schedule_windows: scheduleWindowsFromEditor(),
-    topic_templates: topicTemplatesFromInput(),
     local_topic_templates: state.localTopicTemplates,
     daily_limit: Number($("dailyLimit").value || 3),
+    pace_min: Number($("paceMin").value || 40),
+    pace_max: Number($("paceMax").value || 90),
+    pace_cap: Number($("paceCap").value || 0),
+    pace_test: $("paceTest").checked,
     visibility: $("visibility").value,
     original_enabled: $("originalChk").checked,
     copy_engine: $("copyEngineSelect").value,
@@ -1434,6 +1996,11 @@ async function saveConfig() {
     moments_tag: $("momentsTag").value.trim(),
     apiyi_base: $("apiyiBase")?.value.trim() || "",
   };
+  if (windows.length) {
+    const preferred = $("scheduleWindow").value;
+    payload.schedule_windows = windows;
+    payload.default_schedule_window = windows.includes(preferred) ? preferred : windows[0];
+  }
   if ($("deepseekKey").value.trim()) {
     payload.deepseek_api_key = $("deepseekKey").value.trim();
   }
@@ -1454,11 +2021,15 @@ async function saveConfig() {
     has_pptoken_key: !!payload.pptoken_api_key || !!state.config.has_pptoken_key,
     has_deepseek_key: !!payload.deepseek_api_key || !!state.config.has_deepseek_key,
   });
-  refreshScheduleWindowOptions(payload.schedule_windows);
-  if (payload.schedule_windows.includes(payload.default_schedule_window)) {
+  const savedWindows = payload.schedule_windows || state.config.schedule_windows || [];
+  refreshScheduleWindowOptions(savedWindows);
+  if (payload.default_schedule_window && savedWindows.includes(payload.default_schedule_window)) {
     $("scheduleWindow").value = payload.default_schedule_window;
   }
-  refreshTopicTemplateOptions(payload.topic_templates, state.localTopicTemplates);
+  if ($("commonWindowStatus")) {
+    $("commonWindowStatus").textContent = savedWindows.length ? `已保存 ${savedWindows.length} 个常用时间段` : "";
+  }
+  renderTopicTemplateTabs();
   updateTextProviderUI();
   log("设置已保存。");
 }
@@ -1523,12 +2094,13 @@ function currentText() {
 
 async function generateCopy(style = state.style, opts = { apply: true }) {
   if ($("randomStyleChk").checked && opts.apply && opts.randomize !== false) {
-    const styles = ["praise", "professional", "process", "opinion", "story"];
+    const styles = ["praise", "professional", "process", "opinion", "story", "painpoint", "knowledge", "advantage"];
     style = styles[Math.floor(Math.random() * styles.length)];
   }
   if (!state.current) throw new Error("请先推荐一组素材");
   if (opts.apply) state.style = style;
-  if (state.styleCopies[style]) {
+  const useVision=document.querySelector('#xhsVision [data-vision-use]')?.checked===true;
+  if (!useVision && state.styleCopies[style]) {
     if (opts.apply) applyCopy(style);
     return state.styleCopies[style];
   }
@@ -1539,8 +2111,9 @@ async function generateCopy(style = state.style, opts = { apply: true }) {
   if (opts.apply && button) { button.disabled = true; button.textContent = "生成中…"; }
   const pending = (async () => {
     log(`正在调用文案引擎生成「${styleLabel(style)}」…`);
-    const data = await api("/api/generate", {
+    const data = await api(useVision?"/api/vision/generate":"/api/generate", {
       style, profile_dir: state.activeProfile,
+      ...(useVision?{platform:'xhs',use_vision:true,files:currentPayload().images,tags:currentPayload().tags}:{}),
       model_name: $("modelName").value.trim(), notes: $("notes").value.trim(),
       copy_engine: $("copyEngineSelect").value,
       deepseek_model: currentTextProvider() === "deepseek" ? $("deepseekModel").value : "",
@@ -1590,7 +2163,7 @@ async function polishCurrentCopy() {
 }
 
 function styleLabel(style) {
-  return { praise: "夸赞型", professional: "专业展示", process: "过程分享", opinion: "观点讨论", story: "案例故事" }[style] || style;
+  return { praise: "夸赞型", professional: "专业展示", process: "过程分享", opinion: "观点讨论", story: "案例故事", painpoint: "行业痛点视角", knowledge: "行业干货分享", advantage: "自我优势" }[style] || style;
 }
 
 function applyCopy(style) {
@@ -1695,23 +2268,25 @@ async function publishNow() {
   const payload = { ...currentPayload(), publish_mode: "immediate", schedule_time: "", schedule_window: "" };
   validatePublishImageCount(payload.images);
   if (!payload.title || !payload.content || !payload.images.length) throw new Error("请先确认图片、标题和正文");
-  if (!confirm(`立即发布到当前账号？\n${payload.title}\n${payload.images.length} 张图片 · ${payload.visibility}`)) return;
+  if (!confirm(`立即发布到当前账号？\n${payload.title}\n${payload.images.length} 张图片 · ${payload.visibility}\n\n点击后软件会填入发布页并直接提交。`)) return;
   $("publishMode").value = "immediate";
   syncPublishRadios();
   await savePublishPreferences({publish_mode:"immediate"});
   if (JSON.stringify({...currentPayload(), publish_mode:"immediate", schedule_time:"", schedule_window:""}) !== JSON.stringify(payload)) {
     throw new Error("确认期间发布内容或账号发生变化，请重新点击立即发布。");
   }
-  const snapshot = JSON.stringify(currentPayload());
-  await api("/api/xhs/publish-now", payload);
-  await loadQueue();
-  log("立即发布任务已确认，后台会校验账号与设置后提交；异常时会通知你。");
-  await finishCurrentDraft(snapshot);
+  const snapshot = JSON.stringify(payload);
+  log("正在填入发布页并提交，请不要操作浏览器窗口...");
+  const data = await api("/api/xhs/submit-publish", payload);
+  await handleDirectSubmit(data, snapshot, {
+    successLabel: "已填入发布页并提交立即发布",
+    title: payload.title,
+  });
 }
 
 async function confirmPublished(id, snapshot = null) {
   if (!confirm("软件将到小红书笔记管理核验这条记录的真实状态。只有管理页确认已发布才会归档素材；审核中或定时待发布不会归档。继续核验吗？")) return;
-  const data = await api("/api/history/confirm", {id});
+  const data = await api("/api/history/confirm", {id, profile_dir: state.activeProfile});
   for (const [profile, pending] of state.manualPublishes.entries()) {
     if (pending.id === id) state.manualPublishes.delete(profile);
   }
@@ -1813,12 +2388,25 @@ function displayProfile() {
 async function saveProfile() {
   const origin = state.activeProfile;
   const fields = profileFields();
-  const data = await api("/api/profile/save", {profile_dir:origin, ...fields});
+  const windows = scheduleWindowsFromEditor();
+  const data = await api("/api/profile/save", {profile_dir:origin, ...fields, schedule_windows: windows});
   state.profiles.set(origin, data.profile);
   state.profilePrompts.set(origin, data.prompts);
   if (JSON.stringify(profileFields()) === JSON.stringify(fields) && state.activeProfile === origin) state.profileDrafts.delete(origin);
-  if (state.activeProfile === origin) displayProfile();
-  log("账号画像和提示词已保存。");
+  if (state.activeProfile === origin) {
+    displayProfile();
+    state.config.schedule_windows = Array.isArray(data.schedule_windows) ? data.schedule_windows : windows;
+    state.config.default_schedule_window = data.default_schedule_window || state.config.default_schedule_window || "";
+    renderScheduleEditor(state.config.schedule_windows);
+    refreshScheduleWindowOptions(state.config.schedule_windows);
+    const preferred = state.config.default_schedule_window;
+    $("scheduleWindow").value = state.config.schedule_windows.includes(preferred)
+      ? preferred
+      : state.config.schedule_windows[0] || "";
+    $("commonWindowStatus").textContent = `已保存 ${state.config.schedule_windows.length} 个常用时间段`;
+    previewSchedule().catch(() => {});
+  }
+  log("账号画像、提示词和常用时间段已保存。");
 }
 
 async function generateProfile() {
@@ -1882,11 +2470,15 @@ async function fillMoments() {
   }
 }
 
-async function refreshHistory() {
-  const data = await api("/api/history");
+async function refreshHistory(expectedProfile = state.activeProfile) {
+  const origin = expectedProfile || state.activeProfile;
+  const requestId = ++state.historyLoadId;
+  const data = await api(`/api/history?profile_dir=${encodeURIComponent(origin)}`);
+  if (requestId !== state.historyLoadId || origin !== state.activeProfile) return;
+  const items = Array.isArray(data.items) ? data.items : [];
   const statusLabel = (status) => ({published:"已发布", reviewing:"审核中", scheduled:"定时待发布", accepted:"平台已接收", prefilled:"页面已填入", unknown:"待核验", abandoned:"已放弃"}[status] || status);
-  $("historyList").innerHTML = data.items.length
-    ? data.items
+  $("historyList").innerHTML = items.length
+    ? items
         .map(
           (item) => `
         <div class="history-item">
@@ -2031,9 +2623,12 @@ function uploadOverlay(kind, input) {
   reader.readAsDataURL(file);
 }
 
-async function loadFxSettings() {
+async function loadFxSettings(expectedProfile = state.activeProfile) {
+  const origin = expectedProfile || state.activeProfile;
+  const requestId = ++state.fxLoadId;
   try {
-    const data = await api(`/api/logo/settings?profile_dir=${encodeURIComponent(state.activeProfile)}`);
+    const data = await api(`/api/logo/settings?profile_dir=${encodeURIComponent(origin)}`);
+    if (requestId !== state.fxLoadId || origin !== state.activeProfile) return;
     const s = data.settings || {};
     state.logo.enabled = !!s.logo_enabled;
     state.logo.path = s.logo_path || "";
@@ -2063,8 +2658,15 @@ async function loadFxSettings() {
     setVal("watermarkScale", state.watermark.scale);
     setVal("watermarkOpacity", state.watermark.opacity);
     syncFxStateFromUI();
-    if (state.logo.path) {
-      const d = $("logoDrop"); if (d) { d.classList.add("has-file"); d.querySelector("b").textContent = "已加载 LOGO：" + state.logo.path.split("/").pop(); }
+    const drop = $("logoDrop");
+    if (drop) {
+      drop.classList.toggle("has-file", Boolean(state.logo.path));
+      const label = drop.querySelector("b");
+      if (label) {
+        label.textContent = state.logo.path
+          ? "已加载 LOGO：" + state.logo.path.split("/").pop()
+          : "拖入或点击上传 LOGO PNG";
+      }
     }
   } catch (e) {
     /* 首次无设置，用默认值 */
@@ -2482,6 +3084,12 @@ async function confirmCollage() {
 // ---------- 视图切换 / 导航 ----------
 
 function showView(name) {
+  if (window.platformWorkspace?.active && name === "publish") { window.platformWorkspace.show(); return; }
+  if (window.platformWorkspace?.active && name === "records") { window.platformWorkspace.history(); return; }
+  if (window.platformWorkspace?.active) {
+    if (window.platformWorkspace.busy) return;
+    window.platformWorkspace.select("xhs");
+  }
   $("appShell").classList.toggle("automation-view", name === "automation");
   ["publish", "records", "settings", "profile", "automation", "hot"].forEach((v) => {
     const el = $(`page${v[0].toUpperCase()}${v.slice(1)}`);
@@ -2496,6 +3104,7 @@ function showView(name) {
   const main = document.querySelector(".main-area");
   if (main) main.scrollTop = 0;
   if (name === "automation") window.loadAutomation?.();
+  if (name === "settings") window.distributionUI?.load();
 }
 
 function handleNav(target) {
@@ -2586,6 +3195,74 @@ function initResizers() {
 
 // ---------- 批量计划条联动 ----------
 
+function currentPlanItem() {
+  if (!state.queuePreview) return null;
+  return state.queue.find((q) => String(q.id) === String(state.queuePreview.id) && q.status === "draft") || null;
+}
+
+async function generatePlanQueue() {
+  const total = Math.max(1, Number($("planTotal").value || 1));
+  const daily = Math.max(1, Number($("dailyLimit").value || 1));
+  const root = String(state.current?.materialRoot || $("rootPath")?.value || "").trim();
+  if (!root) throw new Error("请先在发布笔记页选择素材文件夹");
+  if (!confirm(`从素材文件夹生成 ${total} 条待审核队列（每天 ${daily} 条）？\n生成后需要逐条确认或批量确认，未确认的不会发布。`)) return;
+  const data = await api("/api/plan/generate", { profile_dir: state.activeProfile, total, daily, root_path: root });
+  log(`已生成 ${data.created.length} 条待审核队列，请点队列编号逐条审核。`);
+  await loadQueue(state.activeProfile);
+  const first = state.queue.findIndex((q) => String(q.id) === String(data.created[0]));
+  if (first >= 0) loadQueueItem(first);
+}
+
+async function confirmCurrentPlanItem() {
+  const item = currentPlanItem();
+  if (!item) throw new Error("请先点队列编号回看一条待审核的队列");
+  await api("/api/plan/confirm", { profile_dir: state.activeProfile, id: item.id });
+  await loadQueue(state.activeProfile);
+  const index = state.queue.findIndex((q) => String(q.id) === String(item.id));
+  if (index >= 0) loadQueueItem(index);
+  log(`队列第 ${index + 1} 条已确认，可以继续下一条。`);
+}
+
+async function confirmAllPlanItems() {
+  const ids = state.queue.filter((q) => q.status === "draft" && !q.payload?.reviewed).map((q) => q.id);
+  if (!ids.length) throw new Error("没有待确认的队列");
+  if (!confirm(`批量确认 ${ids.length} 条队列？确认后才会进入发布。`)) return;
+  await api("/api/plan/confirm", { profile_dir: state.activeProfile, ids });
+  await loadQueue(state.activeProfile);
+  log(`已批量确认 ${ids.length} 条队列。`);
+}
+
+async function runPlanQueue() {
+  const ready = state.queue.filter((q) => q.status === "draft" && q.payload?.reviewed).length;
+  if (!ready) throw new Error("还没有已确认的队列，请先逐条确认或批量确认");
+  if (!confirm(`开始按队列发布？共 ${ready} 条。\n软件会逐条填入并使用小红书定时发布，每条之间随机间隔 8–20 分钟。`)) return;
+  const data = await api("/api/plan/run", { profile_dir: state.activeProfile });
+  log(`已启动 ${data.started} 条队列，正在按 8–20 分钟随机间隔逐条提交，请不要关闭浏览器。`);
+  await loadQueue(state.activeProfile);
+}
+
+async function saveCurrentPlanItem() {
+  const item = currentPlanItem();
+  if (!item) throw new Error("请先点队列编号回看一条待审核的队列");
+  const fields = {
+    title: $("titleInput").value.trim(),
+    content: $("contentInput").value.trim(),
+    tags: $("tagsInput").value.split(/[#\s]+/).filter(Boolean),
+    visibility: $("visibility").value,
+    album: $("defaultAlbum").value.trim(),
+    location: $("defaultLocation").value.trim(),
+    original: $("originalChk").checked,
+    shooting_date: $("shootingDate").value.trim(),
+    mentions: $("mentionsInput").value.split(/\n+/).map((s) => s.trim()).filter(Boolean),
+  };
+  if (!fields.title || !fields.content) throw new Error("标题和正文不能为空");
+  await api("/api/plan/update", { profile_dir: state.activeProfile, id: item.id, fields });
+  await loadQueue(state.activeProfile);
+  const index = state.queue.findIndex((q) => String(q.id) === String(item.id));
+  if (index >= 0) loadQueueItem(index);
+  log(`队列第 ${index + 1} 条已保存修改，需要重新点「确认当前队列」。`);
+}
+
 function updatePlanBar() {
   const total = Math.max(1, Number($("planTotal").value || 1));
   const perDay = Math.max(1, Number($("dailyLimit").value || 1));
@@ -2598,8 +3275,9 @@ function updatePlanBar() {
 
 function showMedia(kind) {
   const isImage = kind === "image";
-  $("imagePanel").style.display = isImage ? "" : "none";
+  $("imagePanel").firstElementChild.style.display = isImage ? "" : "none";
   $("videoPanel").style.display = isImage ? "none" : "";
+  $("xhsAllowCopyChk").closest("label").style.display = isImage ? "" : "none";
   $("mediaTabImage").classList.toggle("active", isImage);
   $("mediaTabVideo").classList.toggle("active", !isImage);
 }
@@ -2707,6 +3385,17 @@ function bindEvents() {
   $("mediaTabVideo").addEventListener("click", () => showMedia("video"));
 
   // 批量计划条
+  $("planToggleBtn").addEventListener("click", () => {
+    const panel = $("planPanel");
+    const open = panel.hidden;
+    panel.hidden = !open;
+    $("planToggleBtn").setAttribute("aria-expanded", String(open));
+  });
+  $("planGenerateBtn").addEventListener("click", () => generatePlanQueue().catch((e) => log(e.message)));
+  $("planConfirmCurrentBtn").addEventListener("click", () => confirmCurrentPlanItem().catch((e) => log(e.message)));
+  $("planConfirmAllBtn").addEventListener("click", () => confirmAllPlanItems().catch((e) => log(e.message)));
+  $("planRunBtn").addEventListener("click", () => runPlanQueue().catch((e) => log(e.message)));
+  $("planSaveCurrentBtn").addEventListener("click", () => saveCurrentPlanItem().catch((e) => log(e.message)));
   ["planTotal", "dailyLimit"].forEach((id) => {
     $(id).addEventListener("input", () => { updatePlanBar(); updateChecklist(); });
     $(id).addEventListener("change", () => {
@@ -2730,18 +3419,35 @@ function bindEvents() {
 
   // 配置 / 素材
   $("saveConfigBtn").addEventListener("click", () => saveConfig().catch((e) => log(e.message)));
-  $("saveLocalTemplateBtn").addEventListener("click", () => saveLocalTopicTemplate().catch((e) => {
-    $("localTemplateStatus").textContent = e.message;
-    log(e.message);
-  }));
-  $("deleteLocalTemplateBtn").addEventListener("click", () => deleteLocalTopicTemplate().catch((e) => {
-    $("localTemplateStatus").textContent = e.message;
-    log(e.message);
-  }));
-  $("syncResourcesBtn").addEventListener("click", () => syncPublishingResources().catch((e) => {
-    $("resourcesStatus").textContent = `同步失败：${e.message}`;
-    log(e.message);
-  }));
+  $("manageTemplatesBtn").addEventListener("click", openTemplateDialog);
+  $("templateCloseBtn").addEventListener("click", closeTemplateDialog);
+  $("templateNewBtn").addEventListener("click", () => {
+    state.editingTemplateName = "";
+    $("templateNameInput").value = "";
+    $("templateTopicsInput").value = "";
+    $("templateDialogStatus").textContent = "";
+    renderTemplateManagerList();
+    $("templateNameInput").focus();
+  });
+  $("templateReadPlatformBtn").addEventListener("click", () => readPlatformTemplates());
+  $("templateImportConfirmBtn").addEventListener("click", () => {
+    importPlatformTemplates().catch((error) => {
+      $("templateDialogStatus").textContent = error.message;
+      log(error.message);
+    });
+  });
+  $("templateSaveBtn").addEventListener("click", () => {
+    saveTemplateFromDialog().catch((error) => {
+      $("templateDialogStatus").textContent = error.message;
+      log(error.message);
+    });
+  });
+  $("templateDeleteBtn").addEventListener("click", () => {
+    deleteTemplateFromDialog().catch((error) => {
+      $("templateDialogStatus").textContent = error.message;
+      log(error.message);
+    });
+  });
   $("testModelBtn").addEventListener("click", () => testTextModel().catch((e) => log(e.message)));
   $("addWindowBtn").addEventListener("click", () => {
     const list = $("scheduleWindowList");
@@ -2757,9 +3463,6 @@ function bindEvents() {
   $("recommendBtn").addEventListener("click", () => recommend().catch((e) => log(e.message)));
   $("chooseMaterialFolderBtn").addEventListener("click", () => chooseMaterialFolder().catch((e) => log(e.message)));
   bindMaterialDropZone();
-  $("checklistToggle").addEventListener("click", () => {
-    $("checklistCard").classList.toggle("collapsed");
-  });
   $("checkUpdatesBtn").addEventListener("click", () => checkForUpdates(false));
   $("installUpdateBtn").addEventListener("click", () => installUpdate());
   $("dismissUpdateBtn").addEventListener("click", () => { $("updateBanner").hidden = true; });
@@ -2793,23 +3496,34 @@ function bindEvents() {
     $("contentCount").textContent = $("contentInput").value.length;
   });
 
-  // 底栏：立即发布 / 定时入队
-  $("immediatePublishBtn").addEventListener("click", () => publishNow().catch((e) => log(e.message)));
-  $("prefillPublishBtn").addEventListener("click", () => fillPublish().catch((e) => log(e.message)));
+  // 底栏：仅填入发布页 / 发布（文案随发布方式切换）
+  $("publishBtn").addEventListener("click", () => {
+    const targets=[...(document.getElementById("syncDouyin")?.checked?["douyin"]:[]),...(document.getElementById("syncChannels")?.checked?["channels"]:[])];
+    const video = $("mediaTabVideo").classList.contains("active");
+    if(targets.length || video){
+      window.platformWorkspace.fromXhs(targets,currentPayload(),video).catch(e=>{log(e.message);window.alert(e.message);});
+      return;
+    }
+    const task = $("publishMode").value === "scheduled" ? publishScheduled() : publishNow();
+    task.catch((e) => log(e.message));
+  });
+  $("prefillPublishBtn").addEventListener("click", () => {
+    const video = $("mediaTabVideo").classList.contains("active");
+    const targets = ["douyin","channels"].filter((name,i)=>$(["syncDouyin","syncChannels"][i]).checked);
+    if (video || targets.length) window.platformWorkspace.fromXhs(targets,currentPayload(),video,true).catch(e=>{log(e.message);window.alert(e.message);});
+    else fillPublish().catch((e) => log(e.message));
+  });
   $("confirmManualPublishBtn").addEventListener("click", () => {
     const pending = state.manualPublish;
     if (pending) confirmPublished(pending.id, pending.snapshot).catch((e) => log(e.message));
   });
   $("discardManualPublishBtn").addEventListener("click", () => discardManualPublish().catch((e) => log(e.message)));
   $("mentionFocusBtn").addEventListener("click", () => $("mentionsInput").focus());
-  $("schedulePublishBtn").addEventListener("click", () => enqueueCurrent().catch((e) => log(e.message)));
   $("nextQueueBtn").addEventListener("click", () => loadNextQueue().catch((e) => log(e.message)));
+  $("clearCurrentQueueBtn").addEventListener("click", () => clearCurrentQueue().catch((e) => log(e.message)));
+  $("clearAllQueueBtn").addEventListener("click", () => clearAllQueue().catch((e) => log(e.message)));
   $("startQueueBtn").addEventListener("click", () => runQueue().catch((e) => log(e.message)));
   $("pauseQueueBtn").addEventListener("click", () => pauseQueue().catch((e) => log(e.message)));
-
-  // 定时弹窗
-  $("dialogCancelBtn").addEventListener("click", () => { $("scheduleDialog").style.display = "none"; });
-  $("dialogConfirmBtn").addEventListener("click", () => confirmEnqueue().catch((e) => log(e.message)));
 
   // 历史 / 画像
   $("refreshHistoryBtn").addEventListener("click", () => refreshHistory().catch((e) => log(e.message)));
@@ -2871,22 +3585,56 @@ function bindEvents() {
     r.addEventListener("change", () => {
       if (r.checked) {
         $("publishMode").value = r.value;
+        syncPublishRadios();
         savePublishPreferences({publish_mode:r.value}).catch(e => log(`保存发布方式失败：${e.message}`));
         previewSchedule().catch((e) => log(e.message));
       }
     });
   });
 
-  // 时间段 / 模板编辑器联动
+  // 时间段 / 话题模板联动
   $("scheduleWindowList").addEventListener("input", () => {
     refreshScheduleWindowOptions();
     updateChecklist();
   });
-  $("topicTemplates").addEventListener("input", () => {
-    refreshTopicTemplateOptions();
-    updateChecklist();
+  let tagsSaveTimer = 0;
+  $("tagsInput").addEventListener("input", () => {
+    clearSelectedLocalTemplate();
+    clearTimeout(tagsSaveTimer);
+    tagsSaveTimer = setTimeout(() => {
+      savePublishPreferences({ tags: tagsFromInput(), local_topic_template: "" })
+        .catch((e) => log(`保存话题失败：${e.message}`));
+    }, 500);
   });
-  $("topicTemplate").addEventListener("change", applyTopicTemplateSelection);
+  $("defaultAlbum").addEventListener("change", () => {
+    renderManualAlbumChips();
+    renderXhsUiSettings();
+    savePublishPreferences({ album: $("defaultAlbum").value.trim() })
+      .catch((e) => log(`保存合集失败：${e.message}`));
+  });
+  $("addAlbumBtn").addEventListener("click", async () => {
+    try {
+      await addManualAlbum();
+      setCollectionEdit(false);
+      $("xhsCollectionBtn").setAttribute("aria-expanded", "false");
+    } catch (e) {
+      log(e.message);
+    }
+  });
+  $("manualAlbumBtn").addEventListener("click", () => setCollectionEdit(true));
+  $("cancelAlbumEditBtn").addEventListener("click", () => {
+    $("defaultAlbum").value = state.config.default_album || "";
+    renderManualAlbumChips();
+    setCollectionEdit(false);
+  });
+  $("syncAlbumsBtn").addEventListener("click", () => {
+    syncAccountAlbums().catch(() => {});
+  });
+  $("defaultLocation").addEventListener("change", () => {
+    renderXhsUiSettings();
+    savePublishPreferences({ location: $("defaultLocation").value.trim() })
+      .catch((e) => log(`保存地点失败：${e.message}`));
+  });
   $("scheduleWindow").addEventListener("change", () => {
     savePublishPreferences({default_schedule_window: $("scheduleWindow").value})
       .catch((e) => log(`保存默认时间段失败：${e.message}`));
@@ -2899,10 +3647,121 @@ function bindEvents() {
     updateChecklist();
   });
 
+  // 官方发布设置区交互
+  document.querySelectorAll("[data-collapse]").forEach((button) => {
+    button.addEventListener("click", () => toggleXhsSection(button));
+  });
+  $("xhsCollectionBtn").addEventListener("click", () => {
+    if (!$("xhsCollectionEdit").hidden) return;
+    const panel = $("xhsCollectionPanel");
+    panel.hidden = !panel.hidden;
+    $("xhsCollectionBtn").setAttribute("aria-expanded", String(!panel.hidden));
+  });
+  $("xhsCollectionClear").addEventListener("click", (event) => {
+    event.stopPropagation();
+    $("defaultAlbum").value = "";
+    setCollectionEdit(false);
+    $("xhsCollectionPanel").hidden = true;
+    $("xhsCollectionBtn").setAttribute("aria-expanded", "false");
+    savePublishPreferences({ album: "" }).catch((e) => log(`保存合集失败：${e.message}`));
+    renderManualAlbumChips();
+    renderXhsUiSettings();
+  });
+  $("xhsLocationBtn").addEventListener("click", () => {
+    const panel = $("xhsLocationPanel");
+    panel.hidden = !panel.hidden;
+    $("xhsLocationBtn").setAttribute("aria-expanded", String(!panel.hidden));
+    if (!panel.hidden) $("defaultLocation").focus();
+  });
+  $("xhsDeclarationRow").addEventListener("click", (event) => {
+    if (event.target.closest("#xhsDeclarationSubMenu")) return;
+    if (event.target.closest("#xhsDeclarationSubBtn")) {
+      const submenu = $("xhsDeclarationSubMenu");
+      submenu.hidden = !submenu.hidden;
+      return;
+    }
+    const menu = $("xhsDeclarationMenu");
+    menu.hidden = !menu.hidden;
+    $("xhsDeclarationRow").setAttribute("aria-expanded", String(!menu.hidden));
+    if (menu.hidden) $("xhsDeclarationSubMenu").hidden = true;
+  });
+  $("xhsDeclarationMenu").addEventListener("click", (event) => {
+    const item = event.target.closest("[data-declaration]");
+    if (!item) return;
+    event.stopPropagation();
+    saveXhsUi({ declaration: item.dataset.declaration });
+    $("xhsDeclarationMenu").hidden = true;
+    $("xhsDeclarationSubMenu").hidden = true;
+    $("xhsDeclarationRow").setAttribute("aria-expanded", "false");
+    renderXhsUiSettings();
+  });
+  $("xhsVisibilityRow").addEventListener("click", (event) => {
+    if (event.target.closest("#xhsVisibilityMenu")) return;
+    const menu = $("xhsVisibilityMenu");
+    menu.hidden = !menu.hidden;
+    $("xhsVisibilityRow").setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  $("xhsVisibilityMenu").addEventListener("click", (event) => {
+    const item = event.target.closest("[data-visibility]");
+    if (!item) return;
+    event.stopPropagation();
+    $("xhsVisibilityMenu").hidden = true;
+    $("xhsVisibilityRow").setAttribute("aria-expanded", "false");
+    setXhsVisibility(item.dataset.visibility);
+  });
+  $("xhsAllowCopyChk").addEventListener("change", () => {
+    saveXhsUi({ allowCopy: $("xhsAllowCopyChk").checked });
+  });
+  $("xhsCoCreatorBtn").addEventListener("click", () => {
+    log("「添加共创人」已按官方界面保留，自动填页暂未接入。");
+  });
+  document.querySelectorAll("[data-xhs-component]").forEach((button) => {
+    button.addEventListener("click", () => {
+      log(`「${button.dataset.xhsComponent}」已按官方界面保留，自动填页暂未接入。`);
+    });
+  });
+  $("xhsRepostSource").addEventListener("input", () => saveXhsUi({ repostSource: $("xhsRepostSource").value }));
+  $("xhsActivityMoreBtn").addEventListener("click", async () => {
+    const profile = state.activeProfile;
+    try {
+      const result = await api("/api/publishing/activities", { profile_dir: profile });
+      if (profile !== state.activeProfile) return;
+      saveXhsUi({ activityOptions: result.activities });
+      renderXhsUiSettings();
+      if (!result.activities.length) log("当前发布页没有可关联活动。");
+    } catch (error) { log(error.message); }
+  });
+  $("xhsActivityList").addEventListener("click", event => {
+    const button = event.target.closest("[data-activity]");
+    if (!button) return;
+    const values = xhsUiValues();
+    saveXhsUi({ activities: { ...values.activities, [button.dataset.activity]: !values.activities[button.dataset.activity] } });
+    renderXhsUiSettings();
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest("#xhsCollectionWrap")) {
+      $("xhsCollectionPanel").hidden = true;
+      $("xhsCollectionBtn").setAttribute("aria-expanded", "false");
+    }
+    if (!event.target.closest("#xhsLocationWrap")) {
+      $("xhsLocationPanel").hidden = true;
+      $("xhsLocationBtn").setAttribute("aria-expanded", "false");
+    }
+    if (!event.target.closest("#xhsDeclarationRow")) {
+      $("xhsDeclarationMenu").hidden = true;
+      $("xhsDeclarationSubMenu").hidden = true;
+      $("xhsDeclarationRow").setAttribute("aria-expanded", "false");
+    }
+    if (!event.target.closest("#xhsVisibilityRow")) {
+      $("xhsVisibilityMenu").hidden = true;
+      $("xhsVisibilityRow").setAttribute("aria-expanded", "false");
+    }
+  });
+
   // 表单变更刷新清单
   [
     "titleInput", "contentInput", "tagsInput", "defaultAlbum", "defaultLocation",
-    "topicTemplate", "shootingDate", "scheduleWindow", "publishMode",
+    "shootingDate", "scheduleWindow", "publishMode",
     "copyEngineSelect", "deepseekModel", "modelName",
   ].forEach((id) => {
     $(id).addEventListener("input", updateChecklist);
@@ -2911,6 +3770,8 @@ function bindEvents() {
 }
 
 async function init() {
+  $("pagePublish").inert = true;
+  $("bottomBar").inert = true;
   bindEvents();
   const modelSettings = $("deepseekModel").closest(".setting-group");
   const coverSettings = $("apiyiKey").closest(".setting-group");
@@ -2932,13 +3793,15 @@ async function init() {
   initCollage("2x2");
   updatePlanBar();
   renderQueue();
-  await loadConfig();
-  await loadFxSettings();
-  await loadProfile().catch(() => {});
-  await previewSchedule().catch(() => {});
-  await refreshHistory();
-  await loadQueue().catch((e) => log(`读取后台队列失败：${e.message}`));
   await initAccountBar();
+  await loadAccountWorkspace(state.activeProfile);
+  if (PINNED_PROFILE && PINNED_PROFILE !== state.activeProfile) {
+    const label = state.accounts.find((p) => p.dir === PINNED_PROFILE)?.label || PINNED_PROFILE;
+    showAccountInactiveNotice(
+      `此窗口对应「${label}」`,
+      "软件当前账号已经切换到别的 Chrome 用户资料。为避免发错账号，这个窗口已停用；请在对应账号的窗口操作，或在右上角账号菜单切回。"
+    );
+  }
   initCoverPanel();
   log(`工作台已就绪，当前版本 ${state.config.app_version || "未知"}。`);
 }
@@ -2946,6 +3809,9 @@ async function init() {
 init().catch((err) => log(err.message));
 
 // ---------- 右上角多账号（Chrome Profile 隔离，每个账号独立记住登录态） ----------
+
+// 切换账号时服务端会在目标 Chrome 用户资料里打开 /?profile=<dir>，固定这个窗口对应的账号。
+const PINNED_PROFILE = new URLSearchParams(location.search).get("profile") || "";
 
 function closeAccountMenu() {
   $("accountMenu").style.display = "none";
@@ -2957,10 +3823,22 @@ function identityLabel(identity = {}) {
   return identity.nickname || "小红书账号待识别";
 }
 
+function shortTime(value) {
+  return value ? String(value).replace("T", " ").slice(0, 16) : "";
+}
+
 function identityStatus(identity = {}) {
-  if (identity.status === "logged_out") return "请在此 Chrome 用户资料中登录小红书";
-  if (identity.status === "unavailable") return identity.nickname ? "昵称为上次识别的缓存，请连接后刷新" : "请打开对应 Chrome 用户资料并连接 XHS Bridge 后刷新";
-  return identity.checked_at ? `上次识别：${identity.checked_at}` : "连接后点「刷新当前账号资料」读取昵称和头像";
+  if (identity.status === "logged_out") return "这个 Chrome 用户资料里的小红书已退出，登录后才能发布";
+  if (identity.status === "unavailable") {
+    return identity.nickname ? "已缓存：扩展当前未连接，昵称是上次识别的结果" : "扩展未连接，请打开对应 Chrome 用户资料后点刷新";
+  }
+  return identity.checked_at ? `已连接：${shortTime(identity.checked_at)} 实时读取` : "连接后点刷新读取昵称和头像";
+}
+
+function identityBadge(identity = {}) {
+  if (identity.status === "logged_out") return "未登录";
+  if (identity.status === "verified") return "已连接·实时";
+  return identity.nickname ? "已缓存·未连接" : "未连接";
 }
 
 function avatarHtml(identity = {}, label = "") {
@@ -2992,6 +3870,95 @@ function renderCurrentAccount() {
   bindAvatarFallback($("pageProfile"));
 }
 
+function resetAccountWorkspaceUi() {
+  state.config = {};
+  state.localTopicTemplates = [];
+  state.manualAlbums = [];
+  state.publishingResources = {};
+  state.selectedLocalTemplate = "";
+  state.candidates = [];
+  state.viewedGroups.clear();
+  state.queuePreview = null;
+  state.queue = [];
+  state.queueEnabled = false;
+  state.manualPublish = null;
+  state.styleCopies = {};
+  state.styleLoading = {};
+  state.copyEpoch += 1;
+  state.coverResult = null;
+  state.scheduleSuggestion = "";
+  state.collageSelection = [];
+  state.logo = { enabled: false, path: "", scale: 18, opacity: 100, vpos: 92, hpos: 92 };
+  state.watermark = { enabled: false, path: "", scale: 120, opacity: 40, tiled: true };
+  if ($("watermarkTextInput")) $("watermarkTextInput").value = "";
+  ["logoScale", "logoOpacityNew", "logoVPos", "logoHPos", "watermarkScale", "watermarkOpacity"].forEach((id) => {
+    if ($(id)) $(id).value = "";
+  });
+  const logoDrop = $("logoDrop");
+  if (logoDrop) {
+    logoDrop.classList.toggle("has-file", false);
+    const label = logoDrop.querySelector("b");
+    if (label) label.textContent = "拖入或点击上传 LOGO PNG";
+  }
+  renderQueue();
+  resetEditorForm();
+  resetMaterialSelection("正在载入当前账号工作区…");
+  $("tagsInput").value = "";
+  if ($("mentionsInput")) $("mentionsInput").value = "";
+  $("rootPath").value = "";
+  $("dailyLimit").value = "3";
+  $("scheduleWindowList").value = "";
+  refreshScheduleWindowOptions([]);
+  $("historyList").innerHTML = '<div class="empty">正在载入当前账号记录…</div>';
+  renderManualAlbumChips();
+  renderManualPending();
+  updateCoverPreview(null);
+}
+
+async function loadAccountWorkspace(profile, force = false) {
+  profile = profile || state.activeProfile || "Default";
+  if (!force && state.accountWorkspaceProfile === profile) return;
+  const epoch = ++state.accountEpoch;
+  clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = null;
+  state.draftDirty = false;
+  state.accountWorkspaceProfile = profile;
+  state.activeProfile = profile;
+  state.restoringAccount = true;
+  $("pagePublish").inert = true;
+  $("bottomBar").inert = true;
+  resetAccountWorkspaceUi();
+  try {
+    const loaded = await loadConfig(profile);
+    if (!loaded || epoch !== state.accountEpoch) {
+      if (!loaded && epoch === state.accountEpoch) log("账号配置加载失败，请刷新后重试。");
+      return;
+    }
+    const draft = await loadDraft(profile);
+    if (epoch !== state.accountEpoch) return;
+    await Promise.all([
+      loadFxSettings(profile),
+      loadProfile().catch(() => {}),
+      refreshHistory(profile).catch((error) => log(`读取本账号记录失败：${error.message}`)),
+      loadQueue(profile).catch((error) => log(`读取后台队列失败：${error.message}`)),
+      Promise.resolve(window.loadAutomation?.()).catch((error) => log(`读取自动发布计划失败：${error.message}`)),
+    ]);
+    if (epoch !== state.accountEpoch) return;
+    await previewSchedule().catch(() => {});
+    if (epoch !== state.accountEpoch) return;
+    const restored = restoreDraft(draft);
+    $("pagePublish").inert = false;
+    $("bottomBar").inert = false;
+    renderManualPending();
+    renderCurrentAccount();
+    log(restored ? `已载入「${profile}」的账号工作区和上次草稿。` : `已载入「${profile}」的账号工作区。`);
+  } catch (error) {
+    if (epoch === state.accountEpoch) log(`加载账号工作区失败：${error.message}`);
+  } finally {
+    if (epoch === state.accountEpoch) state.restoringAccount = false;
+  }
+}
+
 async function initAccountBar() {
   $("accountBtn").addEventListener("click", async () => {
     const menu = $("accountMenu");
@@ -3019,6 +3986,8 @@ async function initAccountBar() {
   await refreshAccountLabel();
   // Read only the connected account; never switch through profiles to populate labels.
   refreshAccountIdentity(true);
+  const syncBtn = $("accountSyncBtn");
+  if (syncBtn) syncBtn.addEventListener("click", () => refreshAccountIdentity());
 }
 
 function renderAccountMenu(data) {
@@ -3032,7 +4001,7 @@ function renderAccountMenu(data) {
           <span class="account-check">${active ? "✓" : ""}</span>
           <span class="account-avatar" aria-hidden="true">${avatarHtml(identity, p.label)}</span>
           <span class="account-names"><span class="account-chrome">Chrome · ${escapeHtml(p.label)}</span><span class="account-nickname">${escapeHtml(identityLabel(identity))}</span></span>
-          <span class="account-dir">${identity.status === "verified" ? "已识别" : identity.nickname ? "已缓存" : ""}</span>
+          <span class="account-dir">${escapeHtml(identityBadge(identity))}</span>
         </button>`;
     })
     .join("");
@@ -3041,7 +4010,7 @@ function renderAccountMenu(data) {
     ${rows || '<div class="account-item muted">未检测到 Chrome 账号</div>'}
     <div class="account-sep"></div>
     <button class="account-item" id="checkLoginBtn" type="button">检测小红书登录状态</button>
-    <button class="account-item" id="accountRefreshBtn" type="button" ${state.accountBusy ? "disabled" : ""}>刷新当前账号资料</button>
+    <button class="account-item" id="accountRefreshBtn" type="button" ${state.accountBusy ? "disabled" : ""}>刷新当前浏览器账号（读取实际登录）</button>
     <button class="account-item" id="accountProfileBtn" type="button">管理当前账号画像</button>
     <button class="account-item" id="accountLogoutBtn" type="button" ${state.accountBusy ? "disabled" : ""}>退出当前小红书账号（清登录态）</button>
     <div class="account-tip">每个 Chrome 用户资料独立保存登录态。未连接的账号显示已缓存资料；在 Chrome 手动更换小红书账号后，请刷新资料。添加账号请先在 Chrome 新建用户资料并登录小红书。</div>
@@ -3058,18 +4027,15 @@ function renderAccountMenu(data) {
 }
 
 async function acceptAccountList(data) {
-  const changed = data.active && data.active !== state.activeProfile;
+  const next = data.active || state.activeProfile;
+  const changed = next !== state.activeProfile;
   state.accounts = data.profiles || [];
-  state.activeProfile = data.active || state.activeProfile;
+  state.activeProfile = next;
   renderCurrentAccount();
   if (changed) {
-    invalidateCopies();
+    await loadAccountWorkspace(next, true);
+  } else {
     displayProfile();
-    await loadConfig();
-    await previewSchedule().catch((error) => log(error.message));
-    await loadFxSettings();
-    await loadProfile();
-    window.loadAutomation?.();
   }
 }
 
@@ -3079,41 +4045,125 @@ async function refreshAccountLabel() {
   return data;
 }
 
+function setAccountSyncBusy(busy) {
+  const btn = $("accountSyncBtn");
+  if (!btn) return;
+  btn.disabled = !!busy;
+  btn.classList.toggle("busy", !!busy);
+}
+
+function confirmAccountMismatch(conflict = {}) {
+  const dialog = $("accountMismatchDialog");
+  if (!dialog) return Promise.resolve(null);
+  const observed = conflict.observed || {};
+  const cached = conflict.cached || {};
+  $("accountMismatchText").textContent =
+    `浏览器里这个 Chrome 用户资料现在登录的是「${observed.nickname || "未知账号"}」，` +
+    `软件里记录的是「${cached.nickname || "原账号"}」。` +
+    "如果确实在浏览器里换了小红书账号，点「同步」把软件记录更新为浏览器里的账号；否则点「保留软件记录」。";
+  $("accountMismatchSnooze").checked = false;
+  return new Promise((resolve) => {
+    const ok = $("accountMismatchOk");
+    const cancel = $("accountMismatchCancel");
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
+      dialog.close();
+      resolve(value);
+    };
+    const onOk = () => finish({ snooze: $("accountMismatchSnooze").checked });
+    const onCancel = () => finish(null);
+    ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
+    dialog.addEventListener("close", () => finish(null), { once: true });
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
+  });
+}
+
 async function refreshAccountIdentity(silent = false) {
   if (state.accountBusy) return;
   state.accountBusy = true;
+  setAccountSyncBusy(true);
   displayProfile();
-  if (!silent) log("正在读取当前连接的小红书昵称和头像…");
+  if (!silent) log("正在读取当前 Chrome 窗口实际登录的小红书账号…");
   renderAccountMenu({ profiles: state.accounts, active: state.activeProfile });
   try {
-    const data = await api("/api/accounts/refresh", { profile: state.activeProfile });
-    await refreshAccountLabel();
-    if (!silent) log(data.identity?.status === "verified" ? `已识别小红书账号：${data.identity.nickname}` : data.identity?.error || "当前小红书账号未登录");
+    try {
+      const data = await api("/api/accounts/refresh", { profile: state.activeProfile });
+      await refreshAccountLabel();
+      if (!silent) log(data.identity?.status === "verified" ? `已识别小红书账号：${data.identity.nickname}` : data.identity?.error || "当前小红书账号未登录");
+      return;
+    } catch (error) {
+      const conflict = error.data?.conflict;
+      if (!conflict) throw error;
+      const choice = await confirmAccountMismatch(conflict);
+      if (!choice) {
+        log("已保留软件里记录的账号。如果要改成浏览器里现在的账号，请再点一次刷新并选择同步。");
+        return;
+      }
+      const adopted = await api("/api/accounts/refresh", {
+        profile: state.activeProfile, adopt: true, snooze: choice.snooze,
+      });
+      await refreshAccountLabel();
+      log(`已把「${state.activeProfile}」的账号记录同步为浏览器里的「${adopted.identity?.nickname || "新账号"}」。${choice.snooze ? "24 小时内不再提示。" : ""}`);
+      return;
+    }
   } catch (e) {
     if (!silent) log(`账号资料刷新失败：${e.message}`);
   } finally {
     state.accountBusy = false;
+    setAccountSyncBusy(false);
     displayProfile();
     renderAccountMenu({ profiles: state.accounts, active: state.activeProfile });
   }
 }
 
+function showAccountInactiveNotice(title, message) {
+  if ($("accountSwitchNotice")) return;
+  const el = document.createElement("div");
+  el.id = "accountSwitchNotice";
+  el.className = "account-switch-notice";
+  el.innerHTML = `<div><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p></div>`;
+  document.body.appendChild(el);
+}
+
 async function switchAccount(profileDir, label) {
-  if (state.accountBusy) return;
+  if (state.accountBusy || state.restoringAccount) return;
   closeAccountMenu();
   if (profileDir === state.activeProfile) return;
   state.accountBusy = true;
+  setAccountSyncBusy(true);
   displayProfile();
   setBridge("切换中：正在连接账号…", null);
-  log(`正在连接账号「${label}」：会打开或复用对应 Chrome 用户资料，其他 Chrome 窗口不会关闭…`);
+  log(`正在切换到「${label}」：会打开这个 Chrome 用户资料并沿用它自己记录的登录状态，其它账号窗口不会关闭…`);
   try {
+    await saveActiveDraft({ silent: false }).catch((error) => log(`保存当前账号草稿失败：${error.message}`));
     const data = await api("/api/accounts/switch", { profile: profileDir });
     if (data.ready) {
       setBridge(`已连接：${label}`, true);
-      log(`已切换到「${label}」，浏览器记录（登录状态）已复用。`);
+      const opened = !!data.workspace?.ok;
+      const minimized = !!data.previous_window?.ok;
+      const reason = data.workspace?.error ? `（${data.workspace.error}）` : "";
+      log(
+        `已切换到「${label}」。` +
+        (opened ? "工作台已在这个 Chrome 用户资料的新窗口打开，" : `没能自动打开新窗口${reason}，请手动打开该 Chrome 用户资料并访问 http://127.0.0.1:5818 ，`) +
+        (minimized ? "上一个账号的窗口已最小化。" : "上一个账号的窗口已保留。")
+      );
+      if (PINNED_PROFILE && profileDir === PINNED_PROFILE) {
+        $("accountSwitchNotice")?.remove();
+      } else if (opened) {
+        showAccountInactiveNotice(
+          `已切换到「${label}」`,
+          "这个窗口属于上一个账号，已停用。请到刚打开的新窗口继续操作；右上角账号菜单仍可切回其它账号。"
+        );
+      }
     } else {
       setBridge("扩展未连接", false);
-      log(`已切到「${label}」，但该浏览器账号未连上扩展：请确认该 Chrome 用户资料已安装并启用 XHS Bridge 扩展。`);
+      log(`已切到「${label}」，但该浏览器账号未连上扩展：请确认这个 Chrome 用户资料已安装并启用 XHS Bridge 扩展。`);
     }
     await refreshAccountLabel();
   } catch (e) {
@@ -3122,6 +4172,7 @@ async function switchAccount(profileDir, label) {
     await refreshAccountLabel().catch(() => {});
   } finally {
     state.accountBusy = false;
+    setAccountSyncBusy(false);
     displayProfile();
   }
 }

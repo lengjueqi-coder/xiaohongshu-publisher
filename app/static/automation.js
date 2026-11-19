@@ -3,15 +3,17 @@
   const field = (id) => document.getElementById(`auto_${id}`);
   const html = escapeHtml;
   let snapshot = null, loadedProfile = "", loadId = 0, busy = false, optionsLoaded = false, draftFx = null, loading = false;
-  const styles = {praise:"夸赞型",professional:"专业展示",process:"过程分享",opinion:"观点讨论",story:"案例故事"};
+  const styles = {praise:"夸赞型",professional:"专业展示",process:"过程分享",opinion:"观点讨论",story:"案例故事",painpoint:"行业痛点视角",knowledge:"行业干货分享",advantage:"自我优势"};
   const statuses = {draft:"待审核",queued:"待提交",paused:"已暂停",submitting:"正在填入",reviewed_page:"正在提交",submitted:"平台已接收",failed:"提交前失败",unknown:"需核对平台结果",cancelled:"已取消"};
   host.innerHTML = `
-    <div class="auto-heading"><div><div class="auto-kicker">PUBLISHING PLAN</div><h1>让内容按计划发生</h1><p>选好素材与规则，自动制作、排期。需要你处理时，用声音提醒。</p></div><span id="autoState" class="auto-status">读取计划中</span></div>
+    <div class="auto-heading"><div><div class="auto-kicker">PUBLISHING PLAN</div><h1>原小红书专属计划</h1><p>用于原有小红书拼图及素材库流程；三平台分发请使用上方新计划。两个计划不能同时处理同一账号的小红书。</p></div><span id="autoState" class="auto-status">读取计划中</span></div>
     <div class="auto-card"><h2>当前账号的发布计划</h2><p id="autoAccount"></p><div class="auto-grid">
       <label class="auto-wide">素材根目录<div class="auto-row"><input id="auto_root_path" placeholder="选择大文件夹，支持年份 / 月份 / 子文件夹"/><button id="autoChooseRoot">选择文件夹</button></div></label>
       <label>运行方式<select id="auto_mode"><option value="review">自动制作，先批量审核</option><option value="automatic">全自动制作并提交</option></select></label>
       <label>每天发布数量<input id="auto_daily_count" type="number" min="1" max="10"/></label>
-      <label>发布时间段（每行一个）<textarea id="auto_windows" rows="2" placeholder="10:00-11:00&#10;21:00-22:00"></textarea></label>
+      <label>每天使用时间段<select id="auto_window_mode"><option value="random">随机使用一个常用时间段</option><option value="fixed">固定使用一个常用时间段</option></select></label>
+      <label id="autoFixedWindowLabel">固定时间段<select id="auto_fixed_window"></select></label>
+      <div class="auto-wide"><span style="font-size:12px">账号常用时间段</span><div id="autoCommonWindows" class="auto-actions"></div></div>
       <label>发布时间所属时区<select id="auto_timezone"><option value="Asia/Shanghai">北京时间</option><option value="America/Los_Angeles">洛杉矶时间</option></select></label>
       <label>提前准备天数<input id="auto_ahead_days" type="number" min="1" max="7"/></label>
       <label>选图方式<select id="auto_selection"><option value="ordered">按文件顺序选取</option><option value="random">从当前子文件夹随机选择</option></select></label>
@@ -33,8 +35,8 @@
       <label>每小时最多提交几条<input id="auto_submission_hour_limit" type="number" min="1" max="10"/></label>
       <label>每 24 小时最多提交几条<input id="auto_submission_day_limit" type="number" min="1" max="50"/></label>
     </div>
-    <div class="auto-note">每个直接放有图片的子文件夹默认使用一次。生成任务后，图片、文案和设置会固定保存。Mac 需保持开机联网、素材磁盘可用；提交给平台的定时内容由平台继续执行。</div>
-    <div class="auto-actions"><button id="autoSave" class="primary">保存规则</button><button id="autoBind">绑定当前小红书账号</button><button id="autoBuild">先制作 10 条预览</button><button id="autoEnable" class="primary">启用计划</button><button id="autoPause">暂停计划</button></div><p id="autoPlanError"></p></div>
+    <div class="auto-note">每个直接放有图片的子文件夹默认使用一次。生成任务后，图片、文案和设置会固定保存；改了规则要点"保存规则并同步到未提交任务"，已提交的内容不会变。Mac 需保持开机联网、素材磁盘可用；提交给平台的定时内容由平台继续执行。</div>
+    <div class="auto-actions"><button id="autoSave" class="primary">保存规则</button><button id="autoApply" class="primary">保存规则并同步到未提交任务</button><button id="autoBind">绑定当前小红书账号</button><button id="autoBuild">先制作 10 条预览</button><button id="autoEnable" class="primary">启用计划</button><button id="autoPause">暂停计划</button></div><p id="autoPlanError"></p></div>
     <div class="auto-card"><div class="auto-heading"><h2>制作与发布记录</h2><button id="autoApprove" class="primary">确认选中的草稿并提交</button></div><p>逐条展开检查图片、文案和设置。平台已接收不等于已到发布时间或通过审核。</p><div id="autoTasks"></div></div>
     <div class="auto-card"><h2>声音与语音提醒</h2><p>仅在这台 Mac 上播放，未连接手机。系统音量、勿扰模式和通知权限可能影响提醒，请先试听。</p><div class="auto-grid">
       <label class="auto-check auto-wide"><input id="auto_notify_enabled" type="checkbox"/>开启异常提醒</label>
@@ -77,7 +79,17 @@
     if(draftFx)config.fx_params=draftFx;
     ["root_path","mode","timezone","selection","layout","copy_mode","album","location","topic_template","visibility"].forEach(k=>config[k]=field(k).value.trim());
     ["daily_count","ahead_days","min_images","max_images","submission_hour_limit","submission_day_limit"].forEach(k=>config[k]=Number(field(k).value));
-    config.windows=field("windows").value.split(/\n+/).map(s=>s.trim()).filter(Boolean);
+    if(config.mode==="automatic"&&(config.daily_count<1||config.daily_count>2))throw new Error("全自动发布每天只能 1–2 条，请调低每天发布数量");
+    const commonWindows=Array.isArray(snapshot.common_windows)?snapshot.common_windows:[];
+    if(!commonWindows.length)throw new Error("请先到账号画像下方设置常用发布时间段");
+    config.window_mode=field("window_mode").value;
+    if(config.window_mode==="fixed"){
+      config.fixed_window=field("fixed_window").value;
+      if(!commonWindows.includes(config.fixed_window))throw new Error("请选择一个固定时间段");
+      config.windows=[config.fixed_window];
+    }else{
+      config.fixed_window="";config.windows=[...commonWindows];
+    }
     config.tags=splitTags(field("tags").value);config.mentions=field("mentions").value.split(/\n+/).map(s=>s.trim()).filter(Boolean);
     config.styles=[...host.querySelectorAll("[data-auto-style]:checked")].map(e=>e.dataset.autoStyle);
     ["original","allow_template_fallback"].forEach(k=>config[k]=field(k).checked);
@@ -88,11 +100,32 @@
     const c=snapshot.plan.config;
     draftFx=null;
     ["root_path","mode","timezone","selection","layout","copy_mode","album","location","topic_template","visibility","daily_count","ahead_days","min_images","max_images","submission_hour_limit","submission_day_limit"].forEach(k=>field(k).value=c[k]??"");
-    field("windows").value=(c.windows||[]).join("\n");field("tags").value=(c.tags||[]).join(" ");field("mentions").value=(c.mentions||[]).join("\n");
+    field("window_mode").value=c.window_mode||"random";
+    renderCommonWindows();
+    const common=Array.isArray(snapshot.common_windows)?snapshot.common_windows:[];
+    field("fixed_window").value=common.includes(c.fixed_window)?c.fixed_window:(common[0]||"");
+    toggleAutoFixedWindow();
+    field("tags").value=(c.tags||[]).join(" ");field("mentions").value=(c.mentions||[]).join("\n");
     ["original","allow_template_fallback"].forEach(k=>field(k).checked=!!c[k]);
     host.querySelectorAll("[data-auto-style]").forEach(e=>e.checked=c.styles.includes(e.dataset.autoStyle));
     document.getElementById("autoLibrary").replaceChildren();(c.copy_library||[]).forEach(addCopy);
     fxSummary();
+  }
+  function renderCommonWindows() {
+    const windows=Array.isArray(snapshot.common_windows)?snapshot.common_windows:[];
+    const select=field("fixed_window");
+    const current=select.value||snapshot.plan.config.fixed_window||"";
+    select.innerHTML=windows.length
+      ?windows.map(w=>`<option value="${html(w)}">${html(w)}</option>`).join("")
+      :'<option value="">未设置常用时间段</option>';
+    if(windows.includes(current))select.value=current;
+    const box=document.getElementById("autoCommonWindows");
+    box.innerHTML=windows.length
+      ?windows.map(w=>`<span class="auto-chip">${html(w)}</span>`).join("")
+      :'<span class="auto-warn">尚未设置，请到账号画像下方添加常用发布时间段。</span>';
+  }
+  function toggleAutoFixedWindow() {
+    document.getElementById("autoFixedWindowLabel").hidden=field("window_mode").value!=="fixed";
   }
   function fxSummary() {
     const fx=snapshot.plan.config.fx_params||{};
@@ -108,7 +141,7 @@
     const selected=new Set([...host.querySelectorAll("[data-approve-id]:checked")].map(e=>e.dataset.approveId));
     const expanded=new Set([...host.querySelectorAll("details[open]")].map(e=>e.dataset.jobDetail));
     document.getElementById("autoTasks").innerHTML=snapshot.jobs.length?snapshot.jobs.map(j=>{
-      const p=j.payload;return `<article class="auto-task"><div class="auto-row">${j.status==="draft"?`<input type="checkbox" aria-label="选择草稿 ${j.id}" data-approve-id="${j.id}" ${selected.has(String(j.id))?"checked":""}/>`:""}<h3>#${j.id} ${html(p.title||"未命名任务")}</h3><span class="auto-status">${html(statuses[j.status]||j.status)}</span></div><p>${html(p.folder_name||"")} · ${html(j.schedule_time||"立即发布")} ${html(p.timezone||"")} · ${html(p.visibility||"")}</p><details data-job-detail="${j.id}" ${expanded.has(String(j.id))?"open":""}><summary>查看图片、文案与设置</summary><div class="auto-thumbs">${(p.images||[]).map(path=>`<img src="/api/image?path=${encodeURIComponent(path)}" alt="本条已固定的图片" loading="lazy"/>`).join("")}</div><pre>${html(p.content||"")}</pre><p>${html((p.tags||[]).map(t=>"#"+t).join(" "))}</p><p>原创：${p.original?"开启":"关闭"} · 合集：${html(p.album||"未设置")} · 地点：${html(p.location||"未设置")} · @：${html((p.mentions||[]).join("、")||"无")}</p>${j.last_error?`<div class="auto-note">${html(j.last_error)}</div>`:""}<div class="auto-actions">${["draft","queued","paused","failed"].includes(j.status)?`<button data-cancel-job="${j.id}">取消并释放素材</button>`:""}${j.status==="unknown"?`<button data-resolve-job="${j.id}" data-accepted="yes">已核对：平台已接收</button><button data-resolve-job="${j.id}" data-accepted="no">已核对：平台未接收</button>`:""}</div></details></article>`;
+      const p=j.payload;return `<article class="auto-task"><div class="auto-row">${j.status==="draft"?`<input type="checkbox" aria-label="选择草稿 ${j.id}" data-approve-id="${j.id}" ${selected.has(String(j.id))?"checked":""}/>`:""}<h3>#${j.id} ${html(p.title||"未命名任务")}</h3><span class="auto-status">${html(statuses[j.status]||j.status)}</span></div><p>${html(p.folder_name||"")} · ${html(j.schedule_time||"立即发布")} ${html(p.timezone||"")} · ${html(p.visibility||"")}</p><details data-job-detail="${j.id}" ${expanded.has(String(j.id))?"open":""}><summary>查看图片、文案与设置</summary><div class="auto-thumbs">${(p.images||[]).map(path=>`<img src="/api/image?path=${encodeURIComponent(path)}" alt="本条已固定的图片" loading="lazy"/>`).join("")}</div><pre>${html(p.content||"")}</pre><p>${html((p.tags||[]).map(t=>"#"+t).join(" "))}</p><p>原创：${p.original?"开启":"关闭"} · 可见范围：${html(p.visibility||"未设置")} · 合集：${html(p.album||"未设置")} · 话题模板：${html(p.topic_template||"未设置")} · 地点：${html(p.location||"未设置")} · @：${html((p.mentions||[]).join("、")||"无")}</p>${j.last_error?`<div class="auto-note">${html(j.last_error)}</div>`:""}<div class="auto-actions">${["draft","queued","paused","failed"].includes(j.status)?`<button data-cancel-job="${j.id}">取消并释放素材</button>`:""}${j.status==="unknown"?`<button data-resolve-job="${j.id}" data-accepted="yes">已核对：平台已接收</button><button data-resolve-job="${j.id}" data-accepted="no">已核对：平台未接收</button>`:""}</div></details></article>`;
     }).join(""):"<p>还没有任务。保存规则后，先制作一批预览。</p>";
   }
   function renderStatus() {
@@ -132,6 +165,7 @@
     try {
       const data=await api(`/api/automation?profile_dir=${encodeURIComponent(profile)}`);if(id!==loadId||profile!==state.activeProfile||data.profile_dir!==profile)return;
       snapshot=data;await loadOptions();if(id!==loadId||profile!==state.activeProfile)return;
+      renderCommonWindows();
       if(loadedProfile!==profile||force){fillConfig();fillNotifications();loadedProfile=profile;}
       renderStatus();renderJobs();
     }catch(e){feedback(`自动发布读取失败：${e.message}`);}finally{loading=false;}
@@ -142,16 +176,19 @@
     const profile=state.activeProfile;
     try {
       const data=await api(path,{...body,profile_dir:profile});
-      if(profile===state.activeProfile){snapshot=data;renderStatus();renderJobs();if(force){fillConfig();fillNotifications();}}
+      if(profile===state.activeProfile){snapshot=data;renderCommonWindows();renderStatus();renderJobs();if(force){fillConfig();fillNotifications();}}
       feedback(path==="/api/notifications/preview"?"试听播放已完成；若未听到，请检查 Mac 音量与音频输出设备。":path==="/api/notifications/save"?"提醒设置已保存。":"操作已完成。");
-    }catch(e){feedback(e.message);}finally{busy=false;buttons.forEach(b=>b.disabled=false);if(snapshot)renderStatus();}
+      return true;
+    }catch(e){feedback(e.message);return false;}finally{busy=false;buttons.forEach(b=>b.disabled=false);if(snapshot)renderStatus();}
   }
   document.getElementById("autoChooseRoot").onclick=async()=>{try{const d=await api("/api/choose-folder",{});field("root_path").value=d.path;}catch(e){feedback(e.message);}};
   document.getElementById("autoAddCopy").onclick=()=>addCopy();
-  document.getElementById("autoSave").onclick=()=>run("/api/automation/save",{config:readConfig()},true);
+  document.getElementById("autoSave").onclick=()=>{try{run("/api/automation/save",{config:readConfig()},true);}catch(e){feedback(e.message);}};
+  document.getElementById("autoApply").onclick=async()=>{try{if(await run("/api/automation/save",{config:readConfig()},true)){await run("/api/automation/apply",{});feedback("已把当前规则同步到所有未提交任务；发布时间、图片和文案保持不变。");}}catch(e){feedback(e.message);}};
   document.getElementById("autoBind").onclick=()=>run("/api/automation/bind",{},true);
   document.getElementById("autoBuild").onclick=()=>run("/api/automation/build",{limit:10});
-  document.getElementById("autoEnable").onclick=async()=>{if(snapshot?.plan.config.mode==="automatic"&&!await confirmAction(`启用“${snapshot.plan.config.account_name}”的全自动发布？\n后续符合已保存规则的任务会自动提交，当前可见范围：${snapshot.plan.config.visibility}`))return;run("/api/automation/enable",{enabled:true});};
+  document.getElementById("autoEnable").onclick=async()=>{if(field("mode").value==="automatic"&&!await confirmAction(`启用“${snapshot.plan.config.account_name}”的全自动发布？\n后续符合已保存规则的任务会自动提交，当前可见范围：${field("visibility").value}`))return;try{if(await run("/api/automation/save",{config:readConfig()},true))await run("/api/automation/enable",{enabled:true});}catch(e){feedback(e.message);}};
+  field("window_mode").addEventListener("change",toggleAutoFixedWindow);
   document.getElementById("autoPause").onclick=()=>run("/api/automation/enable",{enabled:false});
   document.getElementById("autoUseFx").onclick=()=>{draftFx=fxParamsFromUI();snapshot.plan.config.fx_params=draftFx;fxSummary();feedback("已采用当前账号的水印/LOGO；请保存规则。");};
   document.getElementById("autoApprove").onclick=async()=>{const ids=[...host.querySelectorAll("[data-approve-id]:checked")].map(e=>Number(e.dataset.approveId));if(!ids.length){feedback("请先勾选已审核的草稿。");return;}if(await confirmAction(`确认提交选中的 ${ids.length} 条内容？`))run("/api/automation/approve",{ids});};

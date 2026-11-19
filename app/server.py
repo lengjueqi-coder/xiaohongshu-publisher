@@ -30,10 +30,15 @@ import imagefx
 import cover_service
 import browser_profiles
 import publishing_resources
+from platform_publishing import Publisher
 from automation_engine import AutomationEngine, init_tables as init_automation_tables
 import mac_notifications
 from account_identity import read_connected_identity, safe_avatar_url
 from update_service import UpdateError, check_for_update, launch_update
+from publishing_policy import require_schedule_lead
+import vision_service
+from distribution_service import DistributionService
+from distribution_plans import DailyPlans
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +56,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_IMPORT_IMAGE_BYTES = 100 * 1024 * 1024
 MAX_NOTE_IMAGES = 18
-APP_VERSION = "2026.11.10"
+APP_VERSION = "2026.11.19"
 
 
 COPY_STYLES = {
@@ -60,6 +65,16 @@ COPY_STYLES = {
     "process": "制作过程分享型",
     "opinion": "观点讨论型",
     "story": "案例故事型",
+    "painpoint": "行业痛点视角型",
+    "knowledge": "行业干货分享型",
+    "advantage": "自我优势型",
+}
+
+# 仅对需要明确切入角度的风格补充写作指引，避免 AI 只按风格名自由发挥。
+COPY_STYLE_HINTS = {
+    "painpoint": "从目标客户在资料照上的真实困扰切入，先点出问题，再给出判断和建议，不贩卖焦虑。",
+    "knowledge": "以可执行的拍摄或准备经验为主，条理清楚，不夸大效果。",
+    "advantage": "围绕本工作室的做法与标准讲优势，用具体流程和取舍说明，不贬低同行、不承诺效果。",
 }
 
 
@@ -95,11 +110,13 @@ QUEUE_WAKE = threading.Event()
 QUEUE_STOP = threading.Event()
 QUEUE_THREAD: threading.Thread | None = None
 HTTP_SERVER: ThreadingHTTPServer | None = None
-QUEUE_GAP_MIN_SECONDS = 60
-QUEUE_GAP_MAX_SECONDS = 150
+QUEUE_GAP_MIN_SECONDS = 480
+QUEUE_GAP_MAX_SECONDS = 1200
 QUEUE_RESERVING_STATUSES = ("queued", "submitting", "reviewed_page", "draft", "paused", "unknown")
+PLATFORM_PUBLISHER = None
 AUTOMATION: AutomationEngine | None = None
-ACCOUNT_KEYS = {"root_path", "default_album", "default_location", "default_schedule_time", "default_schedule_window", "schedule_windows", "topic_templates", "local_topic_templates", "text_provider", "text_base_url", "pptoken_api_key", "pptoken_model", "daily_limit", "visibility", "publish_mode", "original_enabled", "copy_engine", "deepseek_model", "deepseek_api_key", "apiyi_key", "apiyi_base", "moments_tag", "fx_enabled", "logo_enabled", "logo_path", "logo_position", "logo_margin", "logo_scale", "logo_opacity", "watermark_enabled", "watermark_text", "watermark_path", "watermark_position", "watermark_opacity", "watermark_scale", "output_mode"}
+ACCOUNT_KEYS = {"root_path", "default_album", "manual_albums", "default_location", "default_schedule_time", "default_schedule_window", "schedule_windows", "topic_templates", "local_topic_templates", "last_tags", "last_local_topic_template", "daily_limit", "visibility", "publish_mode", "original_enabled", "moments_tag", "fx_enabled", "logo_enabled", "logo_path", "logo_position", "logo_margin", "logo_scale", "logo_opacity", "watermark_enabled", "watermark_text", "watermark_path", "watermark_position", "watermark_opacity", "watermark_scale", "output_mode"}
+SHARED_AI_KEYS = ("text_provider", "text_base_url", "pptoken_api_key", "pptoken_model", "deepseek_model", "deepseek_api_key", "copy_engine", "apiyi_key", "apiyi_base")
 
 
 @contextmanager
@@ -250,8 +267,40 @@ def init_db() -> None:
                 "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 ("queue_enabled", json.dumps(False)),
             )
+            db.execute("DELETE FROM settings WHERE key LIKE 'queue_enabled:%'")
             db.execute("UPDATE automation_plans SET enabled=0,state='attention',last_error='服务重启时存在提交中任务，请先核对平台结果'")
             db.execute("INSERT INTO automation_alerts(profile_dir,plan_id,kind,message,created_at) VALUES(?,?,?,?,?)", ("全部账号", "", "restart", "服务重启时存在提交中的任务，已暂停。请先核对平台结果，避免重复发布。", now_iso()))
+        db.commit()
+    migrate_shared_ai_settings()
+
+
+def migrate_shared_ai_settings() -> None:
+    profile = active_profile_dir()
+    candidates = [profile]
+    if "Default" not in candidates:
+        candidates.append("Default")
+    with db_connection() as db:
+        for key in SHARED_AI_KEYS:
+            if db.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone():
+                continue
+            row = None
+            for candidate in candidates:
+                row = db.execute(
+                    "SELECT value FROM settings WHERE key=?",
+                    (f"account_defaults:{candidate}:{key}",),
+                ).fetchone()
+                if row:
+                    break
+            if not row:
+                row = db.execute(
+                    "SELECT value FROM settings WHERE key LIKE ? ORDER BY key LIMIT 1",
+                    (f"account_defaults:%:{key}",),
+                ).fetchone()
+            if row:
+                db.execute(
+                    "INSERT INTO settings(key, value) VALUES(?, ?)",
+                    (key, row[0]),
+                )
         db.commit()
 
 
@@ -289,20 +338,139 @@ def account_setting(key: str, default: Any = None, profile_dir: str | None = Non
     return json.loads(row[0]) if row else default
 
 
+def draft_key(profile_dir: str) -> str:
+    return f"publish_draft:{profile_dir}"
+
+
+def get_publish_draft(profile_dir: str | None = None) -> dict[str, Any] | None:
+    profile = profile_dir or active_profile_dir()
+    value = db_get_setting(draft_key(profile))
+    return value if isinstance(value, dict) else None
+
+
+def _clean_draft_text(value: Any, limit: int) -> str:
+    text = str(value or "").replace("\x00", "")
+    return text[:limit]
+
+
+def _clean_draft_list(value: Any, limit: int, item_limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value[:limit]:
+        text = _clean_draft_text(item, item_limit).strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def normalize_publish_draft(draft: Any) -> dict[str, Any]:
+    if not isinstance(draft, dict):
+        raise ValueError("草稿格式不正确")
+    folder = draft.get("folder")
+    clean_folder = None
+    if isinstance(folder, dict) and _clean_draft_text(folder.get("path"), 4096).strip():
+        clean_folder = {
+            "path": _clean_draft_text(folder.get("path"), 4096).strip(),
+            "name": _clean_draft_text(folder.get("name"), 500).strip(),
+            "material_root": _clean_draft_text(folder.get("material_root"), 4096).strip(),
+            "material_mode": _clean_draft_text(folder.get("material_mode"), 30).strip() or "mixed",
+            "all_images": _clean_draft_list(folder.get("all_images"), 100, 4096),
+            "excluded": _clean_draft_list(folder.get("excluded"), 100, 4096),
+        }
+    return {
+        "version": 1,
+        "saved_at": now_iso(),
+        "title": _clean_draft_text(draft.get("title"), 300),
+        "content": _clean_draft_text(draft.get("content"), 20000),
+        "tags": _clean_draft_list(draft.get("tags"), 20, 50),
+        "mentions": _clean_draft_list(draft.get("mentions"), 20, 50),
+        "selected_local_template": _clean_draft_text(draft.get("selected_local_template"), 80).strip(),
+        "model_name": _clean_draft_text(draft.get("model_name"), 80).strip(),
+        "shooting_date": _clean_draft_text(draft.get("shooting_date"), 40).strip(),
+        "notes": _clean_draft_text(draft.get("notes"), 5000),
+        "album": _clean_draft_text(draft.get("album"), 100).strip(),
+        "location": _clean_draft_text(draft.get("location"), 200).strip(),
+        "visibility": _clean_draft_text(draft.get("visibility"), 30).strip(),
+        "publish_mode": _clean_draft_text(draft.get("publish_mode"), 30).strip(),
+        "schedule_window": _clean_draft_text(draft.get("schedule_window"), 80).strip(),
+        "schedule_preview": _clean_draft_text(draft.get("schedule_preview"), 40).strip(),
+        "original": bool(draft.get("original", True)),
+        "style": _clean_draft_text(draft.get("style"), 30).strip(),
+        "folder": clean_folder,
+    }
+
+
+def save_publish_draft(profile_dir: str, draft: Any) -> dict[str, Any]:
+    clean = normalize_publish_draft(draft)
+    db_set_setting(draft_key(profile_dir), clean)
+    return clean
+
+
+def queue_enabled_key(profile_dir: str) -> str:
+    return f"queue_enabled:{profile_dir}"
+
+
+def manual_queue_enabled(profile_dir: str | None = None) -> bool:
+    profile = profile_dir or active_profile_dir()
+    return bool(db_get_setting(queue_enabled_key(profile), False))
+
+
+def set_manual_queue_enabled(profile_dir: str, enabled: bool) -> None:
+    db_set_setting(queue_enabled_key(profile_dir), bool(enabled))
+
+
+def any_manual_queue_enabled() -> bool:
+    with db_connection() as db:
+        rows = db.execute(
+            "SELECT value FROM settings WHERE key LIKE 'queue_enabled:%'"
+        ).fetchall()
+    for row in rows:
+        try:
+            if json.loads(row[0]):
+                return True
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return False
+
+
+def queue_master_enabled() -> bool:
+    return bool(db_get_setting("queue_enabled", False)) or any_manual_queue_enabled()
+
+
+def pause_manual_queue(profile_dir: str) -> None:
+    set_manual_queue_enabled(profile_dir, False)
+    if not any_manual_queue_enabled() and not has_active_plans():
+        db_set_setting("queue_enabled", False)
+
+
 def save_publish_preferences(profile_dir: str, values: dict[str, Any]) -> None:
     allowed = {
         "visibility": {"公开可见", "仅自己可见", "仅互关好友可见"},
         "publish_mode": {"immediate", "scheduled"},
         "original_enabled": None,
         "default_schedule_window": None,
+        "album": None,
+        "location": None,
+        "tags": None,
+        "local_topic_template": None,
     }
+    key_map = {
+        "album": "default_album",
+        "location": "default_location",
+        "tags": "last_tags",
+        "local_topic_template": "last_local_topic_template",
+    }
+    normalized = {}
     for key, options in allowed.items():
         if key not in values:
             continue
-        if key == "original_enabled" and type(values[key]) is not bool:
-            raise ValueError("原创声明设置必须为布尔值")
-        if key == "default_schedule_window":
-            window = str(values[key] or "").strip()
+        value = values[key]
+        if key == "original_enabled":
+            if type(value) is not bool:
+                raise ValueError("原创声明设置必须为布尔值")
+        elif key == "default_schedule_window":
+            value = str(value or "").strip()
             windows = account_setting(
                 "schedule_windows",
                 ["早上 10:00", "晚上 22:00-24:00"],
@@ -310,16 +478,46 @@ def save_publish_preferences(profile_dir: str, values: dict[str, Any]) -> None:
             )
             if not isinstance(windows, list):
                 windows = ["早上 10:00", "晚上 22:00-24:00"]
-            if window and window not in {str(item) for item in windows if item}:
+            if value and value not in {str(item) for item in windows if item}:
                 raise ValueError("默认时间段必须来自当前账号已保存的时间段列表")
-            values[key] = window
-        elif options is not None and values[key] not in options:
+        elif key == "album":
+            value = str(value or "").strip()
+            if len(value) > 100:
+                raise ValueError("合集名称不能超过 100 字")
+        elif key == "location":
+            value = str(value or "").strip()
+            if len(value) > 200:
+                raise ValueError("地点不能超过 200 字")
+        elif key == "tags":
+            if not isinstance(value, list) or len(value) > 10:
+                raise ValueError("话题最多 10 个")
+            tags = []
+            for item in value:
+                tag = str(item or "").strip().lstrip("#").strip()
+                if not tag:
+                    continue
+                if len(tag) > 50 or any(ord(char) < 32 for char in tag):
+                    raise ValueError("单个话题不能超过 50 字")
+                if tag not in tags:
+                    tags.append(tag)
+            value = tags
+        elif key == "local_topic_template":
+            value = str(value or "").strip()
+            templates = account_setting("local_topic_templates", [], profile_dir=profile_dir)
+            names = {
+                str(item.get("name") or "")
+                for item in templates
+                if isinstance(item, dict)
+            } if isinstance(templates, list) else set()
+            if value and value not in names:
+                raise ValueError("话题模板不存在或已被删除，请重新选择")
+        elif options is not None and value not in options:
             raise ValueError(f"无效的发布设置：{key}")
+        normalized[key_map.get(key, key)] = value
     with db_connection() as db:
-        for key in allowed:
-            if key in values:
-                db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                           (f"account_defaults:{profile_dir}:{key}", json.dumps(values[key], ensure_ascii=False)))
+        for key, value in normalized.items():
+            db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       (f"account_defaults:{profile_dir}:{key}", json.dumps(value, ensure_ascii=False)))
 
 
 # ---------- AI 封面（API易）配置：流程与 Key 均迁移自样片工厂已验证实现 ----------
@@ -429,24 +627,94 @@ def clear_account_identity(profile_dir: str) -> None:
     })
 
 
-def refresh_account_identity(profile_dir: str | None = None) -> dict[str, Any]:
-    """Bind a live read to the selected profile, leaving cached identity on disconnect."""
+def identity_conflict(profile_dir: str, identity: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the known account when a live read belongs to a different one."""
+    cached = account_identity(profile_dir)
+    cached_user = str(cached.get("user_id") or "").strip()
+    observed_user = str(identity.get("user_id") or "").strip()
+    if identity.get("status") == "verified" and cached_user and observed_user and observed_user != cached_user:
+        return cached
+    return None
+
+
+def identity_conflict_message(profile_dir: str, identity: dict[str, Any], cached: dict[str, Any]) -> str:
+    return (
+        f"当前 Chrome 窗口登录的是「{identity.get('nickname') or '未知账号'}」，"
+        f"不是「{profile_dir}」上次识别的「{cached.get('nickname') or '原账号'}」。"
+        "请关闭其它 Chrome 用户资料窗口，只保留这个账号的窗口后再试。"
+    )
+
+
+class AccountMismatch(PublishError):
+    """浏览器实时读到的账号与软件记录不一致，需要用户确认后同步。"""
+
+    def __init__(self, profile: str, identity: dict[str, Any], cached: dict[str, Any]):
+        super().__init__(identity_conflict_message(profile, identity, cached))
+        self.profile = profile
+        self.identity = identity
+        self.cached = cached
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": str(self),
+            "profile": self.profile,
+            "conflict": {
+                "observed": self.identity,
+                "cached": self.cached,
+            },
+        }
+
+
+MISMATCH_SNOOZE_HOURS = 24
+
+
+def mismatch_snooze_until(profile: str) -> datetime | None:
+    raw = str(db_get_setting(f"account_mismatch_snooze:{profile}", "") or "")
+    if not raw:
+        return None
+    try:
+        until = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return until if datetime.now() < until else None
+
+
+def snooze_account_mismatch(profile: str) -> str:
+    until = datetime.now() + timedelta(hours=MISMATCH_SNOOZE_HOURS)
+    db_set_setting(f"account_mismatch_snooze:{profile}", until.isoformat(timespec="seconds"))
+    return until.isoformat(timespec="seconds")
+
+
+def refresh_account_identity(profile_dir: str | None = None, adopt: bool = False) -> dict[str, Any]:
+    """Bind a live read to the selected profile, leaving cached identity on disconnect.
+
+    ``adopt`` 表示用户已确认浏览器里确实换成了另一个小红书账号，允许覆盖软件记录。
+    """
     with BROWSER_LOCK:
         profile = profile_dir or active_profile_dir()
         if profile != active_profile_dir():
             raise PublishError("账号已经切换，请刷新当前账号资料")
+        cached = account_identity(profile)
         try:
-            select_profile_connection(profile)
+            _, bound = _select_profile_connection(profile)
             identity = read_connected_identity(XHS_SKILL_DIR)
-            identity["checked_at"] = now_iso()
+            # An unbound connection may belong to another Chrome profile; never
+            # let it replace the account this profile was verified with.
+            conflict = identity_conflict(profile, identity)
+            if conflict:
+                if not bound:
+                    raise PublishError(identity_conflict_message(profile, identity, conflict))
+                if not adopt and not mismatch_snooze_until(profile):
+                    raise AccountMismatch(profile, identity, conflict)
+            identity.update({"checked_at": now_iso(), "live": True})
+        except AccountMismatch:
+            raise
         except Exception as exc:
-            identity = {
-                **account_identity(profile),
-                "status": "unavailable",
-                "error": str(exc)[:300],
-            }
+            identity = {**cached, "status": "unavailable", "error": str(exc)[:300], "live": False}
         db_set_setting(f"account_identity:{profile}", identity)
         return {"ok": True, "profile": profile, "identity": identity}
+
 
 
 def wait_extension_ready(seconds: int = 30) -> bool:
@@ -493,10 +761,15 @@ def get_fx_params(overrides: dict[str, Any] | None = None, profile_dir: str | No
 
 def read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length", "0"))
+    if length < 0 or length > 2 * 1024 * 1024:
+        raise ValueError("请求数据超过允许大小")
     if length == 0:
         return {}
     raw = handler.rfile.read(length)
-    return json.loads(raw.decode("utf-8"))
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("请求内容必须是 JSON 对象")
+    return payload
 
 
 def store_imported_image(filename: str, raw: bytes, target_root: Path | None = None) -> Path:
@@ -588,7 +861,7 @@ def prepare_images_for_xhs(paths: list[str]) -> tuple[list[str], list[str]]:
     for raw in paths:
         p = Path(raw)
         if not p.exists() or not p.is_file():
-            continue
+            raise PublishError(f"发布图片不存在：{p.name}")
         if p.stat().st_size <= MAX_IMAGE_BYTES:
             prepared.append(str(p))
             continue
@@ -868,6 +1141,28 @@ def parse_schedule_window(raw: str) -> dict[str, Any]:
     return {"label": label, "kind": "range", "start": minutes[0], "end": minutes[1]}
 
 
+def normalize_schedule_windows(raw: Any) -> list[str]:
+    """Validate and deduplicate the account's common publishing windows."""
+    if not isinstance(raw, list):
+        raise ValueError("发布时间段列表格式无效")
+    windows: list[str] = []
+    for index, item in enumerate(raw, 1):
+        label = str(item or "").strip()
+        if not label:
+            continue
+        try:
+            parse_schedule_window(label)
+        except ValueError:
+            raise ValueError(f"第 {index} 个发布时间段格式无效，请使用 HH:MM 或 HH:MM-HH:MM") from None
+        if label not in windows:
+            windows.append(label)
+    if not windows:
+        raise ValueError("至少保留一个常用发布时间段")
+    if len(windows) > 12:
+        raise ValueError("最多设置 12 个常用发布时间段")
+    return windows
+
+
 def _datetime_from_day_and_minute(day: date, minute: int) -> datetime:
     if minute >= 24 * 60:
         return datetime.combine(day + timedelta(days=1), dt_time.min)
@@ -956,16 +1251,17 @@ def _planned_candidates_for_day(
     day: date,
     now_ref: datetime,
     rng: random.Random,
+    min_lead_minutes: int = 6,
 ) -> list[datetime]:
     """Build shuffled minute candidates for one calendar window."""
     start = int(parsed["start"])
     end = int(parsed["end"])
     if parsed["kind"] == "fixed":
         candidate = _datetime_from_day_and_minute(day, start)
-        # Keep the same six-minute browser-safety buffer used by ranges for
-        # today's fixed slot. Future days must retain the exact configured time.
+        # Keep the browser-safety buffer for today's fixed slot. Native XHS
+        # scheduling passes a larger lead time; future days retain the exact time.
         if day == now_ref.date():
-            return [candidate] if candidate >= now_ref + timedelta(minutes=6) else []
+            return [candidate] if candidate >= now_ref + timedelta(minutes=min_lead_minutes) else []
         return [candidate] if candidate > now_ref else []
 
     start_dt = _datetime_from_day_and_minute(day, start)
@@ -975,7 +1271,7 @@ def _planned_candidates_for_day(
     latest = end_dt - timedelta(minutes=1) if end == 24 * 60 else end_dt
     earliest = start_dt
     if day == now_ref.date():
-        earliest = max(earliest, now_ref + timedelta(minutes=6))
+        earliest = max(earliest, now_ref + timedelta(minutes=min_lead_minutes))
     earliest = earliest.replace(second=0, microsecond=0)
     latest = latest.replace(second=0, microsecond=0)
     if earliest > latest:
@@ -991,6 +1287,7 @@ def resolve_planned_schedule_time(
     reserved_times: list[str] | None = None,
     profile_dir: str | None = None,
     now_ref: datetime | None = None,
+    min_lead_minutes: int = 6,
 ) -> str:
     """Choose a future slot while respecting queued slots and the daily account limit."""
     now_ref = now_ref or datetime.now()
@@ -1010,7 +1307,7 @@ def resolve_planned_schedule_time(
     for offset in range(31):
         day = now_ref.date() + timedelta(days=offset)
         reference = now_ref if offset == 0 else datetime.combine(day, dt_time.min) - timedelta(minutes=1)
-        candidates = _planned_candidates_for_day(parsed, day, reference, random.SystemRandom())
+        candidates = _planned_candidates_for_day(parsed, day, reference, random.SystemRandom(), min_lead_minutes)
         for candidate_dt in candidates:
             candidate = candidate_dt.isoformat(timespec="minutes")
             candidate_day = candidate_dt.date()
@@ -1207,6 +1504,12 @@ def default_tags(model_name: str, style: str) -> list[str]:
         base += ["演员成长", "拍照建议", "资料照怎么拍"]
     elif style == "story":
         base += ["拍摄案例", "客片分享", "写真案例"]
+    elif style == "painpoint":
+        base += ["资料照怎么拍", "选角", "演员日常"]
+    elif style == "knowledge":
+        base += ["拍照干货", "资料照拍摄", "试镜准备"]
+    elif style == "advantage":
+        base += ["工作室日常", "拍摄标准", "棚拍"]
     deduped: list[str] = []
     for tag in base:
         clean = tag.strip().lstrip("#")
@@ -1216,7 +1519,7 @@ def default_tags(model_name: str, style: str) -> list[str]:
 
 
 def generate_copy(payload: dict[str, Any]) -> dict[str, Any]:
-    engine = payload.get("copy_engine") or account_setting("copy_engine", "auto", payload.get("profile_dir"))
+    engine = payload.get("copy_engine") or db_get_setting("copy_engine", "auto")
     if engine in ("auto", "deepseek", "anthropic"):
         try:
             return generate_deepseek_copy({**payload, "strict_ai": True})
@@ -1232,21 +1535,27 @@ def generate_copy(payload: dict[str, Any]) -> dict[str, Any]:
 
 def generate_template_copy(payload: dict[str, Any]) -> dict[str, Any]:
     style = payload.get("style") or "professional"
-    model_name = (payload.get("model_name") or "这位小姐姐").strip()
+    model_name = (payload.get("model_name") or "出镜人").strip()
     style_label = COPY_STYLES.get(style, COPY_STYLES["professional"])
     title_map = {
-        "praise": f"{model_name}这组资料照状态太好了",
+        "praise": f"{model_name}的演员资料照",
         "professional": "演员资料照别只拍漂亮",
-        "process": "这组演员资料照的拍摄小记录",
+        "process": "拍资料照前可以做哪些准备",
         "opinion": "演员资料照到底要不要拍得很大片",
-        "story": f"{model_name}这次资料照拍摄案例",
+        "story": f"{model_name}的资料照分享",
+        "painpoint": "资料照拍得漂亮，为什么还是没回音",
+        "knowledge": "演员资料照怎么拍，选角才会多看一眼",
+        "advantage": "资料照选片时可以关注什么",
     }
     body_map = {
-        "praise": f"今天这组里的{model_name}真的很上镜。眼神、肩颈状态和镜头前的松弛感都很自然，照片不是硬凹出来的漂亮，而是能看到她本人稳定、干净的气质。演员资料照最怕用力过猛，这组刚好把表现力和真实感留住了。",
+        "praise": "资料照里，比起追求某一种标准的好看，我更关心人物有没有自己的辨识度。准备拍摄时，可以先想清楚照片的用途，再选择适合自己的造型和表达。让看到照片的人容易认出本人，是一个值得保留的方向。",
         "professional": "演员资料照不是单纯把人拍漂亮，而是让选角老师快速看到一个人的气质、可塑性和镜头可信度。干净的光线、自然的表情、不过度设计的造型，往往比复杂布景更重要。照片要像本人，也要让人愿意多看一眼。",
-        "process": "这组拍摄我们没有把画面做得很复杂，重点是先让人物在镜头前放松下来。拍摄过程中会不断微调站姿、眼神和手部动作，让照片既有资料照需要的清晰度，也保留一点现场的呼吸感。最后这组成片我自己也很喜欢。",
+        "process": "拍资料照前，可以先整理用途、需要的景别和服装搭配。拍摄时不妨给表情和动作留一点调整空间，再根据实际成片挑选。每个人适合的表达不同，不必为了凑齐某种姿势而勉强自己。",
         "opinion": "演员资料照到底要不要拍得很“大片”？我的答案是不一定。真正有效的资料照，应该先让人相信这个演员，再让人记住这个演员。过度精修、过度造型，反而可能削弱真实感和投递时的可信度。",
-        "story": f"这次拍摄前，我们先确定了一个目标：不要把{model_name}拍成统一模板里的漂亮照片，而是保留她自己的气质。前半段主要在找状态，后面眼神和肢体明显更稳定，照片也慢慢有了她自己的辨识度。",
+        "story": "分享一组演员资料照。挑选这类照片时，可以先问自己：它是否适合当前的投递用途，是否容易辨认本人，和其他照片放在一起是否重复。具体怎么选择，还是要回到实际的照片和自己的需求。",
+        "painpoint": "投递资料后没有收到反馈，不一定是照片的问题，也可能与角色需求、时间安排等因素有关。能先检查的是：信息是否清楚，照片是否便于辨认本人，风格是否适合这次用途。资料照是沟通的一部分，不能保证投递结果。",
+        "knowledge": "拍演员资料照，先想清楚三件事：一是用途，投组照和宣传照的侧重点不同；二是造型，干净比时髦更重要，别让发型和妆面抢掉人物；三是状态，眼神和肩颈放松，照片才耐看。拍摄时多留一点自然表情，比全程硬凹更有说服力。资料照不是作品集，是让人快速认识你的工具。",
+        "advantage": "选资料照时，我会建议先看三个问题：人物是否清楚、照片是否像本人、是否适合准备使用的场景。再看看同一组里有没有表达重复的照片。把用途想明白，比单纯追求一张很惊艳的照片更有参考价值。",
     }
     tags = default_tags(model_name, style)
     return {
@@ -1284,35 +1593,35 @@ def text_model_config(
     settings: dict[str, Any] | None = None,
     deepseek_model_override: str | None = None,
 ) -> dict[str, str]:
-    """Resolve one account's actual provider and model without crossing providers."""
+    """Resolve the shared AI provider and model configuration."""
     settings = settings if isinstance(settings, dict) else {}
     provider = str(
         settings["text_provider"] if "text_provider" in settings
-        else account_setting("text_provider", "deepseek", profile_dir)
+        else db_get_setting("text_provider", "deepseek")
     ).strip()
     if provider not in TEXT_PROVIDER_LABELS:
         raise PublishError("模型平台无效")
     if provider == "pptoken":
         model = str(
             settings["pptoken_model"] if "pptoken_model" in settings
-            else account_setting("pptoken_model", "", profile_dir)
+            else db_get_setting("pptoken_model", "")
         ).strip()
         base = str(
             settings["text_base_url"] if "text_base_url" in settings
-            else account_setting("text_base_url", "", profile_dir)
+            else db_get_setting("text_base_url", "")
         ).strip()
         supplied_key = str(settings.get("pptoken_api_key") or "").strip()
-        token = supplied_key or str(account_setting("pptoken_api_key", "", profile_dir) or "").strip()
+        token = supplied_key or str(db_get_setting("pptoken_api_key", "") or "").strip()
     else:
         configured_model = str(
             settings["deepseek_model"] if "deepseek_model" in settings
-            else account_setting("deepseek_model", "deepseek-v4-pro", profile_dir)
+            else db_get_setting("deepseek_model", "deepseek-v4-pro")
         ).strip()
         model = str(deepseek_model_override or configured_model).strip()
         base = "https://api.deepseek.com"
         supplied_key = str(settings.get("deepseek_api_key") or "").strip()
         token = supplied_key or str(
-            account_setting("deepseek_api_key", "", profile_dir) or os.environ.get("DEEPSEEK_API_KEY") or ""
+            db_get_setting("deepseek_api_key", "") or os.environ.get("DEEPSEEK_API_KEY") or ""
         ).strip()
     return {
         "provider": provider,
@@ -1592,7 +1901,8 @@ def generate_account_profile(
 def profile_prompt_block(profile_dir: str | None = None) -> str:
     """把账号画像转成 prompt 片段，注入文案生成；没有画像时返回空串。"""
     profile = get_account_profile(profile_dir)
-    if not profile:
+    facts=('positioning','track','audience','content_style','best_performing','avoid','manual_keywords','manual_topics','manual_notes','topics')
+    if not profile or not any(profile.get(key) for key in facts):
         return ""
     topics = "、".join(str(t) for t in (profile.get("topics") or [])[:10])
     return f"""
@@ -1642,6 +1952,7 @@ def generate_deepseek_copy(payload: dict[str, Any]) -> dict[str, Any] | None:
         deepseek_model_override=str(payload.get("deepseek_model") or "") or None,
     )
     style = payload.get("style") or "professional"
+    style_hint = COPY_STYLE_HINTS.get(style)
     prompt = f"""
 请为小红书账号生成一条新的图文文案，每次换一种表达和切入角度。
 {get_copy_prompts(payload.get('profile_dir'))['generate']}
@@ -1652,8 +1963,10 @@ def generate_deepseek_copy(payload: dict[str, Any]) -> dict[str, Any] | None:
 不要生成或返回话题；话题只由用户明确填写或选定的模板决定。严格输出JSON：{{"title":"...","content":"..."}}。
 只参考出镜人和用户备注；不要附加素材关键词、文件夹日期/编号、专辑或地点等管理信息。
 风格：{COPY_STYLES.get(style, COPY_STYLES['professional'])}
+{f'写作切入：{style_hint}' if style_hint else ''}
 出镜人：{payload.get('model_name') or '未提供'}
 用户拍摄备注：{payload.get('notes') or '未提供'}
+近期已用文案（仅用于避开重复角度，不作为本次拍摄事实）：{json.dumps(payload.get('recent_copies') or [], ensure_ascii=False)[:14000]}
 上次标题（本次请使用不同表达）：{str(payload.get('previous_title') or '')[:100]}
 """.strip()
     try:
@@ -1692,7 +2005,7 @@ def polish_copy(payload: dict[str, Any]) -> dict[str, Any]:
     return _validated_copy(parsed, {**payload, "polish":True}, model_config)
 
 
-def run_xhs_cli(args: list[str], timeout: int = 180) -> dict[str, Any]:
+def run_xhs_cli(args: list[str], timeout: int = 180, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
     bundled_python = APP_ROOT / ".venv" / "bin" / "python"
     if bundled_python.exists():
         prefix = [str(bundled_python)]
@@ -1706,7 +2019,7 @@ def run_xhs_cli(args: list[str], timeout: int = 180) -> dict[str, Any]:
         client = select_profile_connection()
         proc = subprocess.run(
             cmd,
-            env={**os.environ, "XHS_BRIDGE_CLIENT": client},
+            env={**os.environ, "XHS_BRIDGE_CLIENT": client, **(extra_env or {})},
             cwd=XHS_SKILL_DIR,
             text=True,
             capture_output=True,
@@ -1846,13 +2159,19 @@ def record_history(payload: dict[str, Any], status: str, warnings: list[str] | N
         return int(cur.lastrowid)
 
 
-def history_rows(limit: int = 50) -> list[dict[str, Any]]:
+def history_rows(limit: int = 50, profile_dir: str | None = None) -> list[dict[str, Any]]:
     with db_connection() as db:
         db.row_factory = sqlite3.Row
-        rows = db.execute(
-            "SELECT * FROM publish_history ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if profile_dir:
+            rows = db.execute(
+                "SELECT * FROM publish_history WHERE profile_dir = ? ORDER BY id DESC LIMIT ?",
+                (profile_dir, limit),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT * FROM publish_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
     result = []
     for row in rows:
         item = dict(row)
@@ -1878,16 +2197,25 @@ def _job_key(payload: dict[str, Any], schedule_time: str, profile_dir: str) -> s
     return hashlib.sha256(raw).hexdigest()
 
 
-def queue_rows(limit: int = 100) -> list[dict[str, Any]]:
+def queue_rows(limit: int = 100, profile_dir: str | None = None) -> list[dict[str, Any]]:
     with db_connection() as db:
         db.row_factory = sqlite3.Row
-        rows = db.execute(
-            """SELECT jobs.*, history.status AS history_status, history.archive_result
-               FROM (SELECT * FROM publish_jobs ORDER BY id DESC LIMIT ?) AS jobs
-               LEFT JOIN publish_history AS history ON history.id = jobs.history_id
-               ORDER BY jobs.id ASC""",
-            (limit,),
-        ).fetchall()
+        if profile_dir:
+            rows = db.execute(
+                """SELECT jobs.*, history.status AS history_status, history.archive_result
+                   FROM (SELECT * FROM publish_jobs WHERE profile_dir = ? ORDER BY id DESC LIMIT ?) AS jobs
+                   LEFT JOIN publish_history AS history ON history.id = jobs.history_id
+                   ORDER BY jobs.id ASC""",
+                (profile_dir, limit),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT jobs.*, history.status AS history_status, history.archive_result
+                   FROM (SELECT * FROM publish_jobs ORDER BY id DESC LIMIT ?) AS jobs
+                   LEFT JOIN publish_history AS history ON history.id = jobs.history_id
+                   ORDER BY jobs.id ASC""",
+                (limit,),
+            ).fetchall()
     result: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -1953,14 +2281,23 @@ def update_job(job_id: int, **fields: Any) -> None:
         db.commit()
 
 
-def claim_next_job() -> dict[str, Any] | None:
+def claim_next_job(respect_account_queue: bool = False) -> dict[str, Any] | None:
     with db_connection() as db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN IMMEDIATE")
-        row = db.execute(
-            "SELECT * FROM publish_jobs WHERE status='queued' AND COALESCE(json_extract(payload,'$.submit_after'),'')<=? ORDER BY id ASC LIMIT 1",
-            (now_iso(),),
-        ).fetchone()
+        sql = "SELECT * FROM publish_jobs WHERE status='queued' AND COALESCE(json_extract(payload,'$.submit_after'),'')<=?"
+        params: list[Any] = [now_iso()]
+        if respect_account_queue:
+            sql += """ AND (
+                COALESCE(json_extract(payload,'$.automation'),0)=1
+                OR EXISTS (
+                    SELECT 1 FROM settings AS enabled
+                    WHERE enabled.key = 'queue_enabled:' || publish_jobs.profile_dir
+                      AND COALESCE(json_extract(enabled.value,'$'),0)=1
+                )
+            )"""
+        sql += " ORDER BY id ASC LIMIT 1"
+        row = db.execute(sql, params).fetchone()
         if not row:
             db.commit()
             return None
@@ -2038,30 +2375,45 @@ def sync_publishing_resources(profile_dir: str) -> dict[str, Any]:
         return saved
 
 
-def select_profile_connection(profile_dir: str | None = None) -> str:
+def _select_profile_connection(profile_dir: str | None = None) -> tuple[str, bool]:
+    """Return ``(client_id, bound)`` for the target profile.
+
+    ``bound`` is False only when the profile has no stored extension binding
+    and the sole live connection was reused. Callers must not treat such a
+    connection as proof of that profile's browser or account.
+    """
     target_profile = str(profile_dir or active_profile_dir())
     client = bridge_client(target_profile)
     if client:
         try:
             browser_profiles.select(client)
-            return client
-        except Exception as exc:
-            selection_error = exc
-    else:
-        selection_error = RuntimeError("这个 Chrome 用户资料尚未绑定扩展，请先切换/连接账号")
+            return client, True
+        except Exception:
+            # Never borrow another Chrome profile's extension when this profile
+            # owns a binding: doing so silently read or wrote a different
+            # Xiaohongshu account under the selected profile.
+            raise PublishError(
+                f"Chrome「{target_profile}」的 XHS Bridge 没有连接。请打开这个 Chrome 用户资料窗口，"
+                "确认右上角是同一个账号后再试；不要同时打开多个用户资料的窗口。"
+            ) from None
 
     # A legacy bridge has exactly one extension but no client IDs. The newer
     # bridge is equally unambiguous when it reports exactly one live client.
     # This fallback is restricted to the already-active profile: applying it
     # to another profile would silently cross account boundaries.
+    selection_error: Exception = RuntimeError("这个 Chrome 用户资料尚未绑定扩展，请先切换/连接账号")
     if target_profile == active_profile_dir():
         try:
             current = browser_profiles.reuse_single_connection(XHS_SKILL_DIR)
             if current is not None:
-                return current
+                return current, False
         except Exception as exc:
             selection_error = exc
     raise PublishError(str(selection_error)) from None
+
+
+def select_profile_connection(profile_dir: str | None = None) -> str:
+    return _select_profile_connection(profile_dir)[0]
 
 
 def switch_chrome_profile(profile_dir: str) -> dict[str, Any]:
@@ -2073,14 +2425,18 @@ def switch_chrome_profile(profile_dir: str) -> dict[str, Any]:
         try:
             browser_profiles.ensure_server(XHS_SKILL_DIR)
             try:
-                client = select_profile_connection(profile_dir)
+                client, bound = _select_profile_connection(profile_dir)
             except Exception:
                 client = browser_profiles.pair(profile_dir, XHS_SKILL_DIR)
                 db_set_setting(f"profile_bridge_client:{profile_dir}", client)
+                bound = True
             # Verify through the target connection before changing the UI account.
             identity = read_connected_identity(XHS_SKILL_DIR)
             if not identity.get("logged_in"):
                 raise PublishError(f"Chrome「{profile_dir}」尚未登录小红书，请在该用户资料登录")
+            conflict = None if bound else identity_conflict(profile_dir, identity)
+            if conflict:
+                raise PublishError(identity_conflict_message(profile_dir, identity, conflict))
         except Exception as exc:
             old_client = bridge_client()
             if old_client:
@@ -2090,8 +2446,50 @@ def switch_chrome_profile(profile_dir: str) -> dict[str, Any]:
                     pass
             raise PublishError(str(exc)) from None
         db_set_setting("active_chrome_profile", profile_dir)
-        db_set_setting(f"account_identity:{profile_dir}", {**identity, "checked_at": now_iso()})
-    return {"ready": True, "profile": profile_dir, "login": {"ok": True}}
+        db_set_setting(f"account_identity:{profile_dir}", {**identity, "checked_at": now_iso(), "live": True})
+    return {"ready": True, "profile": profile_dir, "login": {"ok": True}, "client": client}
+
+
+WORKBENCH_URL = "http://127.0.0.1:5818/"
+
+
+def focus_account_workspace(profile_dir: str, client_id: str | None = None) -> dict[str, Any]:
+    """在刚切换到的 Chrome 用户资料里打开并聚焦工作台页面。"""
+    url = f"{WORKBENCH_URL}?profile={urllib.parse.quote(profile_dir)}"
+    try:
+        browser_profiles.open_app_tab(url, client_id)
+        return {"ok": True, "url": url}
+    except Exception as exc:
+        return {"ok": False, "url": url, "error": str(exc)[:200]}
+
+
+def minimize_previous_window(client_id: str) -> dict[str, Any]:
+    """最小化切换前那个 Chrome 用户资料的窗口，不影响其它窗口。"""
+    if not client_id:
+        return {"ok": False, "reason": "旧账号未绑定扩展，未自动最小化"}
+    try:
+        browser_profiles.minimize_window(client_id)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+def pace_environment() -> dict[str, str]:
+    """把发布节奏设置传给填页子进程。"""
+    try:
+        low = float(db_get_setting("pace_min", 40) or 40)
+        high = float(db_get_setting("pace_max", 90) or 90)
+        cap = float(db_get_setting("pace_cap", 0) or 0)
+    except (TypeError, ValueError):
+        low, high, cap = 40.0, 90.0, 0.0
+    low = max(15.0, min(low, 600.0))
+    high = max(low, min(high, 900.0))
+    return {
+        "XHS_PACE_MIN": str(low),
+        "XHS_PACE_MAX": str(high),
+        "XHS_PACE_CAP": str(max(0.0, cap)),
+        "XHS_PACE_TEST": "1" if db_get_setting("pace_test", False) else "0",
+    }
 
 
 def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = None) -> dict[str, Any]:
@@ -2108,6 +2506,8 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
     tags = [str(t).strip().lstrip("#") for t in payload.get("tags") or [] if str(t).strip()]
     if not title or not content or not images:
         raise PublishError("标题、正文和图片不能为空")
+    if len(title) > 20 or len(content) > 1000:
+        raise PublishError("标题最多 20 字、正文最多 1000 字，请修改后再发布")
     validate_note_image_count(images, require_one=True)
 
     # Load reservations once and exclude the queue row currently being
@@ -2169,6 +2569,8 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
         fx_params = get_fx_params(payload.get("fx_params"), profile_dir=profile_dir)
         fx_images, fx_notes = imagefx.apply_for_publish(images, fx_params, PREPARED_DIR)
         upload_images, image_notes = prepare_images_for_xhs(fx_images)
+    if not upload_images:
+        raise PublishError("发布图片缺失，请重新选择完整素材")
     warnings = content_warnings({**payload, "tags": tags[:10]}) + image_notes + fx_notes
     title_path = ""
     content_path = ""
@@ -2201,12 +2603,13 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
             args += ["--topic-template", str(payload.get("topic_template"))]
         if schedule_time:
             args += ["--schedule-at", schedule_time]
-        if payload.get("shooting_date"):
+        legacy_source = "declaration" not in payload
+        if legacy_source and payload.get("shooting_date"):
             args += ["--shooting-date", str(payload.get("shooting_date"))]
         shooting_location = payload.get("shooting_location") or payload.get("location")
-        if shooting_location:
+        if legacy_source and shooting_location:
             args += ["--shooting-location", str(shooting_location)]
-        result = run_xhs_cli(args, timeout=240)
+        result = run_xhs_cli(args, timeout=480, extra_env=pace_environment())
     finally:
         for path in (title_path, content_path):
             if path:
@@ -2215,10 +2618,16 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
                 except OSError:
                     pass
     if not result["ok"]:
-        raise PublishError((result.get("stderr") or result.get("stdout") or "填入发布页失败")[:500])
+        raw = (result.get("stderr") or result.get("stdout") or "").strip()
+        # 真正的异常在日志末尾（traceback / ERROR 行），前面都是 INFO 步骤。
+        # 只截取开头会把关键报错截掉，所以优先保留结尾。
+        detail = raw if len(raw) <= 900 else "…" + raw[-900:]
+        raise PublishError(detail or "填入发布页失败")
     for line in result.get("stderr", "").splitlines():
         if "WARNING" in line or "警告" in line:
             warnings.append(line[-300:])
+    from publish_checks import apply_extra_settings
+    apply_extra_settings(XHS_SKILL_DIR,payload)
     history_id = record_history({**payload, "tags": tags[:10], "profile_dir": profile_dir}, "prefilled", warnings)
     return {
         "ok": True,
@@ -2226,6 +2635,7 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
         "result": result,
         "warnings": warnings,
         "payload": payload,
+        "verification_payload": {**payload, "images": upload_images, "tags": tags[:10]},
         "manual_fields": {
             "album": payload.get("album") or "",
             "location": payload.get("location") or "",
@@ -2263,6 +2673,71 @@ def click_publish(history_id: int | None = None) -> dict[str, Any]:
     if history_id:
         update_history_status(history_id, "unknown")
     return {"ok": False, "result": result}
+
+
+def submit_publish(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fill the XHS publish page and submit it in one synchronous browser session."""
+    profile = str(payload.get("profile_dir") or active_profile_dir())
+    mode = str(payload.get("publish_mode") or "immediate")
+    if mode == "scheduled":
+        try:
+            schedule_time = normalize_schedule_time(str(payload.get("schedule_time") or ""))
+        except ValueError as exc:
+            raise PublishError(f"定时发布时间格式错误：{exc}") from exc
+        if datetime.fromisoformat(schedule_time) < datetime.now() + timedelta(minutes=60):
+            raise PublishError("小红书定时发布需要至少提前 1 小时，请选择更晚的时间")
+        payload = {**payload, "publish_mode": "scheduled", "schedule_time": schedule_time}
+    elif mode == "immediate":
+        payload = {**payload, "publish_mode": "immediate", "schedule_time": ""}
+    else:
+        raise PublishError("不支持的发布方式")
+
+    with BROWSER_LOCK:
+        if profile != active_profile_dir():
+            raise PublishError("账号已切换，请重新发布")
+        if manual_pending(profile):
+            raise PublishError("当前账号还有待人工确认的发布页面，请先确认已发布或放弃待确认记录，避免覆盖")
+        prepared = prepare_publish(payload)
+        history_id = int(prepared["history_id"])
+        # Keep a pending record from the moment the page is filled, so an
+        # interrupted process never leaves an unaccounted submitted page.
+        db_set_setting(f"manual_pending:{profile}", {
+            "history_id": history_id,
+            "title": payload.get("title"),
+            "created_at": now_iso(),
+        })
+        warnings = list(prepared.get("warnings") or [])
+        schedule_time = str(prepared.get("payload", {}).get("schedule_time") or "")
+        try:
+            verify_prepared_publish(prepared, payload)
+            clicked = click_publish(history_id)
+        except (PublishError, ValueError) as exc:
+            clicked = {"ok": False, "message": str(exc), "result": {}}
+        if clicked.get("ok"):
+            clear_manual_pending(history_id, profile)
+            return {
+                "ok": True,
+                "submitted": True,
+                "history_id": history_id,
+                "schedule_time": schedule_time,
+                "confirmation": clicked.get("confirmation") or {},
+                "warnings": warnings,
+            }
+        message = str(
+            clicked.get("message")
+            or (clicked.get("result") or {}).get("stderr")
+            or (clicked.get("result") or {}).get("stdout")
+            or "点击发布失败"
+        )[:500]
+        return {
+            "ok": True,
+            "submitted": False,
+            "uncertain": bool(clicked.get("uncertain")),
+            "history_id": history_id,
+            "schedule_time": schedule_time,
+            "message": message,
+            "warnings": warnings,
+        }
 
 
 def verify_history_published(history_id: int, reference_time: str | None = None) -> dict[str, Any]:
@@ -2321,12 +2796,27 @@ def update_history_status(history_id: int, status: str) -> None:
             print(f"记录 #{history_id} 归档失败：{exc}", file=sys.stderr, flush=True)
 
 
+def verify_prepared_publish(prepared: dict[str, Any], payload: dict[str, Any]) -> None:
+    from publish_checks import verify
+    effective = prepared.get("verification_payload") or prepared.get("payload") or payload
+    verify(XHS_SKILL_DIR, effective, apply_mentions=True)
+    # Uploading may take minutes; check the deadline again immediately before clicking.
+    require_schedule_lead(effective)
+
+
 def check_task_identity(payload: dict[str, Any]) -> None:
     expected = payload.get("expected_user_id")
     if not expected:
         raise PublishError("任务未绑定小红书用户 ID，请先识别账号并重新确认任务")
     identity = read_connected_identity(XHS_SKILL_DIR)
-    if identity.get("status") != "verified" or identity.get("user_id") != expected:
+    if identity.get("status") != "verified":
+        raise PublishError("当前小红书账号登录失效，请在此 Chrome 用户资料中打开已登录的小红书页面后刷新")
+    observed_user_id = str(identity.get("user_id") or "").strip()
+    if not observed_user_id:
+        # 读不到真实 user_id 时不能拿"计划里绑定的值"来比对——那样永远相等，
+        # 等于跳过了账号校验，可能把内容发到错误的账号上。
+        raise PublishError("无法确认当前 Chrome 登录的小红书账号 ID，请在小红书页面确认已登录后重试")
+    if observed_user_id != expected:
         raise PublishError("当前小红书账号与任务绑定账号不一致或登录失效，已阻止提交")
 
 
@@ -2365,9 +2855,10 @@ def _process_queue_job(job: dict[str, Any]) -> bool:
     job_id = int(job["id"])
     submitted = False
     try:
+        require_schedule_lead(payload)
         if payload.get("strict_fields"):
-            if payload.get("schedule_epoch") and float(payload["schedule_epoch"]) <= time.time() + 300:
-                raise PublishError("任务发布时间已过或不足 5 分钟，已停止补发，请取消后重新排期")
+            if payload.get("schedule_epoch") and float(payload["schedule_epoch"]) <= time.time() + 3600:
+                raise PublishError("任务发布时间已过或不足 1 小时，已停止补发，请重新排期")
             if defer_for_rate_limit(job):
                 return True
         switch_chrome_profile(str(job.get("profile_dir") or active_profile_dir()))
@@ -2382,9 +2873,9 @@ def _process_queue_job(job: dict[str, Any]) -> bool:
                     raise
                 time.sleep(2)  # safe only before the final submit operation
         history_id = int(prepared["history_id"])
+        update_job(job_id, history_id=history_id)
+        verify_prepared_publish(prepared, payload)
         if payload.get("strict_fields"):
-            from publish_checks import verify
-            verify(XHS_SKILL_DIR, payload, apply_mentions=True)
             check_task_identity(payload)
         update_job(job_id, history_id=history_id, status="reviewed_page")
         submitted = True
@@ -2400,7 +2891,7 @@ def _process_queue_job(job: dict[str, Any]) -> bool:
             if AUTOMATION and payload.get("automation"):
                 AUTOMATION.incident(job["profile_dir"], f"任务 #{job_id} 提交结果不明：{message}。请先到平台核对，禁止直接重试。")
             else:
-                db_set_setting("queue_enabled", False)
+                pause_manual_queue(job["profile_dir"])
                 mac_notifications.add_alert(sys.modules[__name__], job["profile_dir"], "", "publish_error", f"任务 #{job_id} 提交结果不明，请到平台核对。")
             return False
         update_job(job_id, status="submitted", completed_at=now_iso(), last_error="")
@@ -2411,27 +2902,33 @@ def _process_queue_job(job: dict[str, Any]) -> bool:
         if AUTOMATION and payload.get("automation"):
             AUTOMATION.incident(job["profile_dir"], message)
         else:
-            db_set_setting("queue_enabled", False)
+            pause_manual_queue(job["profile_dir"])
             mac_notifications.add_alert(sys.modules[__name__], job["profile_dir"], "", "publish_error", message)
         return False
 
 
 def queue_worker_loop() -> None:
     while not QUEUE_STOP.is_set():
-        if not bool(db_get_setting("queue_enabled", False)):
+        if not queue_master_enabled():
             QUEUE_WAKE.wait(2)
             QUEUE_WAKE.clear()
             continue
-        job = claim_next_job()
+        try:
+            job = claim_next_job(respect_account_queue=True)
+        except (sqlite3.Error, OSError) as exc:
+            if AUTOMATION:
+                AUTOMATION.storage_failure(exc)
+            QUEUE_STOP.wait(30)
+            continue
         if not job:
             QUEUE_WAKE.wait(2)
             QUEUE_WAKE.clear()
             continue
         if not process_queue_job(job):
             continue
-        if bool(db_get_setting("queue_enabled", False)):
-            QUEUE_WAKE.wait(random.uniform(QUEUE_GAP_MIN_SECONDS, QUEUE_GAP_MAX_SECONDS))
-            QUEUE_WAKE.clear()
+        if queue_master_enabled():
+            # Producer wakeups must not shorten the mandatory gap between submissions.
+            QUEUE_STOP.wait(random.uniform(QUEUE_GAP_MIN_SECONDS, QUEUE_GAP_MAX_SECONDS))
 
 
 def start_queue_worker() -> None:
@@ -2449,9 +2946,23 @@ def has_active_plans() -> bool:
 
 
 def update_install_block_reason() -> str:
+    if DISTRIBUTION is not None:
+        with db_connection() as db:
+            busy=db.execute("SELECT COUNT(*) FROM distribution_batches WHERE state IN ('queued','running')").fetchone()[0]
+            plans=db.execute('SELECT config FROM distribution_plans').fetchall() if DAILY_PLANS is not None else []
+        if DISTRIBUTION.active or busy or any(json.loads(r[0]).get('enabled') for r in plans):
+            return '多平台分发正在运行，请先暂停每日计划并等待当前任务结束'
+    if not BROWSER_LOCK.acquire(blocking=False):
+        return '浏览器正在上传、填写或提交，请等待操作结束后更新'
+    BROWSER_LOCK.release()
+    if PLATFORM_PUBLISHER is not None:
+        with db_connection() as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='platform_receipts'").fetchone():
+                if db.execute("SELECT 1 FROM platform_receipts WHERE status='submitting' LIMIT 1").fetchone():
+                    return '平台存在待核对的提交，请先确认结果后更新'
     if has_active_plans():
         return "请先暂停自动发布计划，再安装更新"
-    if bool(db_get_setting("queue_enabled", False)) or any(
+    if queue_master_enabled() or any(
         row["status"] in {"submitting", "reviewed_page"} for row in queue_rows()
     ):
         return "发布队列正在运行，请先暂停并等待当前任务结束后再更新"
@@ -2459,12 +2970,33 @@ def update_install_block_reason() -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def trusted_request(self) -> bool:
+        """Reject cross-site browser requests and DNS rebinding to the local service."""
+        host = self.headers.get("Host", "")
+        port = self.server.server_port
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+        origin = self.headers.get("Origin")
+        if host not in allowed or (origin and origin not in {"http://" + h for h in allowed}):
+            self.send_error(403, "Local same-origin requests only")
+            return False
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            self.send_error(403, "Cross-site requests are not allowed")
+            return False
+        return True
+
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[{now_iso()}] {self.address_string()} {fmt % args}")
 
     def do_GET(self) -> None:
+        if not self.trusted_request():
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == '/api/distribution':
+            profile=urllib.parse.parse_qs(parsed.query).get('profile_dir',[active_profile_dir()])[0]
+            service,plans=distribution_services()
+            json_response(self,{'ok':True,**service.snapshot(profile), 'plan':plans.get(profile), 'vision':vision_service.public_config(sys.modules[__name__]),'personas':{p:db_get_setting(f'distribution_persona:{profile}:{p}',{}) for p in ('xhs','douyin','channels')},'profile_dir':profile})
+            return
         if path == "/api/automation":
             profile = urllib.parse.parse_qs(parsed.query).get("profile_dir", [active_profile_dir()])[0]
             json_response(self, automation_engine().snapshot(profile))
@@ -2478,8 +3010,9 @@ class Handler(BaseHTTPRequestHandler):
             text_response(self, html, "text/html; charset=utf-8")
             return
         if path.startswith("/static/"):
-            file_path = APP_ROOT / "app" / path.lstrip("/")
-            if not file_path.exists():
+            static_root = (APP_ROOT / "app" / "static").resolve()
+            file_path = (APP_ROOT / "app" / urllib.parse.unquote(path).lstrip("/")).resolve()
+            if not file_path.is_relative_to(static_root) or not file_path.is_file():
                 self.send_error(404)
                 return
             content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
@@ -2509,12 +3042,15 @@ class Handler(BaseHTTPRequestHandler):
                     "config": {
                         "root_path": root_path,
                         "default_album": db_get_setting("default_album", ""),
+                        "manual_albums": db_get_setting("manual_albums", []),
                         "default_location": db_get_setting("default_location", ""),
                         "default_schedule_time": db_get_setting("default_schedule_time", ""),
                         "default_schedule_window": db_get_setting("default_schedule_window", ""),
                         "schedule_windows": db_get_setting("schedule_windows", ["早上 10:00", "晚上 22:00-24:00"]),
                         "topic_templates": db_get_setting("topic_templates", ["演员资料", "艺考录制"]),
                         "local_topic_templates": db_get_setting("local_topic_templates", []),
+                        "last_tags": db_get_setting("last_tags", []),
+                        "last_local_topic_template": db_get_setting("last_local_topic_template", ""),
                         "publishing_resources": db_get_setting(f"publishing_resources:{active_profile_dir()}", {}),
                         "manual_pending": manual_pending(),
                         "text_provider": db_get_setting("text_provider", "deepseek"),
@@ -2525,6 +3061,10 @@ class Handler(BaseHTTPRequestHandler):
                         "text_provider_label": model_config["provider_label"],
                         "text_model_label": model_config["model_label"],
                         "daily_limit": db_get_setting("daily_limit", 3),
+                        "pace_min": db_get_setting("pace_min", 40),
+                        "pace_max": db_get_setting("pace_max", 90),
+                        "pace_cap": db_get_setting("pace_cap", 0),
+                        "pace_test": db_get_setting("pace_test", False),
                         "visibility": db_get_setting("visibility", "公开可见"),
                         "publish_mode": db_get_setting("publish_mode", "scheduled"),
                         "original_enabled": db_get_setting("original_enabled", True),
@@ -2536,14 +3076,14 @@ class Handler(BaseHTTPRequestHandler):
                         "today_usage_count": today_usage_count(),
                         "xhs_skill_dir": str(XHS_SKILL_DIR),
                         "active_profile": active_profile_dir(),
-                        "queue_enabled": bool(db_get_setting("queue_enabled", False)),
+                        "queue_enabled": manual_queue_enabled(active_profile_dir()),
                         "app_version": APP_VERSION,
                     },
                 },
             )
             return
         if path == "/api/version":
-            json_response(self, {"ok": True, "version": APP_VERSION})
+            json_response(self, {"ok": True, "version": APP_VERSION, "xhs_sync_review": True})
             return
         if path == "/api/update/check":
             try:
@@ -2567,16 +3107,30 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if path == "/api/history":
-            json_response(self, {"ok": True, "items": history_rows()})
-            return
-        if path == "/api/queue":
+        if path == "/api/draft":
+            profile = urllib.parse.parse_qs(parsed.query).get("profile_dir", [active_profile_dir()])[0]
             json_response(
                 self,
                 {
                     "ok": True,
-                    "items": queue_rows(),
-                    "enabled": bool(db_get_setting("queue_enabled", False)),
+                    "profile_dir": profile,
+                    "draft": get_publish_draft(profile),
+                },
+            )
+            return
+        if path == "/api/history":
+            profile = urllib.parse.parse_qs(parsed.query).get("profile_dir", [active_profile_dir()])[0]
+            json_response(self, {"ok": True, "profile_dir": profile, "items": history_rows(profile_dir=profile)})
+            return
+        if path == "/api/queue":
+            profile = urllib.parse.parse_qs(parsed.query).get("profile_dir", [active_profile_dir()])[0]
+            json_response(
+                self,
+                {
+                    "ok": True,
+                    "profile_dir": profile,
+                    "items": queue_rows(profile_dir=profile),
+                    "enabled": manual_queue_enabled(profile),
                 },
             )
             return
@@ -2594,7 +3148,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/image/preview":
             query = urllib.parse.parse_qs(parsed.query)
             p = Path(query.get("path", [""])[0])
-            if not p.exists() or not p.is_file():
+            if not p.is_file() or p.suffix.lower() not in IMAGE_EXTENSIONS:
                 self.send_error(404)
                 return
             raw_overrides = {
@@ -2639,8 +3193,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/image":
             query = urllib.parse.parse_qs(parsed.query)
             p = Path(query.get("path", [""])[0])
-            if not p.exists() or not p.is_file():
+            if not p.is_file() or p.suffix.lower() not in IMAGE_EXTENSIONS:
                 self.send_error(404)
+                return
+            try:
+                from PIL import Image
+                with Image.open(p) as img:
+                    img.verify()
+            except Exception:
+                self.send_error(415, "Not a supported image")
                 return
             content_type = mimetypes.guess_type(str(p))[0] or "image/jpeg"
             data = p.read_bytes()
@@ -2654,6 +3215,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:
+        if not self.trusted_request():
+            return
         try:
             self._post()
         except PublishError as exc:
@@ -2689,6 +3252,43 @@ class Handler(BaseHTTPRequestHandler):
 
     def _post(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if path.startswith('/api/distribution/') or path.startswith('/api/vision/'):
+            payload=read_json(self);app=sys.modules[__name__]
+            profile=str(payload.get('profile_dir') or active_profile_dir())
+            service,plans=distribution_services()
+            action=path.rsplit('/',1)[-1]
+            if path.startswith('/api/vision/'):
+                if action=='save':result={'vision':vision_service.save(app,payload)}
+                elif action=='test':result=vision_service.test(app,payload)
+                elif action=='generate':result={'copy':vision_service.generate(app,payload)}
+                else:raise ValueError('未知识图操作')
+            elif action=='create':result=service.create(payload)
+            elif action=='resume':result=service.resume(payload['id'],payload.get('remaining_only') is True)
+            elif action=='cancel':result=service.cancel(payload['id'])
+            elif action=='resolve':result=service.resolve(payload)
+            elif action=='reconcile':result=service.reconcile(payload['id'],payload['platform'])
+            elif action=='plan-save':result={'plan':plans.save(profile,payload.get('config') or {})}
+            elif action=='plan-enable':result={'plan':plans.enabled(profile,payload.get('enabled') is True)}
+            elif action=='plan-build':result=plans.build(profile)
+            elif action=='persona-research':result=vision_service.research_persona(app,payload)
+            elif action=='persona-save':
+                platform=payload.get('platform')
+                if platform not in ('xhs','douyin','channels'):raise ValueError('平台无效')
+                if payload.get('confirmed') is not True:raise ValueError('请先确认账号定位内容')
+                brief=str(payload.get('brief') or '').strip()
+                if len(brief)>40000:raise ValueError('账号补充信息最多 40000 字')
+                db_set_setting(f'distribution_persona:{profile}:{platform}',{'brief':brief,'confirmed_at':now_iso()})
+                result={'message':'已确认并保存，后续生成文案会重新读取'}
+            else:raise ValueError('未知分发操作')
+            json_response(self,{'ok':True,**result});return
+        if path.startswith("/api/platforms/"):
+            global PLATFORM_PUBLISHER
+            if PLATFORM_PUBLISHER is None:
+                PLATFORM_PUBLISHER = Publisher(sys.modules[__name__])
+            payload = read_json(self)
+            result = PLATFORM_PUBLISHER.handle(path.rsplit("/", 1)[-1], payload)
+            json_response(self, {"ok": True, **result})
+            return
         if path == "/api/material/import":
             self.import_material_image()
             return
@@ -2701,9 +3301,23 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(prompts, dict):
                 raise ValueError("提示词格式无效")
             saved = {key: str(prompts.get(key) or default).strip()[:10000] for key, default in DEFAULT_COPY_PROMPTS.items()}
+            windows = normalize_schedule_windows(payload["schedule_windows"]) if "schedule_windows" in payload else None
             result = save_manual_profile(profile, payload)
+            if windows is not None:
+                db_set_setting("schedule_windows", windows)
+                preferred = str(db_get_setting("default_schedule_window", "") or "").strip()
+                if preferred not in windows:
+                    preferred = windows[0]
+                    db_set_setting("default_schedule_window", preferred)
             db_set_setting(f"copy_prompts:{profile}", saved)
-            json_response(self, {"ok": True, "profile_dir": profile, "profile": result, "prompts": saved})
+            json_response(self, {
+                "ok": True,
+                "profile_dir": profile,
+                "profile": result,
+                "prompts": saved,
+                "schedule_windows": db_get_setting("schedule_windows", []),
+                "default_schedule_window": db_get_setting("default_schedule_window", ""),
+            })
             return
         if path == "/api/publish/preferences":
             profile = str(payload.get("profile_dir") or active_profile_dir())
@@ -2711,6 +3325,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise PublishError("账号已切换，请刷新后重新设置发布方式")
             save_publish_preferences(profile, payload)
             json_response(self, {"ok": True})
+            return
+        if path == "/api/draft":
+            profile = require_active_profile(payload)
+            draft = save_publish_draft(profile, payload.get("draft"))
+            json_response(self, {"ok": True, "profile_dir": profile, "draft": draft})
             return
         if path.startswith("/api/automation/") or path.startswith("/api/notifications/"):
             self.automation_post(path, payload)
@@ -2738,18 +3357,42 @@ class Handler(BaseHTTPRequestHandler):
                 raise PublishError("后台任务已切换账号，请刷新后再保存当前账号设置")
             if "original_enabled" in payload and type(payload["original_enabled"]) is not bool:
                 raise ValueError("原创声明设置必须为布尔值")
-            if "default_schedule_window" in payload:
-                preferred_window = str(payload.get("default_schedule_window") or "").strip()
-                schedule_windows = payload.get("schedule_windows")
-                if schedule_windows is None:
-                    schedule_windows = db_get_setting("schedule_windows", ["早上 10:00", "晚上 22:00-24:00"])
-                if not isinstance(schedule_windows, list):
+            schedule_windows = None
+            if "schedule_windows" in payload:
+                schedule_windows = normalize_schedule_windows(payload.get("schedule_windows"))
+                payload["schedule_windows"] = schedule_windows
+            if "default_schedule_window" in payload or schedule_windows is not None:
+                windows = schedule_windows if schedule_windows is not None else db_get_setting(
+                    "schedule_windows", ["早上 10:00", "晚上 22:00-24:00"]
+                )
+                if not isinstance(windows, list):
                     raise ValueError("发布时间段列表格式无效")
-                if preferred_window and preferred_window not in {str(item) for item in schedule_windows if item}:
+                preferred_window = str(
+                    payload.get("default_schedule_window", db_get_setting("default_schedule_window", "")) or ""
+                ).strip()
+                if schedule_windows is not None:
+                    if preferred_window not in windows:
+                        preferred_window = windows[0]
+                    payload["default_schedule_window"] = preferred_window
+                elif preferred_window and preferred_window not in {str(item) for item in windows if item}:
                     raise ValueError("默认时间段必须来自当前账号已保存的时间段列表")
             local_templates = None
             if "local_topic_templates" in payload:
                 local_templates = publishing_resources.normalize_templates(payload["local_topic_templates"])
+            manual_albums = None
+            if "manual_albums" in payload:
+                items = payload["manual_albums"]
+                if not isinstance(items, list) or len(items) > 50:
+                    raise ValueError("最多保存 50 个常用合集")
+                manual_albums = []
+                for item in items:
+                    name = str(item or "").strip()
+                    if not name:
+                        continue
+                    if len(name) > 100:
+                        raise ValueError("合集名称不能超过 100 字")
+                    if name not in manual_albums:
+                        manual_albums.append(name)
             if payload.get("text_provider", "deepseek") not in {"deepseek", "pptoken"}:
                 raise ValueError("模型平台无效")
             try:
@@ -2757,6 +3400,25 @@ class Handler(BaseHTTPRequestHandler):
             except cover_service.CoverError as exc:
                 error_response(self, str(exc), exc.status)
                 return
+            if "pace_min" in payload or "pace_max" in payload:
+                try:
+                    low = float(payload.get("pace_min", db_get_setting("pace_min", 40)))
+                    high = float(payload.get("pace_max", db_get_setting("pace_max", 90)))
+                except (TypeError, ValueError):
+                    raise ValueError("发布节奏时长必须是数字")
+                if not 15 <= low <= 600 or not 15 <= high <= 900 or low > high:
+                    raise ValueError("发布节奏需满足 15 秒 ≤ 下限 ≤ 上限 ≤ 900 秒")
+                payload["pace_min"], payload["pace_max"] = low, high
+            if "pace_cap" in payload:
+                try:
+                    cap = float(payload["pace_cap"] or 0)
+                except (TypeError, ValueError):
+                    raise ValueError("发布节奏上限必须是数字")
+                if cap and not 15 <= cap <= 900:
+                    raise ValueError("单条最长耗时需在 15–900 秒之间，或填 0 表示不限制")
+                payload["pace_cap"] = cap
+            if "pace_test" in payload and type(payload["pace_test"]) is not bool:
+                raise ValueError("测试模式设置必须为布尔值")
             for key in (
                 "root_path",
                 "default_album",
@@ -2766,6 +3428,10 @@ class Handler(BaseHTTPRequestHandler):
                 "schedule_windows",
                 "topic_templates",
                 "daily_limit",
+                "pace_min",
+                "pace_max",
+                "pace_cap",
+                "pace_test",
                 "visibility",
                 "copy_engine",
                 "original_enabled",
@@ -2783,7 +3449,24 @@ class Handler(BaseHTTPRequestHandler):
                 db_set_setting("pptoken_api_key", payload["pptoken_api_key"])
             if local_templates is not None:
                 db_set_setting("local_topic_templates", local_templates)
+            if manual_albums is not None:
+                db_set_setting("manual_albums", manual_albums)
             json_response(self, {"ok": True})
+            return
+        if path == "/api/publishing/activities":
+            from publish_checks import page_for
+            with BROWSER_LOCK:
+                profile = require_active_profile(payload)
+                select_profile_connection(profile)
+                check_task_identity({"expected_user_id": account_identity(profile).get("user_id")})
+                page = page_for(XHS_SKILL_DIR)
+                activities = page.evaluate("""(() => {
+                    if (location.hostname !== 'creator.xiaohongshu.com' || !document.querySelector('.publish-page-content-setting-content'))
+                        throw Error('请先在当前账号的官方小红书发布页添加素材，再读取活动');
+                    return [...new Set([...document.querySelectorAll('.activity-card .activity-name')]
+                        .filter(e => e.getClientRects().length).map(e => e.innerText.trim()).filter(Boolean))];
+                })()""")
+            json_response(self, {"ok": True, "activities": activities})
             return
         if path == "/api/publishing/resources/sync":
             profile = str(payload.get("profile_dir") or active_profile_dir())
@@ -2805,9 +3488,12 @@ class Handler(BaseHTTPRequestHandler):
             if not window:
                 error_response(self, "请选择发布时间段", 400)
                 return
+            # The preview is submitted to XHS as native scheduled publishing,
+            # which requires at least one hour of lead time.
             schedule_time = resolve_planned_schedule_time(
                 str(window),
                 profile_dir=str(payload.get("profile_dir") or active_profile_dir()),
+                min_lead_minutes=65,
             )
             json_response(self, {"ok": True, "schedule_time": schedule_time})
             return
@@ -2839,25 +3525,124 @@ class Handler(BaseHTTPRequestHandler):
                 raise PublishError("请先检测登录并识别当前小红书用户 ID")
             queued_payload = freeze_payload({**queued_payload, "schedule_time": schedule_time, "schedule_epoch": datetime.fromisoformat(schedule_time).timestamp(), "expected_user_id": identity["user_id"], "strict_fields": True})
             job = enqueue_job(queued_payload, schedule_time)
+            set_manual_queue_enabled(profile, True)
             db_set_setting("queue_enabled", True)
             start_queue_worker()
             QUEUE_WAKE.set()
             json_response(self, {"ok": True, "job": job})
             return
+        if path == "/api/plan/generate":
+            profile = require_active_profile(payload)
+            created = automation_engine().build_review_batch(
+                profile,
+                payload.get("total", 1),
+                payload.get("daily", 1),
+                str(payload.get("root_path") or ""),
+            )
+            json_response(self, {"ok": True, "created": created, "profile_dir": profile, "items": queue_rows(profile_dir=profile)})
+            return
+        if path == "/api/plan/confirm":
+            profile = require_active_profile(payload)
+            ids = payload.get("ids") or ([payload["id"]] if payload.get("id") else [])
+            changed = automation_engine().confirm_drafts(profile, ids)
+            json_response(self, {"ok": True, "confirmed": changed, "items": queue_rows(profile_dir=profile)})
+            return
+        if path == "/api/plan/update":
+            profile = require_active_profile(payload)
+            automation_engine().update_draft(profile, payload["id"], payload.get("fields") or {})
+            json_response(self, {"ok": True, "items": queue_rows(profile_dir=profile)})
+            return
+        if path == "/api/plan/run":
+            profile = require_active_profile(payload)
+            ids = automation_engine().reviewed_draft_ids(profile)
+            if not ids:
+                error_response(self, "还没有已确认的队列，请先逐条确认或批量确认", 400)
+                return
+            automation_engine().approve(profile, ids)
+            json_response(self, {"ok": True, "started": len(ids), "profile_dir": profile, "items": queue_rows(profile_dir=profile)})
+            return
         if path == "/api/queue/start":
-            pending = [row for row in queue_rows() if row["status"] == "queued"]
+            profile = require_active_profile(payload)
+            pending = [row for row in queue_rows(profile_dir=profile) if row["status"] == "queued"]
             if not pending:
                 error_response(self, "没有待提交的已确认任务", 400)
                 return
+            set_manual_queue_enabled(profile, True)
             db_set_setting("queue_enabled", True)
             start_queue_worker()
             QUEUE_WAKE.set()
-            json_response(self, {"ok": True, "items": queue_rows(), "enabled": True})
+            json_response(self, {"ok": True, "profile_dir": profile, "items": queue_rows(profile_dir=profile), "enabled": True})
             return
         if path == "/api/queue/pause":
-            db_set_setting("queue_enabled", False)
+            profile = require_active_profile(payload)
+            pause_manual_queue(profile)
             QUEUE_WAKE.set()
-            json_response(self, {"ok": True, "items": queue_rows(), "enabled": False})
+            json_response(self, {"ok": True, "profile_dir": profile, "items": queue_rows(profile_dir=profile), "enabled": False})
+            return
+        if path == "/api/queue/clear":
+            profile = require_active_profile(payload)
+            scope = str(payload.get("scope") or "").strip()
+            if scope not in {"current", "all"}:
+                raise ValueError("清除范围无效")
+            job_id = None
+            if scope == "current":
+                try:
+                    job_id = int(payload.get("job_id"))
+                except (TypeError, ValueError):
+                    raise ValueError("请指定要清除的队列任务") from None
+            active_statuses = ("submitting", "reviewed_page")
+            active_marks = ",".join("?" for _ in active_statuses)
+
+            def active_count(db) -> int:
+                return db.execute(
+                    f"SELECT COUNT(*) FROM publish_jobs WHERE profile_dir=? AND status IN ({active_marks})",
+                    (profile, *active_statuses),
+                ).fetchone()[0]
+
+            with db_connection() as db:
+                active = active_count(db)
+            if active:
+                error_response(self, f"当前账号有 {active} 条任务正在填入或提交中，暂时不能清除。请等待完成后再试。", 409)
+                return
+            with BROWSER_LOCK:
+                with db_connection() as db:
+                    db.row_factory = sqlite3.Row
+                    active = active_count(db)
+                    if active:
+                        error_response(self, f"当前账号有 {active} 条任务正在填入或提交中，暂时不能清除。请等待完成后再试。", 409)
+                        return
+                    if scope == "current":
+                        row = db.execute(
+                            "SELECT id FROM publish_jobs WHERE id=? AND profile_dir=?", (job_id, profile)
+                        ).fetchone()
+                        if not row:
+                            error_response(self, "队列里找不到这条任务，可能已被清除。", 404)
+                            return
+                        ids = [int(row["id"])]
+                    else:
+                        ids = [
+                            int(row["id"])
+                            for row in db.execute(
+                                "SELECT id FROM publish_jobs WHERE profile_dir=? ORDER BY id", (profile,)
+                            ).fetchall()
+                        ]
+                    unknown_cleared = 0
+                    if ids:
+                        marks = ",".join("?" for _ in ids)
+                        unknown_cleared = db.execute(
+                            f"SELECT COUNT(*) FROM publish_jobs WHERE id IN ({marks}) AND status='unknown'", ids
+                        ).fetchone()[0]
+                        db.execute(f"DELETE FROM publish_jobs WHERE id IN ({marks})", ids)
+                        db.execute(f"DELETE FROM automation_materials WHERE job_id IN ({marks})", ids)
+            QUEUE_WAKE.set()
+            json_response(self, {
+                "ok": True,
+                "profile_dir": profile,
+                "cleared": len(ids),
+                "unknown_cleared": unknown_cleared,
+                "items": queue_rows(profile_dir=profile),
+                "enabled": manual_queue_enabled(profile),
+            })
             return
         if path == "/api/scan":
             root = payload.get("root_path") or db_get_setting("root_path", "")
@@ -3102,11 +3887,18 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, account_list())
             return
         if path == "/api/accounts/refresh":
+            profile = str(payload.get("profile") or active_profile_dir())
+            adopt = bool(payload.get("adopt"))
             if not BROWSER_LOCK.acquire(blocking=False):
                 error_response(self, "浏览器正在处理任务，请稍后刷新账号资料", 409)
                 return
             try:
-                result = refresh_account_identity(str(payload.get("profile") or active_profile_dir()))
+                result = refresh_account_identity(profile, adopt=adopt)
+                if adopt and payload.get("snooze"):
+                    result["snooze_until"] = snooze_account_mismatch(profile)
+            except AccountMismatch as exc:
+                json_response(self, exc.payload(), 409)
+                return
             except PublishError as exc:
                 error_response(self, str(exc), 409)
                 return
@@ -3116,15 +3908,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/accounts/switch":
             profile_dir = str(payload.get("profile") or "").strip()
-            if bool(db_get_setting("queue_enabled", False)) and any(
+            previous_profile = active_profile_dir()
+            previous_client = bridge_client(previous_profile) if profile_dir != previous_profile else ""
+            if queue_master_enabled() and any(
                 row["status"] in {"queued", "submitting", "reviewed_page"} for row in queue_rows()
             ):
                 error_response(self, "队列正在提交，请先暂停队列再切换账号", 409)
                 return
+            workspace: dict[str, Any] = {"ok": False, "reason": "账号未变化"}
+            minimized: dict[str, Any] = {"ok": False, "reason": "账号未变化"}
             try:
                 with BROWSER_LOCK:
                     switched = switch_chrome_profile(profile_dir)
                     identity = refresh_account_identity(profile_dir)
+                    if profile_dir != previous_profile:
+                        workspace = focus_account_workspace(profile_dir, switched.get("client"))
+                        minimized = minimize_previous_window(previous_client)
             except PublishError as exc:
                 error_response(self, str(exc), 502)
                 return
@@ -3134,7 +3933,10 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "ready": switched["ready"],
                     "profile": profile_dir,
+                    "previous_profile": previous_profile,
                     "identity": identity["identity"],
+                    "workspace": workspace,
+                    "previous_window": minimized,
                     "login_stdout": switched["login"].get("stdout", "")[-200:],
                 },
             )
@@ -3201,10 +4003,14 @@ class Handler(BaseHTTPRequestHandler):
                 raise PublishError("请先识别当前小红书账号")
             frozen = freeze_payload({**payload, "profile_dir": profile, "publish_mode": "immediate", "schedule_time": "", "strict_fields": True, "expected_user_id": identity["user_id"]})
             job = enqueue_job(frozen, "")
+            set_manual_queue_enabled(profile, True)
             db_set_setting("queue_enabled", True)
             start_queue_worker()
             QUEUE_WAKE.set()
             json_response(self, {"ok": True, "job": job})
+            return
+        if path == "/api/xhs/submit-publish":
+            self.submit_publish(payload)
             return
         if path == "/api/xhs/click-publish":
             history_id = int(payload.get("history_id") or 0)
@@ -3227,11 +4033,14 @@ class Handler(BaseHTTPRequestHandler):
                 )
             return
         if path == "/api/history/confirm":
+            profile = require_active_profile(payload)
             item_id = int(payload.get("id"))
             with db_connection() as db:
                 row = db.execute("SELECT status,profile_dir FROM publish_history WHERE id=?", (item_id,)).fetchone()
             if not row or row[0] not in ("prefilled", "unknown", "scheduled", "accepted", "reviewing", "published"):
                 raise ValueError("记录不存在或当前状态不能确认发布")
+            if row[1] != profile:
+                raise PublishError("这条记录属于另一个账号，请切换回对应账号再操作")
             receipt = verify_history_published(item_id)
             if receipt["status"] not in {"published", "reviewing", "scheduled"}:
                 raise PublishError(f"笔记管理尚未确认发布：{receipt.get('reason') or receipt['status']}")
@@ -3263,6 +4072,19 @@ class Handler(BaseHTTPRequestHandler):
             error_response(self, str(exc), 400)
         return
 
+    def submit_publish(self, payload: dict[str, Any]) -> None:
+        try:
+            profile = require_active_profile(payload)
+            if manual_pending(profile):
+                raise PublishError("当前账号还有待人工确认的发布页面，请先确认已发布或放弃待确认记录，避免覆盖")
+            if not payload.get("images") or not str(payload.get("title") or "").strip() or not str(payload.get("content") or "").strip():
+                raise PublishError("请先确认图片、标题和正文")
+            result = submit_publish({**payload, "profile_dir": profile})
+            json_response(self, result)
+        except PublishError as exc:
+            error_response(self, str(exc), 400)
+        return
+
     def automation_post(self, path, payload):
         engine = automation_engine()
         profile = str(payload.get("profile_dir") or active_profile_dir())
@@ -3274,6 +4096,8 @@ class Handler(BaseHTTPRequestHandler):
             engine.set_enabled(profile, bool(payload.get("enabled")))
         elif path == "/api/automation/build":
             engine.build_batch(profile, payload.get("limit", 10))
+        elif path == "/api/automation/apply":
+            engine.apply_settings(profile)
         elif path == "/api/automation/approve":
             engine.approve(profile, payload.get("ids") or [])
         elif path == "/api/automation/cancel":
@@ -3312,6 +4136,22 @@ def automation_engine() -> AutomationEngine:
     return AUTOMATION
 
 
+DISTRIBUTION=None
+DAILY_PLANS=None
+DISTRIBUTION_INIT_LOCK=threading.Lock()
+
+
+def distribution_services():
+    global DISTRIBUTION,DAILY_PLANS,PLATFORM_PUBLISHER
+    with DISTRIBUTION_INIT_LOCK:
+        if PLATFORM_PUBLISHER is None:PLATFORM_PUBLISHER=Publisher(sys.modules[__name__])
+        if DISTRIBUTION is None:
+            DISTRIBUTION=DistributionService(sys.modules[__name__],PLATFORM_PUBLISHER)
+            DAILY_PLANS=DailyPlans(sys.modules[__name__],DISTRIBUTION)
+            DISTRIBUTION.start()
+        return DISTRIBUTION,DAILY_PLANS
+
+
 def main() -> None:
     global HTTP_SERVER
     parser = argparse.ArgumentParser()
@@ -3323,6 +4163,7 @@ def main() -> None:
     init_db()
     start_queue_worker()
     automation_engine().start()
+    distribution_services()[1].start()
     import mac_runtime
     mac_runtime.apply_awake(sys.modules[__name__])
     print(f"XHS Assistant running at http://{args.host}:{args.port}")

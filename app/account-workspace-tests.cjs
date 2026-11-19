@@ -9,7 +9,7 @@ function workspace() {
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, {
       value: "", textContent: "", innerHTML: "", className: "", style: {}, hidden: false,
-      listeners: {},
+      listeners: {}, replaceChildren(...nodes) { this.children = nodes; },
       classList: { toggle() {} }, querySelectorAll: () => [], setAttribute() {}, removeAttribute() {},
       addEventListener(name, listener) { (this.listeners[name] ||= []).push(listener); },
     });
@@ -18,45 +18,46 @@ function workspace() {
   const context = vm.createContext({
     document: { getElementById: get, querySelectorAll: () => [], querySelector: () => get("main"), addEventListener() {} },
     setTimeout, clearTimeout, console, confirm: () => true, window: { addEventListener() {} },
+    URLSearchParams, location: { search: "", href: "http://localhost/" },
     ResizeObserver: class { observe() {} disconnect() {} },
   });
   const source = fs.readFileSync(path.join(__dirname, "static/app.js"), "utf8")
     .replace('init().catch((err) => log(err.message));', "");
-  vm.runInContext(source + "\nglobalThis.workspace = {state, loadProfile, displayProfile, generateProfile, showView, renderCurrentAccount, currentPayload, generateCopy, invalidateCopies, polishCurrentCopy, selectStyle, firstUsableImage, applyExplicitSize, renderRecommendation, generateCover, saveCover, savePublishPreferences, saveConfig, loadConfig, loadQueueItem, changeGroup, updateQueuePreviewControls, leaveQueuePreview, checkForUpdates, maybeCheckForUpdates, startUpdateChecks, appendImportedPaths, validatePublishImageCount, updateImageCount, refreshTopicTemplateOptions, renderPublishingResources, applyTopicTemplateSelection, parseLocalTemplateTopics, saveLocalTopicTemplate, syncPublishingResources, testTextModel, formatCopyEngine, renderProfile, setManualPending, fillPublish, publishNow, enqueueCurrent, confirmEnqueue, confirmPublished, previewSchedule, finishCurrentDraft, useProfileHotKeyword, bindEvents};", context);
+  vm.runInContext(source + "\nglobalThis.workspace = {state, loadProfile, displayProfile, generateProfile, showView, renderCurrentAccount, currentPayload, generateCopy, invalidateCopies, polishCurrentCopy, selectStyle, firstUsableImage, applyExplicitSize, renderRecommendation, generateCover, saveCover, savePublishPreferences, saveConfig, loadConfig, loadQueueItem, changeGroup, updateQueuePreviewControls, leaveQueuePreview, checkForUpdates, maybeCheckForUpdates, startUpdateChecks, appendImportedPaths, validatePublishImageCount, updateImageCount, renderTopicTemplateTabs, applyLocalTopicTemplate, restorePublishMemory, renderPublishingResources, parseLocalTemplateTopics, saveTemplateFromDialog, deleteTemplateFromDialog, readPlatformTemplates, importPlatformTemplates, persistLocalTemplates, renderManualAlbumChips, addManualAlbum, removeManualAlbum, persistManualAlbums, testTextModel, formatCopyEngine, renderProfile, setManualPending, fillPublish, publishNow, publishScheduled, handleDirectSubmit, confirmPublished, previewSchedule, finishCurrentDraft, useProfileHotKeyword, loadDraft, saveActiveDraft, restoreDraft, ensureCurrentTemplateValid, loadQueue, runQueue, pauseQueue, bindEvents};", context);
   return { context, get, ...context.workspace };
 }
 
-test("topic templates require an explicit selection", () => {
+test("local topic template chips render and fill the topic input", () => {
   const app=workspace();
-  app.refreshTopicTemplateOptions(["摄影模板"]);
-  assert.match(app.get("topicTemplate").innerHTML, /^<option value="">不使用模板<\/option>/);
-  assert.equal(app.get("topicTemplate").value, "");
-  app.get("topicTemplate").value="摄影模板";
-  app.refreshTopicTemplateOptions(["摄影模板"]);
-  assert.equal(app.get("topicTemplate").value, "摄影模板");
-});
-
-test("manual topic template names stay visibly unverified until platform sync", () => {
-  const app=workspace();
-  app.state.publishingResources={};
-  app.refreshTopicTemplateOptions(["手填模板"]);
-  assert.match(app.get("topicTemplate").innerHTML,/\[未验证名称\] 手填模板/);
-  app.state.publishingResources={templates:[{name:"手填模板",source:"platform"}]};
-  app.refreshTopicTemplateOptions(["手填模板"]);
-  assert.match(app.get("topicTemplate").innerHTML,/\[平台已同步\] 手填模板/);
+  app.state.localTopicTemplates=[{name:"艺考照",tags:["艺考照","演员资料照"],source:"local"}];
+  app.renderTopicTemplateTabs();
+  assert.match(app.get("topicTemplateTabs").innerHTML,/艺考照/);
+  app.applyLocalTopicTemplate("艺考照");
+  assert.equal(app.get("tagsInput").value,"#艺考照 #演员资料照");
+  assert.equal(app.state.selectedLocalTemplate,"艺考照");
 });
 
 test("local topic templates freeze their exact topics in the publish payload", () => {
   const app=workspace();
   app.state.localTopicTemplates=[{name:"艺考常用",tags:["艺考照","演员资料照"],source:"local"}];
-  app.refreshTopicTemplateOptions(["平台模板"]);
-  app.get("topicTemplate").value="local:艺考常用";
-  app.applyTopicTemplateSelection();
+  app.applyLocalTopicTemplate("艺考常用");
   const payload=app.currentPayload();
   assert.equal(payload.local_topic_template,"艺考常用");
   assert.equal(payload.topic_template,"");
   assert.deepEqual(Array.from(payload.tags),["艺考照","演员资料照"]);
-  assert.equal(app.get("localTemplateTopics").value,"#艺考照 #演员资料照");
+});
+
+test("both immediate and scheduled payloads carry local template topics", () => {
+  const app=workspace();
+  app.state.localTopicTemplates=[{name:"艺考照",tags:["艺考照","演员资料照"],source:"local"}];
+  app.applyLocalTopicTemplate("艺考照");
+  for (const mode of ["immediate","scheduled"]) {
+    app.get("publishMode").value=mode;
+    const payload=app.currentPayload();
+    assert.deepEqual(Array.from(payload.tags),["艺考照","演员资料照"]);
+    assert.equal(payload.local_topic_template,"艺考照");
+    assert.equal(payload.topic_template,"");
+  }
 });
 
 test("local template paste accepts separators, deduplicates, and enforces ten topics", () => {
@@ -66,16 +67,16 @@ test("local template paste accepts separators, deduplicates, and enforces ten to
 });
 
 test("saving a local template sends account-scoped structured template data", async () => {
-  const app=workspace();app.state.activeProfile="Profile 2";
-  app.get("localTemplateName").value="演员资料";
-  app.get("localTemplateTopics").value="#演员资料照 #见组照";
+  const app=workspace();app.state.activeProfile="Profile 2";app.state.localTopicTemplates=[];
+  app.get("templateNameInput").value="演员资料";
+  app.get("templateTopicsInput").value="#演员资料照 #见组照";
   let sent;
   app.context.fetch=async (url,options)=>{sent={url,body:JSON.parse(options.body)};return {ok:true,json:async()=>({ok:true})};};
-  await app.saveLocalTopicTemplate();
+  await app.saveTemplateFromDialog();
   assert.equal(sent.url,"/api/config");
   assert.equal(sent.body.profile_dir,"Profile 2");
   assert.deepEqual(sent.body.local_topic_templates,[{name:"演员资料",tags:["演员资料照","见组照"],source:"local"}]);
-  assert.match(app.get("localTemplateStatus").textContent,/已为当前账号保存/);
+  assert.match(app.get("templateDialogStatus").textContent,/已保存/);
 });
 
 test("account config restores resources, PPToken, publish preferences, and manual pending", async () => {
@@ -83,7 +84,7 @@ test("account config restores resources, PPToken, publish preferences, and manua
   app.context.fetch=async()=>({ok:true,json:async()=>({ok:true,config:{
     active_profile:"Profile 2",root_path:"/素材",default_album:"演员合集",default_location:"北京",
     schedule_windows:["19:00-21:00"],default_schedule_window:"19:00-21:00",topic_templates:["手填平台模板"],
-    local_topic_templates:[{name:"本地常用",tags:["艺考照"],source:"local"}],
+    local_topic_templates:[{name:"本地常用",tags:["艺考照"],source:"local"}],last_tags:["艺考照"],last_local_topic_template:"本地常用",
     publishing_resources:{checked_at:"2026-11-06T10:00:00",synced_at:"2026-11-06T10:00:00",templates:[{name:"平台同步模板"}],albums:["合集A"],errors:[]},
     daily_limit:3,visibility:"仅自己可见",publish_mode:"immediate",original_enabled:false,copy_engine:"auto",
     text_provider:"pptoken",text_base_url:"https://example.com/v1",pptoken_model:"gpt-test",has_pptoken_key:true,
@@ -98,8 +99,9 @@ test("account config restores resources, PPToken, publish preferences, and manua
   assert.equal(app.get("textProvider").value,"pptoken");
   assert.equal(app.get("pptokenSettings").hidden,false);
   assert.equal(app.get("deepseekSettings").hidden,true);
-  assert.match(app.get("topicTemplate").innerHTML,/本地常用/);
-  assert.match(app.get("topicTemplate").innerHTML,/平台同步模板/);
+  assert.match(app.get("topicTemplateTabs").innerHTML,/本地常用/);
+  assert.equal(app.state.selectedLocalTemplate,"本地常用");
+  assert.equal(app.get("tagsInput").value,"#艺考照");
   assert.match(app.get("accountAlbumOptions").innerHTML,/合集A/);
   assert.equal(app.get("confirmManualPublishBtn").hidden,false);
   assert.equal(app.get("prefillPublishBtn").disabled,true);
@@ -112,18 +114,40 @@ test("PPToken results display the real configured platform and model", () => {
   assert.equal(app.formatCopyEngine({ai_used:false,engine:"local-template"}),"本地模板");
 });
 
-test("platform resource sync keeps partial results and reports exact failures", async () => {
+test("importing selected platform templates writes structured local templates", async () => {
+  const app=workspace();
+  app.state.localTopicTemplates=[];
+  app.state.platformImportRows=[{name:"平台模板",topics:["艺考照","见组照"],confirmed:true}];
+  app.get("templateImportList").querySelectorAll=()=>[{dataset:{importIndex:"0"}}];
+  let sent;
+  app.context.fetch=async (url,options)=>{sent={url,body:JSON.parse(options.body)};return {ok:true,json:async()=>({ok:true})};};
+  await app.importPlatformTemplates();
+  assert.deepEqual(sent.body.local_topic_templates,[{name:"平台模板",tags:["艺考照","见组照"],source:"platform"}]);
+  assert.match(app.get("topicTemplateTabs").innerHTML,/平台模板/);
+  assert.match(app.get("templateDialogStatus").textContent,/已导入 1 个模板/);
+});
+
+test("platform template read failure surfaces the backend message", async () => {
+  const app=workspace();app.state.activeProfile="Profile 1";
+  app.context.fetch=async ()=>({ok:true,json:async()=>({ok:true,profile_dir:"Profile 1",resources:{templates:[],albums:[],errors:["请先填入一组素材到当前账号的小红书发布页，再同步模板和合集。"]}})});
+  await app.readPlatformTemplates();
+  assert.match(app.get("templateImportHint").textContent,/读取失败：请先填入一组素材/);
+});
+
+test("platform template import reads names, topics, and album options", async () => {
   const app=workspace();app.state.activeProfile="Profile 1";
   app.context.fetch=async (url,options)=>{
     assert.equal(url,"/api/publishing/resources/sync");
     assert.equal(JSON.parse(options.body).profile_dir,"Profile 1");
-    return {ok:true,json:async()=>({ok:true,profile_dir:"Profile 1",resources:{checked_at:"2026-11-06T11:00:00",templates:[{name:"平台模板"}],albums:["合集一"],status:{templates:{ok:true,topics_complete:true},albums:{ok:true}},errors:["未读到第二页合集"]}})};
+    return {ok:true,json:async()=>({ok:true,profile_dir:"Profile 1",resources:{checked_at:"2026-11-06T11:00:00",templates:[{name:"平台模板",topics:["艺考照","见组照"],topics_confirmed:true}],albums:["合集一"],status:{templates:{ok:true,topics_complete:true},albums:{ok:true}},errors:["未读到第二页合集"]}})};
   };
-  await app.syncPublishingResources();
-  assert.match(app.get("topicTemplate").innerHTML,/平台模板/);
+  await app.readPlatformTemplates();
+  assert.match(app.get("templateImportList").innerHTML,/平台模板/);
+  assert.match(app.get("templateImportList").innerHTML,/#艺考照/);
   assert.match(app.get("accountAlbumOptions").innerHTML,/合集一/);
+  assert.match(app.get("templateImportHint").textContent,/读到 1 个模板/);
   assert.match(app.get("resourcesStatus").textContent,/部分读取失败.*未读到第二页合集/);
-  assert.equal(app.get("syncResourcesBtn").disabled,false);
+  assert.equal(app.get("templateReadPlatformBtn").disabled,false);
 });
 
 test("resource status distinguishes stale cached lists from this check", () => {
@@ -226,11 +250,9 @@ test("manual pending blocks every publish entry until verified or discarded", as
   app.setManualPending("Default",{history_id:9,title:"上一条"});
   await assert.rejects(app.fillPublish(),/待确认的发布页面/);
   await assert.rejects(app.publishNow(),/待确认的发布页面/);
-  await assert.rejects(app.enqueueCurrent(),/待确认的发布页面/);
-  await assert.rejects(app.confirmEnqueue(),/待确认的发布页面/);
+  await assert.rejects(app.publishScheduled(),/待确认的发布页面/);
   assert.equal(calls,0);
-  assert.equal(app.get("immediatePublishBtn").disabled,true);
-  assert.equal(app.get("schedulePublishBtn").disabled,true);
+  assert.equal(app.get("publishBtn").disabled,true);
 });
 
 test("queue snapshot is read-only and switching groups restores saved account preferences", async () => {
@@ -346,24 +368,22 @@ test("switching queue snapshots keeps the original account preferences", () => {
   assert.equal(app.get("originalChk").checked,false);
 });
 
-test("leaving queue preview preserves a manually configured platform template", () => {
+test("leaving queue preview preserves manually entered topics", () => {
   const app=workspace();
-  app.get("topicTemplates").value="手动平台模板";
-  app.refreshTopicTemplateOptions();
-  app.get("topicTemplate").value="手动平台模板";
-  app.state.queuePreview={payload:{},preferences:{topicTemplate:"手动平台模板"}};
+  app.get("tagsInput").value="#艺考照 #北京写真";
+  app.state.queuePreview={payload:{},preferences:{tags:"#艺考照 #北京写真",localTemplate:""}};
   app.leaveQueuePreview();
-  assert.equal(app.get("topicTemplate").value,"手动平台模板");
+  assert.equal(app.get("tagsInput").value,"#艺考照 #北京写真");
+  assert.equal(app.state.selectedLocalTemplate,"");
 });
 
-test("leaving queue preview preserves an old template name as unverified", () => {
+test("leaving queue preview preserves the selected local template", () => {
   const app=workspace();
-  app.get("topicTemplates").value="";
-  app.state.publishingResources={};
-  app.state.queuePreview={payload:{},preferences:{topicTemplate:"历史模板"}};
+  app.state.localTopicTemplates=[{name:"艺考常用",tags:["艺考照"],source:"local"}];
+  app.state.queuePreview={payload:{},preferences:{tags:"#艺考照",localTemplate:"艺考常用"}};
   app.leaveQueuePreview();
-  assert.equal(app.get("topicTemplate").value,"历史模板");
-  assert.match(app.get("topicTemplate").innerHTML,/\[未验证名称\] 历史模板/);
+  assert.equal(app.state.selectedLocalTemplate,"艺考常用");
+  assert.equal(app.get("tagsInput").value,"#艺考照");
 });
 
 test("legacy queue snapshot without original uses the saved account default", () => {
@@ -381,7 +401,7 @@ test("management verification distinguishes reviewing from published and does no
   const app=workspace();app.setManualPending("Default",{history_id:12,title:"待核验"});
   app.context.fetch=async (url)=>{
     if(url==="/api/history/confirm") return {ok:true,json:async()=>({ok:true,status:"reviewing",reason:"平台仍在审核"})};
-    if(url==="/api/history") return {ok:true,json:async()=>({ok:true,items:[]})};
+    if(url.startsWith("/api/history?")) return {ok:true,json:async()=>({ok:true,items:[]})};
     throw Error(`unexpected ${url}`);
   };
   await app.confirmPublished(12);
@@ -390,47 +410,65 @@ test("management verification distinguishes reviewing from published and does no
   assert.match(app.get("runLog").textContent,/素材不会归档/);
 });
 
-test("confirmed enqueue immediately reflects the running queue and pause action", async () => {
+test("scheduled publish fills and submits directly without the queue", async () => {
   const app=workspace();
   app.state.current={path:"/group",selected_images:["/group/a.jpg"]};
   app.get("titleInput").value="标题";app.get("contentInput").value="正文";
-  app.get("publishMode").value="scheduled";app.get("dialogTimeInput").value="2026-11-07T20:00";
-  const job={id:3,status:"queued",schedule_time:"2026-11-07T20:00",payload:{}};
-  app.context.fetch=async (url)=>{
-    if(url==="/api/queue/enqueue") { app.get("titleInput").value="继续编辑"; return {ok:true,json:async()=>({ok:true,job})}; }
-    if(url==="/api/queue") return {ok:true,json:async()=>({ok:true,items:[job],enabled:true})};
+  app.get("publishMode").value="scheduled";app.get("scheduleWindow").value="19:00-21:00";app.get("schedulePreview").value="2026-11-07 20:00";
+  let submitted;const calls=[];
+  app.context.fetch=async (url,options)=>{
+    calls.push(url);
+    if(url==="/api/publish/preferences") return {ok:true,json:async()=>({ok:true})};
+    if(url==="/api/xhs/submit-publish") {
+      submitted=JSON.parse(options.body);
+      return {ok:true,json:async()=>({ok:true,submitted:false,uncertain:true,history_id:31,schedule_time:"2026-11-07T20:00",message:"平台未确认",warnings:[]})};
+    }
+    if(url.startsWith("/api/history?")) return {ok:true,json:async()=>({ok:true,items:[]})};
     throw Error(`unexpected ${url}`);
   };
-  await app.confirmEnqueue();
-  assert.equal(app.state.queueEnabled,true);
-  assert.equal(app.get("pauseQueueBtn").style.display,"");
-  assert.equal(app.get("startQueueBtn").style.display,"none");
-  assert.equal(app.get("titleInput").value,"继续编辑");
+  await app.publishScheduled();
+  assert.equal(submitted.publish_mode,"scheduled");
+  assert.equal(submitted.schedule_time,"2026-11-07T20:00");
+  assert.ok(calls.includes("/api/xhs/submit-publish"));
+  assert.equal(calls.includes("/api/queue/enqueue"),false);
+  assert.equal(app.state.manualPublishes.get("Default").id,31);
+  assert.equal(app.get("titleInput").value,"标题");
 });
 
-test("manual queue time is never marked as an auto-replan suggestion", async () => {
+test("immediate publish fills and submits directly without the queue", async () => {
   const app=workspace();
   app.state.current={path:"/group",selected_images:["/group/a.jpg"]};
   app.get("titleInput").value="标题";app.get("contentInput").value="正文";
-  app.get("publishMode").value="scheduled";app.get("dialogTimeInput").value="2026-11-07T20:00";
-  let queuedPayload;
-  const job={id:4,status:"queued",schedule_time:"2026-11-07T20:00",payload:{}};
-  app.context.fetch=async (url, options)=>{
-    if(url==="/api/queue/enqueue") { queuedPayload=JSON.parse(options.body).payload; return {ok:true,json:async()=>({ok:true,job})}; }
-    if(url==="/api/queue") return {ok:true,json:async()=>({ok:true,items:[job],enabled:true})};
+  app.get("publishMode").value="scheduled";app.get("schedulePreview").value="2026-11-07 20:00";
+  let submitted;const calls=[];
+  app.context.fetch=async (url,options)=>{
+    calls.push(url);
+    if(url==="/api/publish/preferences") return {ok:true,json:async()=>({ok:true})};
+    if(url==="/api/xhs/submit-publish") {
+      submitted=JSON.parse(options.body);
+      return {ok:true,json:async()=>({ok:true,submitted:false,uncertain:true,history_id:32,schedule_time:"",message:"平台未确认",warnings:[]})};
+    }
+    if(url.startsWith("/api/history?")) return {ok:true,json:async()=>({ok:true,items:[]})};
     throw Error(`unexpected ${url}`);
   };
-  await app.confirmEnqueue();
-  assert.equal(queuedPayload.schedule_auto,false);
+  await app.publishNow();
+  assert.equal(submitted.publish_mode,"immediate");
+  assert.equal(submitted.schedule_time,"");
+  assert.ok(calls.includes("/api/xhs/submit-publish"));
+  assert.equal(calls.includes("/api/xhs/publish-now"),false);
+  assert.equal(app.get("titleInput").value,"标题");
 });
 
 test("new controls are wired to real event handlers", () => {
   const app=workspace();app.bindEvents();
-  for (const id of ["saveLocalTemplateBtn","deleteLocalTemplateBtn","syncResourcesBtn","testModelBtn","discardManualPublishBtn"]) {
+  for (const id of ["manageTemplatesBtn","templateReadPlatformBtn","templateImportConfirmBtn","templateSaveBtn","templateDeleteBtn","testModelBtn","discardManualPublishBtn"]) {
     assert.ok(app.get(id).listeners.click?.length,`${id} should have a click handler`);
   }
   assert.ok(app.get("scheduleWindow").listeners.change?.length,"schedule window should persist its account default");
   assert.ok(app.get("originalChk").listeners.change?.length,"original declaration should persist its account default");
+  assert.ok(app.get("tagsInput").listeners.input?.length,"topics should persist per account");
+  assert.ok(app.get("defaultAlbum").listeners.change?.length,"album should persist per account");
+  assert.ok(app.get("defaultLocation").listeners.change?.length,"location should persist per account");
 });
 
 test("a delayed schedule preview cannot overwrite the next account", async () => {
@@ -455,7 +493,7 @@ test("random copy control actually selects an allowed style", async () => {
   let requested;
   app.context.fetch=async (_url,options)=>{requested=JSON.parse(options.body);return {ok:true,json:async()=>({copy:{title:"标题",content:"正文",tags:["摄影"],style:requested.style}})};};
   await app.generateCopy("invalid-style");
-  assert.ok(["praise","professional","process","opinion","story"].includes(requested.style));
+  assert.ok(["praise","professional","process","opinion","story","painpoint","knowledge","advantage"].includes(requested.style));
 });
 
 test("a collage in first position is the actual preview cover", () => {
@@ -473,6 +511,43 @@ test("images dragged from separate folders append as independent publish paths",
   assert.deepEqual(app.state.current.selected_images,["/folder-a/one.jpg","/managed/two.jpg","/managed/three.png"]);
   assert.equal(app.state.current.materialMode,"mixed");
 });
+
+test("manual album names persist and render as selectable chips", async () => {
+  const app=workspace();
+  app.state.activeProfile="Profile 1";
+  app.state.manualAlbums=["光影写真","艺考照女生"];
+  app.get("defaultAlbum").value="艺考照女生";
+  app.renderManualAlbumChips();
+  assert.match(app.get("manualAlbumChips").innerHTML,/光影写真/);
+  assert.match(app.get("manualAlbumChips").innerHTML,/album-chip selected/);
+  app.get("defaultAlbum").value="女生casting";
+  const sent=[];
+  app.context.fetch=async(url,options)=>{sent.push({url,body:JSON.parse(options.body)});return {ok:true,json:async()=>({ok:true})};};
+  await app.addManualAlbum();
+  assert.deepEqual(Array.from(app.state.manualAlbums),["光影写真","艺考照女生","女生casting"]);
+  assert.ok(sent.some((call)=>/\/api\/config/.test(call.url)&&JSON.stringify(call.body.manual_albums)===JSON.stringify(["光影写真","艺考照女生","女生casting"])));
+  assert.match(app.get("manualAlbumChips").innerHTML,/女生casting/);
+});
+
+test("publish buttons submit directly and the schedule dialog is gone", () => {
+  const source=fs.readFileSync(path.join(__dirname,"static/app.js"),"utf8");
+  assert.match(source,/api\("\/api\/xhs\/submit-publish", payload\)/);
+  assert.doesNotMatch(source,/\/api\/xhs\/publish-now/);
+  assert.doesNotMatch(source,/\/api\/queue\/enqueue/);
+  assert.doesNotMatch(source,/enqueueCurrent|confirmEnqueue|schedulePayload/);
+  assert.match(source,/async function publishScheduled\(\)[\s\S]*?schedulePreview[\s\S]*?\/api\/xhs\/submit-publish/);
+  assert.match(source,/async function fillPublish\(\)[\s\S]*?\/api\/xhs\/fill-publish/);
+  const html=fs.readFileSync(path.join(__dirname,"templates/index.html"),"utf8");
+  assert.doesNotMatch(html,/scheduleDialog/);
+  assert.match(html,/id="publishBtn"[^>]*>立即发布</);
+});
+
+test("publish checklist card is removed from the page", () => {
+  const html=fs.readFileSync(path.join(__dirname,"templates/index.html"),"utf8");
+  assert.doesNotMatch(html,/发布确认清单/);
+  assert.doesNotMatch(html,/id="checklist"/);
+});
+
 
 test("a submitted draft cannot clear edits made while the request was pending", async () => {
   const app=workspace();app.state.current={path:"/group",selected_images:["/group/a.jpg"]};
@@ -754,4 +829,73 @@ test("update checks start before other workspace requests and register one ten-m
   app.startUpdateChecks();await app.state.updateCheckPending;app.startUpdateChecks();
   assert.equal(interval.ms,600000);
   assert.deepEqual(events,["visibilitychange","focus"]);
+});
+
+test("draft read and write stay inside the active account", async () => {
+  const app=workspace();
+  app.state.activeProfile="Profile 2";
+  app.state.config={active_profile:"Profile 2"};
+  app.get("titleInput").value="二号草稿标题";
+  app.get("contentInput").value="二号草稿正文";
+  app.get("tagsInput").value="#艺考照";
+  app.state.localTopicTemplates=[{name:"二号模板",tags:["艺考照"],source:"local"}];
+  app.state.selectedLocalTemplate="二号模板";
+  let saved;let loadedUrl;
+  app.context.fetch=async (url,options)=>{
+    if(options?.method==="POST"){saved={url,body:JSON.parse(options.body)};return {ok:true,json:async()=>({ok:true,draft:saved.body.draft})};}
+    loadedUrl=url;
+    return {ok:true,json:async()=>({ok:true,draft:{title:"二号草稿标题",content:"二号草稿正文",tags:["艺考照"],selected_local_template:"二号模板"}})};
+  };
+  await app.saveActiveDraft();
+  assert.equal(saved.url,"/api/draft");
+  assert.equal(saved.body.profile_dir,"Profile 2");
+  assert.equal(saved.body.draft.title,"二号草稿标题");
+  assert.equal(saved.body.draft.selected_local_template,"二号模板");
+  assert.equal(saved.body.draft.tags.length,1);
+  const draft=await app.loadDraft("Profile 2");
+  assert.equal(loadedUrl,"/api/draft?profile_dir=Profile%202");
+  assert.equal(draft.title,"二号草稿标题");
+});
+
+test("restoring a draft drops a topic template that belongs to another account", () => {
+  const app=workspace();
+  app.state.activeProfile="Profile 2";
+  app.state.localTopicTemplates=[{name:"二号模板",tags:["艺考照"],source:"local"}];
+  const restored=app.restoreDraft({
+    title:"二号标题",content:"二号正文",tags:["艺考照"],notes:"",model_name:"",shooting_date:"",
+    album:"二号合集",location:"北京",visibility:"公开可见",publish_mode:"immediate",original:true,
+    selected_local_template:"一号模板",
+  });
+  assert.equal(restored,true);
+  assert.equal(app.get("titleInput").value,"二号标题");
+  assert.equal(app.get("defaultAlbum").value,"二号合集");
+  assert.equal(app.state.selectedLocalTemplate,"");
+  assert.equal(app.currentPayload().local_topic_template,"");
+});
+
+test("queue start and pause carry the account profile", async () => {
+  const app=workspace();
+  app.state.activeProfile="Profile 2";
+  app.state.queue=[{id:1,status:"queued",payload:{}}];
+  const sent=[];
+  app.context.fetch=async (url,options)=>{
+    if(options?.body) sent.push({url,body:JSON.parse(options.body)});
+    else sent.push({url,body:null});
+    return {ok:true,json:async()=>({ok:true,items:[],enabled:true})};
+  };
+  await app.runQueue();
+  assert.equal(sent[0].url,"/api/queue/start");
+  assert.equal(sent[0].body.profile_dir,"Profile 2");
+  await app.pauseQueue();
+  assert.equal(sent.at(-1).url,"/api/queue/pause");
+  assert.equal(sent.at(-1).body.profile_dir,"Profile 2");
+});
+
+
+test("creator Auth store provides stable operator ID without leaving a draft", async () => {
+  const data=await vm.runInNewContext(identitySource,{
+    location:{hostname:"creator.xiaohongshu.com",pathname:"/publish/publish"},window:{},
+    document:{querySelector:s=>s==="#app"?{__vue_app__:{config:{globalProperties:{$store:{state:{Auth:{userInfo:{userId:"operator-123",userName:"当前运营者"}}}}}}}}:null}
+  });
+  assert.equal(data.user_id,"operator-123");assert.equal(data.nickname,"当前运营者");
 });

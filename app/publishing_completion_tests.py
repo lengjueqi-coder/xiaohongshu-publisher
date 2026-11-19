@@ -178,7 +178,9 @@ class PublishingCompletionTests(unittest.TestCase):
         prepared = {"history_id": 7}
         with patch.object(server, "switch_chrome_profile"), patch.object(
             server, "prepare_publish", return_value=prepared
-        ), patch.object(server, "click_publish", return_value={"ok": True}), patch.object(
+        ), patch.object(server, "verify_prepared_publish", return_value=None), patch.object(
+            server, "click_publish", return_value={"ok": True}
+        ), patch.object(
             server, "archive_history"
         ) as archive:
             self.assertTrue(server.process_queue_job(job))

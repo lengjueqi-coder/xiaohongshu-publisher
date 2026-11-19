@@ -12,20 +12,23 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from publishing_policy import PLAN_LEAD_MINUTES, require_schedule_lead, schedule_epoch
 
 import imagefx
 import mac_notifications as notifications
+import copy_quality
 
 
 DEFAULT_PLAN = {
     "root_path": "", "mode": "review", "timezone": "Asia/Shanghai", "daily_count": 1,
     "windows": ["21:00-22:00"], "ahead_days": 3, "min_images": 4, "max_images": 8,
     "selection": "ordered", "layout": "original", "copy_mode": "local",
-    "styles": ["praise", "professional", "process", "opinion", "story"],
+    "styles": ["praise", "professional", "process", "opinion", "story", "painpoint", "knowledge", "advantage"],
     "copy_library": [], "allow_template_fallback": False, "tags": [], "mentions": [],
     "album": "", "location": "", "topic_template": "", "original": True,
     "visibility": "公开可见", "expected_user_id": "", "account_name": "",
     "fx_params": {}, "submission_hour_limit": 3, "submission_day_limit": 12,
+    "window_mode": "random", "fixed_window": "",
 }
 
 
@@ -77,7 +80,12 @@ class AutomationEngine:
             return result
         config = {**DEFAULT_PLAN, "root_path": self.app.account_setting("root_path", "", profile),
                   "visibility": self.app.account_setting("visibility", "公开可见", profile),
-                  "fx_params": self.app.get_fx_params(profile_dir=profile)}
+                  "fx_params": self.app.get_fx_params(profile_dir=profile),
+                  "album": self.app.account_setting("default_album", "", profile),
+                  "location": self.app.account_setting("default_location", "", profile),
+                  "topic_template": self.app.account_setting("last_local_topic_template", "", profile),
+                  "tags": self.app.account_setting("last_tags", [], profile),
+                  "original": self.app.account_setting("original_enabled", True, profile)}
         return {"profile_dir": profile, "config": config, "enabled": False, "state": "paused", "last_error": ""}
 
     def save_plan(self, profile, raw):
@@ -103,11 +111,31 @@ class AutomationEngine:
                     raise ValueError(f"{key} 必须在 {lower}–{upper} 之间")
             if config["min_images"] > config["max_images"]:
                 raise ValueError("最少选图数量不能超过最多数量")
+            if config["mode"] == "automatic" and config["daily_count"] > 2:
+                raise ValueError("全自动发布每天最多 2 条，请调低每天发布数量")
             needed = 9 if config["layout"] == "3x3" else 4 if config["layout"] in {"2x2", "collage_only"} else 1
             if config["min_images"] < needed:
                 raise ValueError(f"当前拼图要求至少选 {needed} 张，请调高最少选图数量，避免拼图留空")
-            if not isinstance(config["windows"], list) or not config["windows"] or len(config["windows"]) > 10:
-                raise ValueError("请设置 1–10 个发布时间段")
+            common_windows = self.app.account_setting("schedule_windows", [], profile)
+            if not isinstance(common_windows, list) or not common_windows:
+                raise ValueError("请先在账号画像下方设置常用发布时间段")
+            common_windows = [str(item).strip() for item in common_windows if str(item).strip()]
+            if not common_windows:
+                raise ValueError("请先在账号画像下方设置常用发布时间段")
+            config["window_mode"] = str(config.get("window_mode") or "random").strip()
+            if config["window_mode"] not in {"random", "fixed"}:
+                raise ValueError("每天使用时间段的方式无效")
+            if config["window_mode"] == "fixed":
+                fixed_window = str(config.get("fixed_window") or "").strip()
+                if fixed_window not in common_windows:
+                    raise ValueError("固定时间段必须来自账号常用发布时间段")
+                config["fixed_window"] = fixed_window
+                config["windows"] = [fixed_window]
+            else:
+                config["fixed_window"] = ""
+                config["windows"] = common_windows
+            if len(config["windows"]) > 12:
+                raise ValueError("最多设置 12 个常用发布时间段")
             for window in config["windows"]:
                 self.app.parse_schedule_window(str(window))
             if not config["styles"] or any(s not in self.app.COPY_STYLES for s in config["styles"]):
@@ -174,17 +202,39 @@ class AutomationEngine:
     def set_enabled(self, profile, enabled):
         with self.lock:
             plan = self.get_plan(profile)
+            config = plan["config"]
             if enabled:
+                with self.app.db_connection() as db:
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE name='distribution_plans'").fetchone():
+                        other=db.execute('SELECT config FROM distribution_plans WHERE profile=?',(profile,)).fetchone()
+                        if other:
+                            distribution=json.loads(other[0])
+                            if distribution.get('enabled') and 'xhs' in distribution.get('targets',[]):raise ValueError('请先暂停多平台每日计划，避免两个计划重复发布小红书')
                 if not plan["config"].get("expected_user_id"):
                     raise ValueError("请先保存计划并绑定当前小红书账号")
                 if not Path(plan["config"]["root_path"]).is_dir():
                     raise ValueError("素材磁盘或目录不可用")
+                common = self.app.account_setting("schedule_windows", [], profile)
+                common = [str(item).strip() for item in common if str(item).strip()] if isinstance(common, list) else []
+                if not common:
+                    raise ValueError("请先在账号画像下方设置常用发布时间段")
+                if config.get("window_mode") == "fixed":
+                    fixed = str(config.get("fixed_window") or "").strip()
+                    if fixed not in common:
+                        raise ValueError("固定时间段必须来自账号常用发布时间段")
+                    config["windows"], config["fixed_window"] = [fixed], fixed
+                else:
+                    config["windows"], config["fixed_window"] = common, ""
                 with self.app.db_connection() as db:
                     uncertain = db.execute("SELECT COUNT(*) FROM publish_jobs WHERE profile_dir=? AND status='unknown'", (profile,)).fetchone()[0]
                 if uncertain:
                     raise ValueError("该账号存在状态不明的任务，请先核对处理，避免重复发布")
             with self.app.db_connection() as db:
-                db.execute("UPDATE automation_plans SET enabled=?,state=?,last_error='',updated_at=? WHERE profile_dir=?", (int(enabled), "running" if enabled else "paused", self.app.now_iso(), profile))
+                db.execute('BEGIN IMMEDIATE')
+                if enabled and db.execute("SELECT 1 FROM sqlite_master WHERE name='distribution_plans'").fetchone():
+                    other=db.execute('SELECT config FROM distribution_plans WHERE profile=?',(profile,)).fetchone()
+                    if other and json.loads(other[0]).get('enabled') and 'xhs' in json.loads(other[0]).get('targets',[]):raise ValueError('请先暂停多平台每日计划')
+                db.execute("UPDATE automation_plans SET config=?,enabled=?,state=?,last_error='',updated_at=? WHERE profile_dir=?", (json.dumps(config, ensure_ascii=False), int(enabled), "running" if enabled else "paused", self.app.now_iso(), profile))
                 # Manual tasks are never enabled or paused by an automation plan.
                 db.execute("UPDATE publish_jobs SET status=?,updated_at=? WHERE profile_dir=? AND status=? AND json_extract(payload,'$.automation')=1",
                            ("queued" if enabled else "paused", self.app.now_iso(), profile, "paused" if enabled else "queued"))
@@ -230,11 +280,11 @@ class AutomationEngine:
                     if dt.date() != day:  # spillover is counted on its actual calendar day
                         if sum(s[:10] == dt.date().isoformat() for s in used) >= config["daily_count"]:
                             continue
-                    if dt >= local_now + timedelta(minutes=30) and dt.strftime("%Y-%m-%dT%H:%M") not in used:
+                    if dt >= local_now + timedelta(minutes=PLAN_LEAD_MINUTES) and dt.strftime("%Y-%m-%dT%H:%M") not in used:
                         candidates.append(dt)
                         break
             if candidates:
-                return min(candidates)
+                return random.choice(candidates)
         return None
 
     def build_batch(self, profile, limit=10, now=None):
@@ -244,6 +294,8 @@ class AutomationEngine:
             config = plan["config"]
             if not config["root_path"]:
                 raise ValueError("请先保存素材目录及发布规则")
+            if config["mode"] == "automatic":
+                config["daily_count"] = max(1, min(2, int(config["daily_count"] or 1)))
             with self.app.db_connection() as db:
                 used = {r[0] for r in db.execute("SELECT folder_path FROM automation_materials WHERE profile_dir=?", (profile,))}
                 used.update(r[0] for r in db.execute("SELECT json_extract(payload,'$.folder_path') FROM publish_jobs WHERE profile_dir=? AND status!='cancelled' AND json_extract(payload,'$.automation')=1", (profile,)))
@@ -270,6 +322,8 @@ class AutomationEngine:
             return created
 
     def make_payload(self, profile, config, folder, slot):
+        config = dict(config)
+        # The saved plan is a snapshot; explicit empty fields and switches are authoritative.
         source_images = list(folder.images)
         if len(source_images) < config["min_images"]:
             raise ValueError(f"素材组“{folder.name}”只有 {len(source_images)} 张图片，少于规则要求的 {config['min_images']} 张")
@@ -297,11 +351,14 @@ class AutomationEngine:
                 images = [str(collage)] if config["layout"] == "collage_only" else [str(collage), *images[:self.app.MAX_NOTE_IMAGES - 1]]
             self.app.validate_note_image_count(images, require_one=True)
             style = random.choice(config["styles"])
+            recent = copy_quality.recent_copies(self.app, profile)
             if config["copy_mode"] == "library":
                 copy = random.choice(config["copy_library"])
             else:
                 args = {"style": style, "folder_name": folder.name, "model_name": folder.model_name,
-                        "profile_dir": profile, "copy_engine": "local" if config["copy_mode"] == "local" else "auto"}
+                        "profile_dir": profile, "notes": copy_quality.material_notes(folder.path),
+                        "recent_copies": recent[:20],
+                        "copy_engine": "local" if config["copy_mode"] == "local" else "auto"}
                 if config["copy_mode"] == "ai":
                     copy = self.app.generate_deepseek_copy(args)
                     if not copy and not config["allow_template_fallback"]:
@@ -310,13 +367,21 @@ class AutomationEngine:
                 else:
                     copy = self.app.generate_template_copy(args)
             self.validate_copy(copy)
+            # Review drafts remain editable; unattended publishing must stop on repetition.
+            if config["mode"] == "automatic":
+                copy_quality.ensure_distinct(copy, recent)
             tags = list(dict.fromkeys(config["tags"]))[:10]
+            schedule_time = slot.strftime("%Y-%m-%dT%H:%M")
+            schedule_epoch = slot.timestamp()
+            if datetime.fromtimestamp(schedule_epoch, tz=slot.tzinfo).strftime("%Y-%m-%dT%H:%M") != schedule_time:
+                raise ValueError("定时发布时间生成异常，请重新生成任务")
             payload = {"automation": True, "profile_dir": profile, "folder_path": folder.path,
                        "material_mode": "folder", "material_root": config["root_path"], "archive_source_images": selected,
                        "folder_name": folder.name, "images": images, "model_name": folder.model_name,
                        "style": style, "title": copy["title"], "content": copy["content"], "tags": tags,
-                       "publish_mode": "scheduled", "schedule_time": slot.strftime("%Y-%m-%dT%H:%M"),
-                       "schedule_epoch": slot.timestamp(), "timezone": config["timezone"],
+                       "copy_engine": copy.get("engine", config["copy_mode"]), "ai_used": bool(copy.get("ai_used")),
+                       "publish_mode": "scheduled", "schedule_time": schedule_time,
+                       "schedule_epoch": schedule_epoch, "timezone": config["timezone"],
                        "submit_after": datetime.now().isoformat(timespec="seconds"),
                        "expected_user_id": config["expected_user_id"], "strict_fields": True,
                        "submission_hour_limit": config["submission_hour_limit"],
@@ -331,7 +396,8 @@ class AutomationEngine:
     def approve(self, profile, ids):
         with self.lock:
             plan = self.get_plan(profile)
-            if not plan["config"]["expected_user_id"]:
+            expected_user_id = plan["config"]["expected_user_id"] or self.app.account_identity(profile).get("user_id")
+            if not expected_user_id:
                 raise ValueError("请先绑定当前运营账号")
             with self.app.db_connection() as db:
                 for job_id in ids:
@@ -339,12 +405,158 @@ class AutomationEngine:
                     if not row or row[1] != "draft":
                         raise ValueError("所选任务已变化，请刷新后重试")
                     payload = json.loads(row[0])
-                    if payload.get("schedule_epoch", 0) <= time.time() + 300:
-                        raise ValueError("草稿时间已过或太近，请取消该草稿后重新生成")
-                    payload["expected_user_id"] = plan["config"]["expected_user_id"]
+                    require_schedule_lead(payload)
+                    payload["expected_user_id"] = expected_user_id
                     db.execute("UPDATE publish_jobs SET payload=?,status='queued',updated_at=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), self.app.now_iso(), int(job_id)))
             self.app.db_set_setting("queue_enabled", True)
             self.app.QUEUE_WAKE.set()
+
+    def apply_settings(self, profile):
+        """把当前已保存的发布设置同步到尚未提交的任务。
+
+        只改可见范围、合集、地点、话题模板、原创、@ 这些"发布设置"；发布时间和
+        图片文案属于生成时冻结的内容，不在这里改动。
+        """
+        keys = ("visibility", "album", "location", "topic_template", "original", "mentions")
+        with self.lock, self.app.db_connection() as db:
+            config = self.get_plan(profile)["config"]
+            now = time.time()
+            rows = db.execute(
+                "SELECT id,payload FROM publish_jobs WHERE profile_dir=? AND status IN ('draft','queued','paused','failed') AND json_extract(payload,'$.automation')=1",
+                (profile,),
+            ).fetchall()
+            changed = 0
+            for job_id, raw in rows:
+                payload = json.loads(raw)
+                if payload.get("schedule_epoch", 0) <= now + 300:
+                    continue
+                for key in keys:
+                    if key in config:
+                        payload[key] = config[key]
+                db.execute(
+                    "UPDATE publish_jobs SET payload=?,updated_at=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), self.app.now_iso(), int(job_id)),
+                )
+                changed += 1
+        return {"ok": True, "changed": changed}
+
+    def build_review_batch(self, profile, total, daily, root_path=""):
+        """按"本次条数 / 每天条数"生成待审核队列（发布笔记页的批量计划）。"""
+        total = int(total)
+        daily = int(daily)
+        if not 1 <= total <= 30:
+            raise ValueError("本次发布条数需在 1–30 之间")
+        if not 1 <= daily <= 5:
+            raise ValueError("每天条数需在 1–5 之间")
+        with self.lock:
+            config = dict(self.get_plan(profile)["config"])
+            folder_root = str(root_path or config.get("root_path") or "").strip()
+            if not folder_root:
+                raise ValueError("请先在发布笔记页选择素材文件夹")
+            folder_path = Path(folder_root).expanduser().resolve()
+            if not folder_path.is_dir():
+                raise ValueError("素材文件夹不存在或不可访问")
+            if not config.get("styles"):
+                raise ValueError("请先到自动发布页保存文案风格等规则")
+            if not config.get("windows"):
+                raise ValueError("请先到账号画像设置常用发布时间段，并在自动发布页保存规则")
+            config["root_path"] = str(folder_path)
+            config["daily_count"] = daily
+            config["submission_day_limit"] = max(int(config.get("submission_day_limit") or 1), total)
+            config["submission_hour_limit"] = max(int(config.get("submission_hour_limit") or 1), min(12, total))
+            if not config.get("expected_user_id"):
+                identity = self.app.account_identity(profile)
+                if not identity.get("user_id"):
+                    raise ValueError("请先到小红书页面确认已登录当前账号")
+                config["expected_user_id"] = identity["user_id"]
+            now = datetime.now(timezone.utc)
+            with self.app.db_connection() as db:
+                used = {r[0] for r in db.execute("SELECT folder_path FROM automation_materials WHERE profile_dir=?", (profile,))}
+                used.update(r[0] for r in db.execute(
+                    "SELECT json_extract(payload,'$.folder_path') FROM publish_jobs WHERE profile_dir=? AND status!='cancelled' AND json_extract(payload,'$.automation')=1",
+                    (profile,),
+                ))
+            candidates = [f for f in self.app.scan_folders(config["root_path"]) if f.path not in used]
+            if not candidates:
+                raise ValueError("素材文件夹里没有新的子文件夹；每个直接放图片的子文件夹只会用一次")
+            created = []
+            for folder in candidates[:total]:
+                slot = self.slot(profile, config, now)
+                if not slot:
+                    break
+                payload = self.make_payload(profile, config, folder, slot)
+                payload["reviewed"] = False
+                payload["automation"] = 1
+                job = self.app.enqueue_job(payload, payload["schedule_time"], status="draft")
+                with self.app.db_connection() as db:
+                    db.execute(
+                        "INSERT INTO automation_materials(profile_dir,folder_path,job_id,created_at) VALUES(?,?,?,?)",
+                        (profile, folder.path, job["id"], self.app.now_iso()),
+                    )
+                created.append(job["id"])
+            if not created:
+                raise ValueError("没有生成任何队列：请检查素材子文件夹数量、发布时间段和提前准备天数")
+            return created
+
+    def confirm_drafts(self, profile, ids):
+        """把勾选/确认过的草稿标记为已审核；只有已审核的才会被批量提交。"""
+        changed = 0
+        with self.lock, self.app.db_connection() as db:
+            for job_id in ids:
+                row = db.execute(
+                    "SELECT payload,status FROM publish_jobs WHERE id=? AND profile_dir=?", (int(job_id), profile)
+                ).fetchone()
+                if not row or row[1] != "draft":
+                    continue
+                payload = json.loads(row[0])
+                payload["reviewed"] = True
+                db.execute(
+                    "UPDATE publish_jobs SET payload=?,updated_at=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), self.app.now_iso(), int(job_id)),
+                )
+                changed += 1
+        return changed
+
+    def update_draft(self, profile, job_id, fields):
+        """在发布笔记页修改某一条草稿；修改后必须重新确认。"""
+        allowed = {
+            "title", "content", "tags", "visibility", "album", "location",
+            "topic_template", "original", "shooting_date", "mentions", "schedule_time",
+        }
+        with self.lock, self.app.db_connection() as db:
+            row = db.execute(
+                "SELECT payload,status FROM publish_jobs WHERE id=? AND profile_dir=?", (int(job_id), profile)
+            ).fetchone()
+            if not row or row[1] != "draft":
+                raise ValueError("只能修改尚未提交的草稿，请刷新后重试")
+            payload = json.loads(row[0])
+            for key in allowed:
+                if key in fields:
+                    payload[key] = fields[key]
+            payload["reviewed"] = False
+            schedule = str(fields.get("schedule_time") or "").strip()
+            if "schedule_time" in fields and not schedule:
+                raise ValueError("定时任务的发布时间不能为空")
+            if schedule:
+                epoch = schedule_epoch({**payload, "schedule_time": schedule, "schedule_epoch": None})
+                payload["schedule_epoch"] = epoch
+                require_schedule_lead(payload)
+                db.execute(
+                    "UPDATE publish_jobs SET payload=?,schedule_time=?,updated_at=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), schedule, self.app.now_iso(), int(job_id)),
+                )
+            else:
+                db.execute(
+                    "UPDATE publish_jobs SET payload=?,updated_at=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), self.app.now_iso(), int(job_id)),
+                )
+
+    def reviewed_draft_ids(self, profile):
+        with self.app.db_connection() as db:
+            rows = db.execute(
+                "SELECT id,payload FROM publish_jobs WHERE profile_dir=? AND status='draft' ORDER BY id ASC", (profile,)
+            ).fetchall()
+        return [int(job_id) for job_id, raw in rows if json.loads(raw).get("reviewed")]
 
     def cancel(self, profile, job_id):
         with self.lock, self.app.db_connection() as db:
@@ -375,6 +587,7 @@ class AutomationEngine:
                 item["payload"] = json.loads(item["payload"])
                 jobs.append(item)
         return {"ok": True, "profile_dir": profile, "plan": self.get_plan(profile), "jobs": jobs,
+                "common_windows": self.app.account_setting("schedule_windows", [], profile),
                 "alerts": notifications.alerts(self.app), "notifications": notifications.settings(self.app)}
 
     def tick(self):

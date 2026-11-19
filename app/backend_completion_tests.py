@@ -162,7 +162,7 @@ class BackendCompletionTests(unittest.TestCase):
         self.assertEqual(result["provider"], "pptoken")
         self.assertEqual(result["model"], "vendor/temporary")
         self.assertEqual(call.call_args.kwargs["settings"], temporary)
-        self.assertEqual(server.account_setting("text_provider", profile_dir="Default"), "deepseek")
+        self.assertEqual(server.db_get_setting("text_provider"), "deepseek")
 
     def test_resource_sync_updates_successful_empty_list_and_keeps_failed_cache(self):
         server.db_set_setting("publishing_resources:Default", {

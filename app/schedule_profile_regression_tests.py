@@ -20,6 +20,8 @@ class ScheduleAndProfileRegressionTests(unittest.TestCase):
         self.db_patch.start()
         self.addCleanup(self.db_patch.stop)
         server.init_db()
+        self.image = Path(self.temp.name) / "test-image.jpg"
+        self.image.write_bytes(b"\xff\xd8\xff\xe0test")
 
     def _scheduled_payload(self, schedule_time: str = "") -> dict:
         return {
@@ -29,7 +31,7 @@ class ScheduleAndProfileRegressionTests(unittest.TestCase):
             "schedule_time": schedule_time,
             "title": "排期校验测试",
             "content": "正文",
-            "images": ["/tmp/test-image.jpg"],
+            "images": [str(self.image)],
             "tags": [],
         }
 

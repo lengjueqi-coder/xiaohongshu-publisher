@@ -3,14 +3,17 @@ from __future__ import annotations
 import tempfile
 import unittest
 import random
-from datetime import date, datetime
+import json
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import sys
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import server
+from automation_engine import AutomationEngine, DEFAULT_PLAN
 from account_identity import IdentityUnavailable, normalize_identity, safe_avatar_url
 from server import (
     choose_image_group,
@@ -31,6 +34,9 @@ class AssistantTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         server.DB_PATH = Path(self.tmp.name) / "test.sqlite3"
         init_db()
+        check_patch = patch("publish_checks.verify")
+        check_patch.start()
+        self.addCleanup(check_patch.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -52,6 +58,33 @@ class AssistantTests(unittest.TestCase):
         self.assertTrue(copy["title"])
         self.assertTrue(copy["content"])
         self.assertNotIn("张三", copy["tags"])
+
+    def test_schedule_windows_are_validated_and_deduplicated(self) -> None:
+        self.assertEqual(
+            server.normalize_schedule_windows(["10:00-11:00", " 10:00-11:00 ", "12:00"]),
+            ["10:00-11:00", "12:00"],
+        )
+        with self.assertRaises(ValueError):
+            server.normalize_schedule_windows([])
+        with self.assertRaises(ValueError):
+            server.normalize_schedule_windows(["25:00"])
+
+    def test_automation_slot_randomizes_across_common_windows(self) -> None:
+        engine = AutomationEngine(server)
+        config = {
+            **DEFAULT_PLAN,
+            "windows": ["10:00-11:00", "12:00-13:00", "20:00-21:00"],
+            "daily_count": 1,
+            "ahead_days": 0,
+            "timezone": "Asia/Shanghai",
+        }
+        now = datetime(2026, 5, 15, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        with patch("automation_engine.random.choice", side_effect=lambda items: items[-1]):
+            evening = engine.slot("Default", config, now)
+        self.assertGreaterEqual(evening.hour, 20)
+        with patch("automation_engine.random.choice", side_effect=lambda items: items[0]):
+            morning = engine.slot("Default", config, now)
+        self.assertEqual(morning.hour, 10)
 
     def test_publish_preferences_are_account_scoped_and_validated(self) -> None:
         server.db_set_setting("account_defaults:Profile 1:schedule_windows", ["19:00-21:00"])
@@ -79,6 +112,33 @@ class AssistantTests(unittest.TestCase):
         })
         self.assertEqual(server.account_setting("default_schedule_window", profile_dir="Profile 2"), "早上 10:00")
         self.assertEqual(server.account_setting("visibility", profile_dir="Default"), "公开可见")
+
+    def test_publish_preferences_remember_album_location_topics_and_template(self) -> None:
+        server.db_set_setting("account_defaults:Profile 1:local_topic_templates", [
+            {"name": "艺考照", "tags": ["艺考照", "演员资料照"], "source": "local"},
+        ])
+        server.save_publish_preferences("Profile 1", {
+            "album": "演员合集",
+            "location": "北京通州",
+            "tags": ["#艺考照", "演员资料照", "艺考照"],
+            "local_topic_template": "艺考照",
+        })
+        self.assertEqual(server.account_setting("default_album", profile_dir="Profile 1"), "演员合集")
+        self.assertEqual(server.account_setting("default_location", profile_dir="Profile 1"), "北京通州")
+        self.assertEqual(
+            server.account_setting("last_tags", profile_dir="Profile 1"),
+            ["艺考照", "演员资料照"],
+        )
+        self.assertEqual(
+            server.account_setting("last_local_topic_template", profile_dir="Profile 1"),
+            "艺考照",
+        )
+        with self.assertRaises(ValueError):
+            server.save_publish_preferences("Profile 1", {"local_topic_template": "不存在"})
+        with self.assertRaises(ValueError):
+            server.save_publish_preferences("Profile 1", {"tags": [f"话题{i}" for i in range(11)]})
+        with self.assertRaises(ValueError):
+            server.save_publish_preferences("Profile 1", {"location": "x" * 201})
 
     def test_scan_folders_finds_image_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,6 +487,105 @@ class AssistantTests(unittest.TestCase):
         self.assertTrue(clicked["ok"])
         self.assertEqual(server.history_rows(1)[0]["status"], "accepted")
 
+    def test_submit_publish_immediate_fills_and_confirms_in_one_call(self) -> None:
+        payload = {
+            "folder_path": "/tmp/A",
+            "folder_name": "A",
+            "images": ["/tmp/A/01.jpg"],
+            "title": "立即提交",
+            "content": "正文",
+            "publish_mode": "immediate",
+            "profile_dir": "Default",
+        }
+        prepared = {"ok": True, "history_id": 77, "warnings": [], "payload": {**payload, "schedule_time": ""}}
+        with patch.object(server, "active_profile_dir", return_value="Default"), patch.object(
+            server, "prepare_publish", return_value=prepared
+        ) as prepare, patch.object(
+            server, "verify_prepared_publish", return_value=None
+        ), patch.object(
+            server, "click_publish", return_value={"ok": True, "confirmation": {"confirmed": True}}
+        ) as click:
+            result = server.submit_publish(payload)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["history_id"], 77)
+        self.assertIsNone(server.manual_pending("Default"))
+        self.assertEqual(prepare.call_args.args[0]["publish_mode"], "immediate")
+        self.assertEqual(prepare.call_args.args[0]["schedule_time"], "")
+        click.assert_called_once_with(77)
+
+    def test_submit_publish_keeps_pending_when_platform_does_not_confirm(self) -> None:
+        payload = {
+            "folder_path": "/tmp/A",
+            "folder_name": "A",
+            "images": ["/tmp/A/01.jpg"],
+            "title": "未确认提交",
+            "content": "正文",
+            "publish_mode": "immediate",
+            "profile_dir": "Default",
+        }
+        prepared = {"ok": True, "history_id": 78, "warnings": [], "payload": {**payload, "schedule_time": ""}}
+        with patch.object(server, "active_profile_dir", return_value="Default"), patch.object(
+            server, "prepare_publish", return_value=prepared
+        ), patch.object(
+            server, "verify_prepared_publish", return_value=None
+        ), patch.object(
+            server,
+            "click_publish",
+            return_value={"ok": False, "uncertain": True, "message": "平台未确认", "result": {}},
+        ):
+            result = server.submit_publish(payload)
+        self.assertFalse(result["submitted"])
+        self.assertTrue(result["uncertain"])
+        self.assertEqual(server.manual_pending("Default")["history_id"], 78)
+
+    def test_submit_publish_requires_one_hour_lead_for_native_schedule(self) -> None:
+        payload = {
+            "folder_path": "/tmp/A",
+            "folder_name": "A",
+            "images": ["/tmp/A/01.jpg"],
+            "title": "定时提交",
+            "content": "正文",
+            "publish_mode": "scheduled",
+            "schedule_time": (datetime.now() + timedelta(minutes=30)).isoformat(timespec="minutes"),
+            "profile_dir": "Default",
+        }
+        with self.assertRaises(server.PublishError) as raised:
+            server.submit_publish(payload)
+        self.assertIn("1 小时", str(raised.exception))
+        self.assertIsNone(server.manual_pending("Default"))
+
+    def test_submit_publish_scheduled_passes_time_to_fill_and_click(self) -> None:
+        schedule_time = (datetime.now() + timedelta(hours=2)).isoformat(timespec="minutes")
+        payload = {
+            "folder_path": "/tmp/A",
+            "folder_name": "A",
+            "images": ["/tmp/A/01.jpg"],
+            "title": "定时提交",
+            "content": "正文",
+            "publish_mode": "scheduled",
+            "schedule_time": schedule_time,
+            "profile_dir": "Default",
+        }
+        prepared = {"ok": True, "history_id": 79, "warnings": [], "payload": {**payload}}
+        with patch.object(server, "active_profile_dir", return_value="Default"), patch.object(
+            server, "prepare_publish", return_value=prepared
+        ) as prepare, patch.object(
+            server, "verify_prepared_publish", return_value=None
+        ), patch.object(
+            server, "click_publish", return_value={"ok": True, "confirmation": {"confirmed": True}}
+        ):
+            result = server.submit_publish(payload)
+        self.assertTrue(result["submitted"])
+        self.assertEqual(prepare.call_args.args[0]["schedule_time"], schedule_time)
+        self.assertIsNone(server.manual_pending("Default"))
+
+    def test_native_schedule_preview_reserves_one_hour_lead(self) -> None:
+        now_ref = datetime(2026, 11, 7, 20, 0)
+        planned = resolve_planned_schedule_time(
+            "20:00-22:00", now_ref=now_ref, min_lead_minutes=65
+        )
+        self.assertGreaterEqual(datetime.fromisoformat(planned), now_ref + timedelta(minutes=65))
+
     def test_queue_processes_private_batch_serially_after_platform_confirmation(self) -> None:
         from PIL import Image
 
@@ -434,7 +593,7 @@ class AssistantTests(unittest.TestCase):
         Image.new("RGB", (80, 80), (220, 180, 120)).save(image, "JPEG")
         calls: list[str] = []
 
-        def fake_cli(args, timeout=180):
+        def fake_cli(args, timeout=180, extra_env=None):
             calls.append(args[0])
             if args[0] == "fill-publish":
                 return {"ok": True, "json": {"success": True}}
@@ -467,6 +626,8 @@ class AssistantTests(unittest.TestCase):
             )
 
         with patch.object(server, "switch_chrome_profile", return_value={"ready": True}), patch.object(
+            server, "verify_prepared_publish", return_value=None
+        ), patch.object(
             server, "run_xhs_cli", side_effect=fake_cli
         ), patch.object(server.time, "sleep", return_value=None):
             while True:
@@ -560,6 +721,126 @@ class AssistantTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"image bytes")
             with self.assertRaisesRegex(ValueError, "只支持拖入"):
                 server.store_imported_image("clip.mov", b"video", Path(tmp))
+
+
+class AccountWorkspaceIsolationTests(unittest.TestCase):
+    """每个 Chrome 账号必须拥有独立的草稿、队列、记录与队列开关。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        server.DB_PATH = Path(self.tmp.name) / "test.sqlite3"
+        init_db()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_draft_is_scoped_per_profile(self) -> None:
+        server.save_publish_draft("Profile 1", {
+            "title": "一号标题",
+            "content": "一号正文",
+            "tags": ["演员资料"],
+            "selected_local_template": "艺考照",
+            "folder": {"path": "/tmp/A", "name": "A", "all_images": ["/tmp/A/01.jpg"], "excluded": []},
+        })
+        server.save_publish_draft("Profile 2", {"title": "二号标题", "content": "二号正文"})
+        self.assertEqual(server.get_publish_draft("Profile 1")["title"], "一号标题")
+        self.assertEqual(server.get_publish_draft("Profile 1")["selected_local_template"], "艺考照")
+        self.assertEqual(server.get_publish_draft("Profile 2")["title"], "二号标题")
+        self.assertIsNone(server.get_publish_draft("Profile 3"))
+        self.assertEqual(server.get_publish_draft("Profile 2")["tags"], [])
+        self.assertIsNone(server.get_publish_draft("Profile 2")["folder"])
+
+    def test_draft_normalizes_long_and_unknown_fields(self) -> None:
+        saved = server.save_publish_draft("Profile 1", {
+            "title": "标" * 400,
+            "content": "文" * 20050,
+            "tags": [f"话题{i}" for i in range(25)],
+            "unknown": "被忽略",
+        })
+        self.assertEqual(len(saved["title"]), 300)
+        self.assertEqual(len(saved["content"]), 20000)
+        self.assertEqual(len(saved["tags"]), 20)
+        self.assertNotIn("unknown", saved)
+
+    def test_queue_rows_are_scoped_per_profile(self) -> None:
+        first = server.enqueue_job({
+            "folder_path": "/tmp/A", "folder_name": "A", "images": ["/tmp/A/01.jpg"],
+            "title": "一号", "content": "正文", "profile_dir": "Profile 1",
+        }, "2099-01-01T21:00")
+        second = server.enqueue_job({
+            "folder_path": "/tmp/B", "folder_name": "B", "images": ["/tmp/B/01.jpg"],
+            "title": "二号", "content": "正文", "profile_dir": "Profile 2",
+        }, "2099-01-02T21:00")
+        self.assertEqual([row["id"] for row in server.queue_rows(profile_dir="Profile 1")], [first["id"]])
+        self.assertEqual([row["id"] for row in server.queue_rows(profile_dir="Profile 2")], [second["id"]])
+        self.assertEqual(len(server.queue_rows()), 2)
+
+    def test_history_rows_are_scoped_per_profile(self) -> None:
+        server.record_history({
+            "title": "一号记录", "content": "正文", "images": ["/tmp/A/01.jpg"],
+            "folder_name": "A", "profile_dir": "Profile 1",
+        }, "prefilled")
+        server.record_history({
+            "title": "二号记录", "content": "正文", "images": ["/tmp/B/01.jpg"],
+            "folder_name": "B", "profile_dir": "Profile 2",
+        }, "prefilled")
+        first = server.history_rows(profile_dir="Profile 1")
+        second = server.history_rows(profile_dir="Profile 2")
+        self.assertEqual([row["title"] for row in first], ["一号记录"])
+        self.assertEqual([row["title"] for row in second], ["二号记录"])
+
+    def test_manual_queue_switch_is_scoped_per_profile(self) -> None:
+        self.assertFalse(server.manual_queue_enabled("Profile 1"))
+        self.assertFalse(server.manual_queue_enabled("Profile 2"))
+        server.set_manual_queue_enabled("Profile 1", True)
+        self.assertTrue(server.manual_queue_enabled("Profile 1"))
+        self.assertFalse(server.manual_queue_enabled("Profile 2"))
+        server.set_manual_queue_enabled("Profile 2", True)
+        self.assertTrue(server.queue_master_enabled())
+        server.pause_manual_queue("Profile 1")
+        self.assertFalse(server.manual_queue_enabled("Profile 1"))
+        self.assertTrue(server.manual_queue_enabled("Profile 2"))
+        server.pause_manual_queue("Profile 2")
+        self.assertFalse(server.queue_master_enabled())
+
+    def test_claim_next_job_respects_each_account_switch(self) -> None:
+        server.enqueue_job({
+            "folder_path": "/tmp/A", "folder_name": "A", "images": ["/tmp/A/01.jpg"],
+            "title": "一号", "content": "正文", "profile_dir": "Profile 1", "publish_mode": "immediate",
+        }, "")
+        server.enqueue_job({
+            "folder_path": "/tmp/B", "folder_name": "B", "images": ["/tmp/B/01.jpg"],
+            "title": "二号", "content": "正文", "profile_dir": "Profile 2", "publish_mode": "immediate",
+        }, "")
+        self.assertIsNone(server.claim_next_job(respect_account_queue=True))
+        server.set_manual_queue_enabled("Profile 2", True)
+        job = server.claim_next_job(respect_account_queue=True)
+        self.assertIsNotNone(job)
+        self.assertEqual(job["profile_dir"], "Profile 2")
+        self.assertIsNone(server.claim_next_job(respect_account_queue=True))
+
+    def test_ai_settings_are_shared_across_profiles(self) -> None:
+        server.db_set_setting("deepseek_api_key", "sk-shared")
+        server.db_set_setting("deepseek_model", "deepseek-v4-pro")
+        with server.db_connection() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                ("account_defaults:Profile 2:deepseek_api_key", json.dumps("sk-should-be-ignored")),
+            )
+        for profile in ("Profile 1", "Profile 2"):
+            config = server.text_model_config(profile)
+            self.assertEqual(config["api_key"], "sk-shared")
+            self.assertEqual(config["model"], "deepseek-v4-pro")
+
+    def test_legacy_account_ai_key_is_migrated_to_global(self) -> None:
+        with server.db_connection() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                ("account_defaults:Profile 1:deepseek_api_key", json.dumps("sk-legacy")),
+            )
+            db.execute("DELETE FROM settings WHERE key=?", ("deepseek_api_key",))
+        server.migrate_shared_ai_settings()
+        self.assertEqual(server.db_get_setting("deepseek_api_key"), "sk-legacy")
 
 
 if __name__ == "__main__":

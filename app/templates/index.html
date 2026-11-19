@@ -4,8 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>小红书发布助手</title>
-    <link rel="stylesheet" href="/static/styles.css?v=2026.11.10-materials" />
-    <link rel="stylesheet" href="/static/automation.css?v=1" />
+    <link rel="stylesheet" href="/static/platforms.css?v=2026.11.18" />
+    <link rel="stylesheet" href="/static/styles.css?v=2026.11.18" />
+    <link rel="stylesheet" href="/static/automation.css?v=2026.11.08-common-windows" />
   </head>
   <body>
     <header class="workspace-header">
@@ -19,6 +20,9 @@
         <span id="updateStatus" class="update-status" role="status" aria-live="polite">正在读取版本…</span>
       </div>
       <div class="account-bar">
+        <button id="accountSyncBtn" class="account-sync" type="button" title="读取当前浏览器窗口实际登录的小红书账号" aria-label="刷新当前浏览器账号">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0111.5-1L20 9M4 15l2.4 3A7 7 0 0018 17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
         <button id="accountBtn" class="account-btn" type="button" title="切换运营账号" aria-expanded="false" aria-controls="accountMenu">
           <span class="account-avatar" id="accountAvatar" aria-hidden="true"></span>
           <span class="account-names"><span id="accountName" class="account-chrome">读取账号中…</span><span id="accountNickname" class="account-nickname">小红书账号待识别</span></span>
@@ -50,9 +54,9 @@
             <svg class="caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <div id="platformMenu" class="platform-menu" style="display:none">
-            <div class="platform-option active"><span class="xhs-badge">小红书</span> 已选择</div>
-            <div class="platform-option disabled">抖音（暂未开放）</div>
-            <div class="platform-option disabled">视频号（暂未开放）</div>
+            <button type="button" class="platform-option active" data-platform="xhs"><span class="xhs-badge">小红书</span></button>
+            <button type="button" class="platform-option" data-platform="douyin">抖音 · 创作者中心</button>
+            <button type="button" class="platform-option" data-platform="channels">视频号 · 助手</button>
             <div class="platform-option disabled">B站（暂未开放）</div>
           </div>
         </div>
@@ -97,6 +101,7 @@
 
 
         <!-- ---------- 发布视图 ---------- -->
+        <div id="pagePlatforms" hidden></div>
         <div id="pagePublish">
           <!-- 任务队列条 -->
           <div class="queue-bar">
@@ -106,6 +111,8 @@
             <span class="queue-label">后台任务队列</span>
             <span id="bridgeStatus" class="bridge-pill">Bridge 未检测</span>
             <div class="queue-actions">
+              <button id="clearCurrentQueueBtn" class="mini-text ghost" type="button" disabled title="先点队列编号回看要清除的那一条">清除当前队列</button>
+              <button id="clearAllQueueBtn" class="mini-text ghost" type="button">清除全部队列</button>
               <button id="nextQueueBtn" class="mini-text ghost" type="button">下一条</button>
               <button id="pauseQueueBtn" class="mini-text ghost" type="button" style="display:none">暂停队列</button>
               <button id="startQueueBtn" class="primary" type="button" style="display:none">开始提交（<span id="readyCount">0</span> 条已确认）</button>
@@ -118,25 +125,32 @@
             <button id="mediaTabVideo" class="media-btn" type="button">视频</button>
           </div>
 
-          <!-- 批量计划条 -->
+          <!-- 批量计划条（默认收起） -->
           <div class="plan-bar">
-            <span class="plan-title">批量计划</span>
-            <label class="plan-item">本次发布
-              <input id="planTotal" type="number" min="1" max="30" value="15" /> 条
-            </label>
-            <i class="plan-sep"></i>
-            <label class="plan-item">每日上限
-              <input id="dailyLimit" type="number" min="1" max="5" value="3" /> 条
-            </label>
-            <i class="plan-sep"></i>
-            <span class="plan-calc">自动分配 <b id="planDays">5</b> 天 · 已排 <b id="planProgress">0</b>/<b id="planTotalView">15</b> 条</span>
+            <button id="planToggleBtn" class="plan-title ghost" type="button" aria-expanded="false">批量计划 <span class="plan-caret">▾</span></button>
+            <div id="planPanel" class="plan-panel" hidden>
+              <label class="plan-item">本次发布
+                <input id="planTotal" type="number" min="1" max="30" value="15" /> 条
+              </label>
+              <i class="plan-sep"></i>
+              <label class="plan-item">每天
+                <input id="dailyLimit" type="number" min="1" max="5" value="3" /> 条
+              </label>
+              <i class="plan-sep"></i>
+              <span class="plan-calc">预计 <b id="planDays">5</b> 天 · 队列 <b id="planProgress">0</b>/<b id="planTotalView">15</b> 条</span>
+              <button id="planGenerateBtn" class="primary" type="button">从素材文件夹生成队列</button>
+              <button id="planSaveCurrentBtn" class="ghost" type="button" disabled>保存修改到本条</button>
+              <button id="planConfirmCurrentBtn" class="ghost" type="button" disabled>确认当前队列</button>
+              <button id="planConfirmAllBtn" class="ghost" type="button">批量确认</button>
+              <button id="planRunBtn" class="primary" type="button">开始按队列发布</button>
+            </div>
           </div>
 
           <div id="videoPanel" style="display:none" class="video-box">
             <div class="video-placeholder">
               <div class="video-icon">🎬</div>
-              <h2>视频发布即将支持</h2>
-              <p>视频上传与发布功能正在开发中，当前请使用「图文」。</p>
+              <h2>视频与多平台分发</h2>
+              <p id="xhsVideoName">尚未选择视频</p><button type="button" class="primary" onclick="window.platformWorkspace.chooseXhsVideo()">选择视频</button>
             </div>
           </div>
 
@@ -176,6 +190,12 @@
 
               <div id="thumbGrid" class="thumb-strip"></div>
 
+              <div class="shoot-line">
+                <label class="inline-field"><span>模特</span><input id="modelName" placeholder="自动识别" /></label>
+                <label class="inline-field"><span>拍摄日期</span><input id="shootingDate" type="date" /></label>
+                <label class="inline-field grow"><span>备注</span><input id="notes" placeholder="道具、场景、服装亮点（会影响文案）" /></label>
+              </div>
+
               <div class="card-foot-line">
                 <button id="editorPathBtn" class="editor-link" type="button" title="选择用于编辑图片的本地软件（如 Photoshop）">
                   <svg viewBox="0 0 24 24"><path d="M4 17l-1 4 4-1L20 7l-3-3L4 17z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
@@ -190,21 +210,26 @@
 
             <!-- 文案卡 -->
             <section class="card">
-              <div class="copy-head">
-                <input id="titleInput" class="title-input" maxlength="20" placeholder="填写标题会有更多赞（0-20字）" />
+              <div class="copy-styles">
                 <div class="style-tabs" id="styleTabs">
                   <button class="style-tab" data-style="praise" type="button">夸赞型</button>
                   <button class="style-tab selected" data-style="professional" type="button">专业展示</button>
                   <button class="style-tab" data-style="process" type="button">过程分享</button>
                   <button class="style-tab" data-style="opinion" type="button">观点讨论</button>
                   <button class="style-tab" data-style="story" type="button">案例故事</button>
+                  <button class="style-tab" data-style="painpoint" type="button">行业痛点视角</button>
+                  <button class="style-tab" data-style="knowledge" type="button">行业干货分享</button>
+                  <button class="style-tab" data-style="advantage" type="button">自我优势</button>
                 </div>
+              </div>
+              <div class="copy-head">
+                <input id="titleInput" class="title-input" maxlength="20" placeholder="填写标题会有更多赞（0-20字）" />
                 <label class="random-line"><input type="checkbox" id="randomStyleChk" /> 随机</label>
                 <button id="generateBtn" class="mini-text ghost" type="button" title="强制重新生成文案">重新生成</button>
                 <button id="polishBtn" class="mini-text ghost" type="button" title="用 AI 润色当前标题和正文">更自然</button>
               </div>
 
-              <textarea id="contentInput" class="content-input" rows="9" placeholder="填写正文描述，分享你的拍摄故事…&#10;推荐素材后 5 种风格文案会自动生成，点上方风格名切换。"></textarea>
+              <textarea id="contentInput" class="content-input" rows="9" placeholder="填写正文描述，分享你的拍摄故事…&#10;推荐素材后 8 种风格文案会自动生成，点上方风格名切换。"></textarea>
 
               <div class="tag-preview" id="tagPreview"></div>
 
@@ -215,6 +240,11 @@
                 <span class="char-count"><span id="contentCount">0</span>/1000</span>
               </div>
 
+              <div class="topic-template-row">
+                <div id="topicTemplateTabs" class="template-tabs"></div>
+                <button id="manageTemplatesBtn" class="mini-text ghost" type="button">管理模板</button>
+              </div>
+
               <label class="plain-field">
                 <span>话题（发布时自动带上 #）</span>
                 <input id="tagsInput" placeholder="用空格或逗号分隔，例如：艺考照 北京写真" />
@@ -223,65 +253,247 @@
               <div class="engine-line">当前文案引擎：<span id="copyEngine">本地模板</span></div>
             </section>
 
-            <!-- 拍摄信息卡 -->
-            <section class="card">
-              <h2 class="block-title">拍摄信息</h2>
-              <div class="two-cols">
-                <label class="plain-field">
-                  <span>模特名</span>
-                  <input id="modelName" placeholder="从文件夹名自动识别，可手动改" />
-                </label>
-                <label class="plain-field">
-                  <span>拍摄日期</span>
-                  <input id="shootingDate" type="date" />
-                </label>
+            <!-- 内容设置卡（界面复刻小红书官方发布页） -->
+            <section class="card xhs-settings-card">
+              <div class="xhs-section-head">
+                <div class="xhs-section-title">内容设置</div>
+                <button class="xhs-collapse" type="button" data-collapse="xhsContentBody" aria-expanded="true">
+                  <span>收起</span>
+                  <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true"><path d="M6.85 8.46a.2.2 0 00.33 0l3.48-3.62a.6.6 0 11.84.82L7.66 9.64a.9.9 0 01-1.28 0L2.5 5.67a.6.6 0 11.84-.82l3.51 3.6z" fill="currentColor"/></svg>
+                </button>
               </div>
-              <label class="plain-field">
-                <span>拍摄备注（道具、场景、服装亮点）</span>
-                <input id="notes" placeholder="例如：白裙、窗边自然光、舞蹈生" />
-              </label>
-              <div class="two-cols">
-                <label class="plain-field">
-                  <span>话题模板</span>
-                  <select id="topicTemplate"></select>
-                </label>
-                <label class="plain-field">
-                  <span>合集（自动加入）</span>
-                  <input id="defaultAlbum" list="accountAlbumOptions" placeholder="同步后选择，或填写准确名称" />
-                  <datalist id="accountAlbumOptions"></datalist>
-                </label>
+
+              <div class="xhs-section-body" id="xhsContentBody">
+                <div class="xhs-grid">
+                  <div class="xhs-collection-wrap" id="xhsCollectionWrap">
+                    <div class="xhs-collection-line">
+                      <div class="xhs-collection-slot">
+                        <button class="xhs-row xhs-collection-row" id="xhsCollectionBtn" type="button" aria-expanded="false">
+                          <span class="xhs-row-icon">
+                            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2.53 6.67c0-.1.02-.18.05-.24.01-.03.02-.04.03-.05L8 3.24l5.38 3.14c.01.01.02.02.03.05.03.05.05.13.05.24s-.02.18-.05.24c-.01.03-.02.04-.03.05L8 10.09 2.61 6.95c-.01-.01-.02-.02-.03-.05a.6.6 0 01-.05-.23zm11.47-1.32L8.49 2.14a1 1 0 00-.98 0L2 5.35a1.5 1.5 0 000 2.63l5.51 3.22a1 1 0 00.98 0l5.51-3.22a1.5 1.5 0 000-2.63zM1.46 9.26a1.47 1.47 0 00-.07.43c0 .56.26 1.07.67 1.31l5.51 3.22a1 1 0 00.98 0l5.51-3.22a1.5 1.5 0 00.6-1.98 1.6 1.6 0 01-.07.04l-5.51 3.22a1.9 1.9 0 01-2.05 0L1.46 9.26z" fill="currentColor"/></svg>
+                          </span>
+                          <span class="xhs-row-text">
+                            <b>加入合集</b>
+                            <i>汇集系列视频，有利于连续性观看</i>
+                          </span>
+                          <span class="xhs-collection-choose">
+                            <span id="xhsCollectionName" class="xhs-collection-name" hidden></span>
+                            <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </span>
+                          <span class="xhs-close" id="xhsCollectionClear" hidden title="取消合集" role="button" aria-label="取消合集">
+                            <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+                          </span>
+                        </button>
+                        <div class="xhs-collection-edit" id="xhsCollectionEdit" hidden>
+                          <input id="defaultAlbum" list="accountAlbumOptions" placeholder="填写或选择合集名称" />
+                          <button id="addAlbumBtn" class="mini-text ghost" type="button">保存</button>
+                          <button id="cancelAlbumEditBtn" class="mini-text ghost" type="button">取消</button>
+                        </div>
+                      </div>
+                      <button id="syncAlbumsBtn" class="xhs-collection-sync" type="button">同步账号合集</button>
+                    </div>
+                    <div class="xhs-inline-panel xhs-collection-popover" id="xhsCollectionPanel" hidden>
+                      <p class="xhs-panel-hint">选择已保存的合集，或手动添加新合集。</p>
+                      <div id="manualAlbumChips" class="album-chips"></div>
+                      <button id="manualAlbumBtn" class="mini-text ghost" type="button">+ 手动添加</button>
+                      <datalist id="accountAlbumOptions"></datalist>
+                    </div>
+                  </div>
+
+                  <button class="xhs-row" id="xhsCoCreatorBtn" type="button">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="6" cy="8" r="4.4" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M11.3 3.6a4.7 4.7 0 010 8.8" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">添加共创人</span>
+                    <span class="xhs-remaining">本月剩余4次</span>
+                    <span class="xhs-row-arrow">
+                      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+
+                  <label class="xhs-row xhs-switch-row">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 1.8l5 2v4.1c0 2.8-2 5-5 6.3-3-1.3-5-3.5-5-6.3V3.8l5-2z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M5.7 7.9l1.5 1.5 3-3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">原创声明</span>
+                    <span class="xhs-switch">
+                      <input type="checkbox" id="originalChk" checked />
+                      <span class="xhs-switch-track"><span class="xhs-switch-thumb"></span></span>
+                    </span>
+                  </label>
+
+                  <div class="xhs-row xhs-select-row" id="xhsDeclarationRow" tabindex="0" role="button" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M13 4.5v7c0 1-1.2 1.6-2 .9A9 9 0 006.2 10.7H4a2.5 2.5 0 010-5h2.2A9 9 0 0011 4c.8-.8 2-.2 2 .5z" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/><path d="M14 6.2v3.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title" id="xhsDeclarationLabel">添加内容类型声明</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                    <div class="xhs-dropdown" id="xhsDeclarationMenu" hidden>
+                      <button type="button" class="xhs-dropdown-item" data-declaration="">不添加声明</button>
+                      <button type="button" class="xhs-dropdown-item" data-declaration="虚构演绎，仅供娱乐">虚构演绎，仅供娱乐</button>
+                      <button type="button" class="xhs-dropdown-item" data-declaration="笔记含AI合成内容">笔记含AI合成内容</button>
+                      <button type="button" class="xhs-dropdown-item" data-declaration="内容包含营销广告">内容包含营销广告</button>
+                      <div class="xhs-dropdown-group">
+                        <button type="button" class="xhs-dropdown-item xhs-has-sub" id="xhsDeclarationSubBtn">
+                          内容来源声明
+                          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                        </button>
+                        <div class="xhs-submenu" id="xhsDeclarationSubMenu" hidden>
+                          <button type="button" class="xhs-dropdown-item" data-declaration="内容来源声明：自主拍摄">自主拍摄</button>
+                          <button type="button" class="xhs-dropdown-item" data-declaration="内容来源声明：来源转载">来源转载</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <label id="xhsRepostField" hidden>转载媒体名称 <input id="xhsRepostSource" type="text" /></label>
+                </div>
+
+                <div class="xhs-subhead">添加组件</div>
+                <div class="xhs-grid xhs-component-grid" id="xhsComponentGrid">
+                  <div class="xhs-collection-wrap" id="xhsLocationWrap">
+                    <button class="xhs-row" id="xhsLocationBtn" type="button" aria-expanded="false">
+                      <span class="xhs-row-icon">
+                        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 14.3s5-4.4 5-7.8a5 5 0 10-10 0c0 3.4 5 7.8 5 7.8z" fill="none" stroke="currentColor" stroke-width="1.2"/><circle cx="8" cy="6.5" r="1.9" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+                      </span>
+                      <span class="xhs-row-title" id="xhsLocationLabel">添加地点</span>
+                      <span class="xhs-row-arrow">
+                        <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      </span>
+                    </button>
+                    <div class="xhs-inline-panel" id="xhsLocationPanel" hidden>
+                      <input id="defaultLocation" placeholder="如：北京通州区宋庄镇" />
+                      <span class="xhs-panel-hint">输入后自动保存；自动填入时按此地点搜索</span>
+                    </div>
+                  </div>
+
+                  <button class="xhs-row" type="button" data-xhs-component="选择群聊">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="6" cy="5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M1.5 13c0-2 2-3.6 4.5-3.6s4.5 1.6 4.5 3.6" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><path d="M11 3.2a2.2 2.2 0 010 4.2M12.3 9.8c1.4.5 2.2 1.7 2.2 3.2" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">选择群聊</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+
+                  <button class="xhs-row" type="button" data-xhs-component="引用笔记">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2.5" y="2" width="11" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M5.2 5.5h5.6M5.2 8h5.6M5.2 10.5h3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">引用笔记</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+
+                  <button class="xhs-row" type="button" data-xhs-component="添加投票">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M3 13V8M8 13V3M13 13V6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">添加投票</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+
+                  <button class="xhs-row" type="button" data-xhs-component="标记地点或标记朋友">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="6.5" cy="5.2" r="2.4" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M2 13c0-2 1.9-3.5 4.5-3.5 1 0 1.9.2 2.7.7" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><path d="M12 13.3s2.2-1.9 2.2-3.4a2.2 2.2 0 10-4.4 0c0 1.5 2.2 3.4 2.2 3.4z" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">标记地点或标记朋友</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+
+                  <button class="xhs-row" type="button" data-xhs-component="添加路线">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 12.5c0-2 2-2 4-2s4 0 4-2-2-2-4-2" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-dasharray="2 2"/><circle cx="4" cy="12.5" r="1.3" fill="none" stroke="currentColor" stroke-width="1.1"/><circle cx="12" cy="4.5" r="1.3" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+                    </span>
+                    <span class="xhs-row-title">添加路线</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+
+                  <button class="xhs-row" type="button" data-xhs-component="选择文件">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 1.8h5L13 5.5v8.7H4z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M9 1.8v3.8h4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+                    </span>
+                    <span class="xhs-row-title">选择文件</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                  </button>
+                </div>
+
+                <div class="xhs-activity">
+                  <div class="xhs-activity-head">
+                    <span class="xhs-activity-title">关联活动</span>
+                    <button class="xhs-more" type="button" id="xhsActivityMoreBtn">
+                      读取官方活动
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M9.67 7.82L5.55 3.81a.7.7 0 01.93-1.05l4.55 4.43a.9.9 0 010 1.28l-4.56 4.4a.7.7 0 01-.93-1.05l4.13-3.98a.15.15 0 000-.02z" fill="currentColor"/></svg>
+                    </button>
+                  </div>
+                  <div class="xhs-activity-grid" id="xhsActivityList"></div>
+                </div>
               </div>
-              <label class="plain-field">
-                <span>地点</span>
-                <input id="defaultLocation" placeholder="如：北京通州区宋庄镇" />
-              </label>
             </section>
 
-            <!-- 内容设置卡 -->
-            <section class="card">
-              <h2 class="block-title">内容设置</h2>
+            <!-- 更多设置卡（界面复刻小红书官方发布页） -->
+            <section class="card xhs-settings-card">
+              <div class="xhs-section-head">
+                <div class="xhs-section-title">更多设置</div>
+                <button class="xhs-collapse" type="button" data-collapse="xhsMoreBody" aria-expanded="true">
+                  <span>收起</span>
+                  <svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true"><path d="M6.85 8.46a.2.2 0 00.33 0l3.48-3.62a.6.6 0 11.84.82L7.66 9.64a.9.9 0 01-1.28 0L2.5 5.67a.6.6 0 11.84-.82l3.51 3.6z" fill="currentColor"/></svg>
+                </button>
+              </div>
+              <div class="xhs-section-body" id="xhsMoreBody">
+                <div class="xhs-grid">
+                  <label class="xhs-row xhs-switch-row">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="5" y="4.5" width="8" height="9" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M10.5 4.5V3a1 1 0 00-1-1H4a1 1 0 00-1 1v7.5a1 1 0 001 1h1" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+                    </span>
+                    <span class="xhs-row-title">允许正文复制</span>
+                    <span class="xhs-switch">
+                      <input type="checkbox" id="xhsAllowCopyChk" checked />
+                      <span class="xhs-switch-track"><span class="xhs-switch-thumb"></span></span>
+                    </span>
+                  </label>
 
-              <div class="setting-group">
-                <div class="setting-label">可见范围</div>
-                <div class="radio-list" id="visibilityList">
-                  <label class="radio-item">
-                    <input type="radio" name="visibilityRadio" value="公开可见" checked />
-                    <span><b>公开可见</b><i>所有人都能看到你的笔记</i></span>
-                  </label>
-                  <label class="radio-item">
-                    <input type="radio" name="visibilityRadio" value="仅自己可见" />
-                    <span><b>仅自己可见</b><i>只有你自己能看到</i></span>
-                  </label>
-                  <label class="radio-item">
-                    <input type="radio" name="visibilityRadio" value="仅互关好友可见" />
-                    <span><b>仅互关好友可见</b><i>仅相互关注的好友能看到</i></span>
-                  </label>
+                  <div class="xhs-row xhs-select-row" id="xhsVisibilityRow" tabindex="0" role="button" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="xhs-row-icon">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><circle cx="6" cy="4.8" r="2.3" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M1.8 13c0-2 1.9-3.5 4.2-3.5h1.4" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/><rect x="9.5" y="9" width="4.7" height="4" rx="1" fill="none" stroke="currentColor" stroke-width="1.1"/><path d="M10.6 9V7.8a1.3 1.3 0 012.6 0V9" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>
+                    </span>
+                    <span class="xhs-row-title" id="xhsVisibilityLabel">公开可见</span>
+                    <span class="xhs-row-arrow">
+                      <svg class="xhs-chevron" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </span>
+                    <div class="xhs-dropdown" id="xhsVisibilityMenu" hidden>
+                      <button type="button" class="xhs-dropdown-item" data-visibility="公开可见">公开可见</button>
+                      <button type="button" class="xhs-dropdown-item" data-visibility="仅自己可见">仅自己可见</button>
+                      <button type="button" class="xhs-dropdown-item" data-visibility="仅互关好友可见">仅互关好友可见</button>
+                    </div>
+                  </div>
                 </div>
-                <select id="visibility" class="hidden-select">
-                  <option>公开可见</option>
-                  <option>仅自己可见</option>
-                  <option>仅互关好友可见</option>
-                </select>
+              </div>
+
+              <!-- 保留给底层填页的隐藏字段 -->
+              <select id="visibility" class="hidden-select">
+                <option>公开可见</option>
+                <option>仅自己可见</option>
+                <option>仅互关好友可见</option>
+              </select>
+            </section>
+
+            <!-- 默认设置卡（长页面下方，设置一次长期沿用） -->
+            <section class="card">
+              <div class="card-head">
+                <h2 class="block-title">默认设置</h2>
+                <span class="muted">按当前 Chrome 账号保存，后续笔记自动沿用</span>
               </div>
 
               <div class="setting-group">
@@ -302,7 +514,7 @@
                 </select>
                 <div class="two-cols schedule-fields">
                   <label class="plain-field">
-                    <span>选择时间段</span>
+                    <span>选择时间段（来自常用时间段）</span>
                     <select id="scheduleWindow"></select>
                   </label>
                   <label class="plain-field">
@@ -312,45 +524,26 @@
                 </div>
               </div>
 
-              <label class="switch-line">
-                <input type="checkbox" id="originalChk" checked />
-                <span><b>声明原创</b><i>勾选后发布时自动开启原创保护</i></span>
-              </label>
-            </section>
-
-            <!-- 发布确认清单（默认折叠，点标题展开） -->
-            <section class="card checklist-card collapsed" id="checklistCard">
-              <button id="checklistToggle" class="card-head as-toggle" type="button">
-                <h2 class="block-title">发布确认清单</h2>
-                <span class="muted" id="checklistSummary">已折叠 · 确认入队后由后台串行提交</span>
-                <svg class="chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-              </button>
-              <ul id="checklist" class="checklist"></ul>
-            </section>
-
-            <!-- 默认设置卡（长页面下方，设置一次长期沿用） -->
-            <section class="card">
-              <div class="card-head">
-                <h2 class="block-title">默认设置</h2>
-                <span class="muted">按当前 Chrome 账号保存，后续笔记自动沿用</span>
-              </div>
-
               <div class="setting-group">
-                <div class="setting-label">本地话题模板（按账号保存）</div>
-                <label class="plain-field"><span>模板名称</span><input id="localTemplateName" placeholder="如：艺考照常用" /></label>
-                <label class="plain-field"><span>1–10 个话题，支持一次粘贴</span><textarea id="localTemplateTopics" rows="4" placeholder="#艺考照 #演员资料照&#10;也可每行一个话题"></textarea></label>
-                <div class="profile-actions"><button id="saveLocalTemplateBtn" class="ghost" type="button">保存此模板</button><button id="deleteLocalTemplateBtn" class="ghost" type="button">删除此模板</button></div>
-                <p id="localTemplateStatus" class="muted" role="status"></p>
-                <details><summary>平台模板名称（同步或手动填写）</summary><textarea id="topicTemplates" rows="3" placeholder="每行一个小红书平台已有模板名称"></textarea></details>
-                <button id="syncResourcesBtn" class="ghost" type="button">同步平台话题模板与合集</button>
-                <p id="resourcesStatus" class="muted" role="status">平台同步需要当前账号停留在发布编辑页；本地模板无需同步。</p>
+                <div class="setting-label">发布节奏（拟人化）</div>
+                <p class="muted explain">软件会把整条笔记的操作分摊到下面的时长区间里，不平均、带随机停顿，并模拟打错字后删改。批量任务按每条单独计算。</p>
+                <div class="two-cols schedule-fields">
+                  <label class="plain-field">
+                    <span>单条最短耗时（秒）</span>
+                    <input id="paceMin" type="number" min="15" max="600" value="40" />
+                  </label>
+                  <label class="plain-field">
+                    <span>单条最长耗时（秒）</span>
+                    <input id="paceMax" type="number" min="15" max="900" value="90" />
+                  </label>
+                </div>
+                <label class="plain-field">
+                  <span>单条绝对上限（秒，0 表示不额外限制）</span>
+                  <input id="paceCap" type="number" min="0" max="900" value="0" />
+                </label>
+                <label class="check-line small"><input type="checkbox" id="paceTest" /> 测试模式：快速填页（会明显更快，正式发布前请关闭）</label>
               </div>
 
-              <div class="setting-group">
-                <div class="setting-label">发布时间段（软件在区间内随机挑时间）</div>
-                <div id="scheduleWindowList" class="sw-list"></div>
-                <button id="addWindowBtn" class="mini-text ghost" type="button">+ 添加时间段</button>
-              </div>
             </section>
           </div>
         </div>
@@ -380,8 +573,17 @@
             </div>
             <label class="plain-field"><span>账号补充说明</span><textarea id="profileNotes" rows="4" placeholder="手动说明账号服务对象、语气、不能写什么等"></textarea></label>
             <label class="plain-field"><span>生成画像的资料来源</span><select id="profileSourceMode"><option value="recent">读取近 20 条笔记，并结合人工补充</option><option value="manual">只用手动填写的资料，不读取平台</option></select></label>
-            <div class="profile-actions"><button id="saveProfileBtn" class="primary" type="button">保存画像和提示词</button><button id="genProfileBtn" class="ghost" type="button">读取近20条并生成画像</button><span id="profileStatus" class="muted" role="status"></span></div>
+            <div class="profile-actions"><button id="saveProfileBtn" class="primary" type="button">保存画像和常用时间段</button><button id="genProfileBtn" class="ghost" type="button">读取近20条并生成画像</button><span id="profileStatus" class="muted" role="status"></span></div>
             <div id="profileBox" class="empty profile-box">尚未生成。生成后文案会按账号定位/赛道/受众自动定制（约需 1-2 分钟）。</div>
+            <div class="setting-group" id="commonWindowsGroup">
+              <div class="setting-label">常用发布时间段</div>
+              <p class="muted explain">每天自动发布或手动选择时间段时使用。可设置多个，例如上午 10:00-11:00、中午 12:00-13:00、晚上 20:00-22:00。自动发布会从这些时间段里选一个，并在其中随机取一个精确时间填入小红书的定时发布。</p>
+              <div id="scheduleWindowList" class="sw-list"></div>
+              <div class="profile-actions">
+                <button id="addWindowBtn" class="mini-text ghost" type="button">+ 添加时间段</button>
+                <span id="commonWindowStatus" class="muted" role="status"></span>
+              </div>
+            </div>
             <div class="setting-group"><div class="setting-label">文案提示词</div>
               <p class="muted explain">AI 生成时会自动附加当前账号已保存的画像、关键词和补充说明，再结合本组拍摄备注。修改后请先保存；本地模板文案不调用 AI。</p>
               <label class="plain-field"><span>当前账号已保存的画像信息</span><textarea id="profileApplied" rows="6" readonly></textarea></label>
@@ -599,24 +801,8 @@
       <button id="prefillPublishBtn" class="bottom-btn white" type="button">仅填入发布页</button>
       <button id="confirmManualPublishBtn" class="bottom-btn white" type="button" hidden>到笔记管理核验</button>
       <button id="discardManualPublishBtn" class="bottom-btn white" type="button" hidden>放弃待确认记录</button>
-      <button id="immediatePublishBtn" class="bottom-btn white" type="button">立即发布</button>
-      <button id="schedulePublishBtn" class="bottom-btn red" type="button">定时发布（入队）</button>
-    </div>
-
-    <!-- 定时入队弹窗 -->
-    <div id="scheduleDialog" class="modal" style="display:none">
-      <div class="dialog-box">
-        <h2>设置定时发布时间</h2>
-        <p class="muted dialog-hint">软件已按时间段与每日上限给出建议时间，可手动修改。</p>
-        <label class="plain-field">
-          <span>发布时间</span>
-          <input id="dialogTimeInput" type="datetime-local" />
-        </label>
-        <div class="dialog-actions">
-          <button id="dialogCancelBtn" class="ghost" type="button">取消</button>
-          <button id="dialogConfirmBtn" class="primary" type="button">确认入队，处理下一条</button>
-        </div>
-      </div>
+      <label class="sync-target"><input id="syncDouyin" type="checkbox">同步抖音</label><label class="sync-target"><input id="syncChannels" type="checkbox">同步视频号</label>
+      <button id="publishBtn" class="bottom-btn red" type="button">立即发布</button>
     </div>
 
     <!-- 大图预览弹窗 -->
@@ -631,9 +817,55 @@
       </div>
     </div>
 
-    <div id="runLog" class="run-log">等待操作（版本 2026.11.10）。</div>
+    <dialog id="templateDialog" class="template-dialog">
+      <div class="template-dialog-head">
+        <h2>话题模板</h2>
+        <button id="templateCloseBtn" class="icon-tool ghost" type="button" title="关闭" aria-label="关闭">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <p class="muted">最多 10 个模板，每个 1–10 个话题。点话题栏上方的模板按钮会一次性填入。</p>
+      <div class="template-dialog-actions">
+        <button id="templateReadPlatformBtn" class="ghost" type="button">从平台读取模板</button>
+        <button id="templateNewBtn" class="ghost" type="button">新建空白模板</button>
+      </div>
+      <div id="templateList" class="template-list"></div>
 
-    <script src="/static/app.js?v=2026.11.10-materials"></script>
-    <script src="/static/automation.js?v=2026.11.10-materials"></script>
+      <div id="templateImportPanel" class="template-import-panel" hidden>
+        <h3>平台读取结果</h3>
+        <p id="templateImportHint" class="muted"></p>
+        <div id="templateImportList"></div>
+        <button id="templateImportConfirmBtn" class="primary" type="button">导入选中的模板</button>
+      </div>
+
+      <div class="template-editor">
+        <label class="plain-field"><span>模板名称</span><input id="templateNameInput" maxlength="60" placeholder="如：艺考照" /></label>
+        <label class="plain-field"><span>话题（1–10 个，空格/逗号/换行分隔）</span><textarea id="templateTopicsInput" rows="3" placeholder="#艺考照 #演员资料照 #北京写真"></textarea></label>
+        <div class="profile-actions">
+          <button id="templateSaveBtn" class="primary" type="button">保存模板</button>
+          <button id="templateDeleteBtn" class="ghost" type="button">删除当前模板</button>
+        </div>
+      </div>
+      <p id="templateDialogStatus" class="muted" role="status"></p>
+      <p id="resourcesStatus" class="muted" role="status"></p>
+    </dialog>
+
+    <dialog id="accountMismatchDialog" class="template-dialog account-mismatch-dialog">
+      <div class="template-dialog-head"><h2>浏览器账号和软件记录不一致</h2></div>
+      <p id="accountMismatchText" class="muted"></p>
+      <label class="account-mismatch-snooze"><input type="checkbox" id="accountMismatchSnooze" /> 24 小时内不再提示（这段时间自动按浏览器里的账号同步）</label>
+      <div class="dialog-actions">
+        <button id="accountMismatchCancel" class="ghost" type="button">保留软件记录</button>
+        <button id="accountMismatchOk" class="primary" type="button">同步为浏览器里的账号</button>
+      </div>
+    </dialog>
+
+    <div id="runLog" class="run-log">等待操作（版本 2026.11.18）。</div>
+
+    <script src="/static/app.js?v=2026.11.18-distribution"></script>
+    <script src="/static/platforms.js?v=2026.11.19"></script>
+    <script src="/static/automation.js?v=2026.11.18"></script>
+    <link rel="stylesheet" href="/static/distribution.css?v=2026.11.19" />
+    <script src="/static/distribution.js?v=2026.11.19"></script>
   </body>
 </html>
