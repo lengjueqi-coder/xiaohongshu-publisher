@@ -2800,3 +2800,706 @@ index d14fbd5..67484a4 100644
  
  
  @dataclass
+diff --git a/extension/background.js b/extension/background.js
+index 67e7fb0..be2b3fc 100644
+--- a/extension/background.js
++++ b/extension/background.js
+@@ -47,7 +47,7 @@ async function connect() {
+ 
+   ws.onopen = () => {
+     console.log("[XHS Bridge] 已连接到 bridge server");
+-    socket.send(JSON.stringify({ role: "extension", client_id:clientId, caps:["app_open", "window_minimize", "platforms_v1"] }));
++    socket.send(JSON.stringify({ role: "extension", client_id:clientId, caps:["app_open", "window_minimize", "platforms_v1", "xhs_background_tabs", "platforms_background_v1"] }));
+     chrome.tabs.query({}).then(tabs => tabs.forEach(announcePair));
+   };
+ 
+@@ -85,6 +85,10 @@ async function handleCommand(msg) {
+   const { method, params = {} } = msg;
+ 
+   switch (method) {
++    case "xhs_owned_tab": {
++      const tab = await ownedXhsTab(params.scope, params.create === true);
++      return {id: tab.id};
++    }
+     case 'open_tab': {
+       const url=new URL(params.url);
+       if(!['www.xiaohongshu.com','xiaohongshu.com','creator.xiaohongshu.com'].includes(url.hostname)||url.protocol!=='https:')throw new Error('只允许打开小红书官方页');
+@@ -149,15 +153,18 @@ async function handleCommand(msg) {
+ 
+ // ───────────────────────── 导航 ─────────────────────────
+ 
+-async function cmdNavigate({ url }) {
+-  const tab = await getOrOpenXhsTab();
++async function cmdNavigate(params) {
++  const {url} = params;
++  if (!isXhsUrl(url)) throw new Error("只允许转到小红书官方页面");
++  const tab = await xhsTarget(params);
+   await chrome.tabs.update(tab.id, { url });
+   await waitForTabComplete(tab.id, url, 60000);
+   return null;
+ }
+ 
+-async function cmdWaitForLoad({ timeout = 60000 }) {
+-  const tab = await getOrOpenXhsTab();
++async function cmdWaitForLoad(params) {
++  const {timeout = 60000} = params;
++  const tab = await xhsTarget(params);
+   await waitForTabComplete(tab.id, null, timeout);
+   return null;
+ }
+@@ -245,10 +252,15 @@ async function cmdMinimizeWindow() {
+ 
+ // ───────────────────────── 截图 ─────────────────────────
+ 
+-async function cmdScreenshot() {
+-  const tab = await getOrOpenXhsTab();
+-  const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+-  return { data: dataUrl.split(",")[1] };
++async function cmdScreenshot(params) {
++  const tab = await xhsTarget(params);
++  const target = {tabId: tab.id};
++  await chrome.debugger.attach(target, "1.3");
++  try {
++    return await chrome.debugger.sendCommand(target, "Page.captureScreenshot", {format: "png"});
++  } finally {
++    await chrome.debugger.detach(target).catch(() => {});
++  }
+ }
+ 
+ // ───────────────────────── Cookies ─────────────────────────
+@@ -260,7 +272,7 @@ async function cmdGetCookies({ domain = "xiaohongshu.com" }) {
+ // ───────────────────────── MAIN world JS 执行 ─────────────────────────
+ 
+ async function cmdEvaluateInMainWorld(method, params) {
+-  const tab = params.tabId ? await chrome.tabs.get(Number(params.tabId)) : await getOrOpenXhsTab();
++  const tab = await xhsTarget(params);
+   if(!/^https:\/\/(?:(?:www|creator)\.)?xiaohongshu\.com\//.test(tab.url))throw new Error('读取目标不是小红书官方页面');
+   const results = await chrome.scripting.executeScript({
+     target: { tabId: tab.id },
+@@ -365,8 +377,9 @@ function mainWorldExecutor(method, params) {
+ 
+ // ───────────────────────── 文件上传（chrome.debugger + CDP） ─────────
+ 
+-async function cmdSetFileInputViaDebugger({ selector, files }) {
+-  const tab = await getOrOpenXhsTab();
++async function cmdSetFileInputViaDebugger(params) {
++  const {selector, files} = params;
++  const tab = await xhsTarget(params);
+   const target = { tabId: tab.id };
+ 
+   await chrome.debugger.attach(target, "1.3");
+@@ -389,8 +402,9 @@ async function cmdSetFileInputViaDebugger({ selector, files }) {
+ 
+ // ───────────────────────── 真实鼠标点击（chrome.debugger + CDP） ─────────
+ 
+-async function cmdTrustedClick({ x, y }) {
+-  const tab = await getOrOpenXhsTab();
++async function cmdTrustedClick(params) {
++  const {x, y} = params;
++  const tab = await xhsTarget(params);
+   const target = { tabId: tab.id };
+ 
+   await chrome.debugger.attach(target, "1.3");
+@@ -408,7 +422,7 @@ async function cmdTrustedClick({ x, y }) {
+ // ───────────────────────── DOM 操作（MAIN world） ────────────────────
+ 
+ async function cmdDomInMainWorld(method, params) {
+-  const tab = await getOrOpenXhsTab();
++  const tab = await xhsTarget(params);
+   const results = await chrome.scripting.executeScript({
+     target: { tabId: tab.id },
+     world: "MAIN",
+@@ -683,19 +697,51 @@ function domExecutor(method, params) {
+ 
+ // ───────────────────────── Tab 管理 ─────────────────────────
+ 
+-async function getOrOpenXhsTab() {
+-  const tabs = await chrome.tabs.query({
+-    url: [
+-      "https://www.xiaohongshu.com/*",
+-      "https://xiaohongshu.com/*",
+-      "https://creator.xiaohongshu.com/*",
+-    ],
+-  });
+-  if (tabs.length > 0) return tabs[0];
+-  // 没有已打开的 XHS 页面，新建一个
+-  const tab = await chrome.tabs.create({ url: "https://www.xiaohongshu.com/" });
+-  await waitForTabComplete(tab.id, null, 30000);
+-  return tab;
++function isXhsUrl(url) {
++  try {
++    return ["https://creator.xiaohongshu.com", "https://www.xiaohongshu.com", "https://xiaohongshu.com"].includes(new URL(url).origin);
++  } catch {
++    return false;
++  }
++}
++
++const XHS_START_PAGES = {
++  publish: "https://creator.xiaohongshu.com/publish/publish?source=official",
++  management: "https://creator.xiaohongshu.com/new/note-manager",
++  browse: "https://www.xiaohongshu.com/explore"
++};
++const creatingXhsTab = new Map();
++
++async function ownedXhsTab(scope, create) {
++  if (!Object.hasOwn(XHS_START_PAGES, scope)) throw new Error("未知的小红书工作页");
++  const key = "xhsTab:" + scope;
++  const id = (await chrome.storage.session.get(key))[key];
++  const tab = id && await chrome.tabs.get(id).catch(() => null);
++  if (tab && isXhsUrl(tab.pendingUrl || tab.url)) return tab;
++  if (!create) throw new Error("原小红书后台工作页已关闭或已跳转，请重新填入并核对");
++  if (!creatingXhsTab.has(scope)) {
++    creatingXhsTab.set(scope, (async () => {
++      const created = await chrome.tabs.create({url: XHS_START_PAGES[scope], active: false});
++      await waitForTabComplete(created.id, null, 30000);
++      await chrome.storage.session.set({[key]: created.id});
++      return await chrome.tabs.get(created.id);
++    })().finally(() => creatingXhsTab.delete(scope)));
++  }
++  return await creatingXhsTab.get(scope);
++}
++
++async function xhsTarget(params) {
++  if (params.scope) {
++    const tab = await ownedXhsTab(params.scope, false);
++    if (tab.id !== params.tabId) throw new Error("小红书后台工作页已变化，请重新核对");
++    return tab;
++  }
++  if (params.tabId) {
++    const tab = await chrome.tabs.get(params.tabId);
++    if (!isXhsUrl(tab.pendingUrl || tab.url)) throw new Error("当前标签不是小红书官方页");
++    return tab;
++  }
++  return await ownedXhsTab("browse", true);
+ }
+ 
+ // ───────────────────────── 启动 ─────────────────────────
+@@ -704,6 +750,29 @@ connect();
+ 
+ // Explicit tab routing prevents one platform or Chrome profile from taking over another.
+ const PLATFORM_ORIGINS = {workbench:'http://127.0.0.1:5818',douyin:'https://creator.douyin.com',channels:'https://channels.weixin.qq.com'};
++const platformSessions = new Map();
++
++async function releasePlatformSession(tabId, session) {
++  const entry = platformSessions.get(tabId);
++  if (!entry || entry.token !== session) return;
++  clearTimeout(entry.timer);
++  try {
++    await chrome.debugger.detach({tabId});
++  } finally {
++    if (platformSessions.get(tabId) === entry) platformSessions.delete(tabId);
++  }
++}
++
++function keepPlatformSession(tabId, entry) {
++  clearTimeout(entry.timer);
++  entry.timer = setTimeout(() => releasePlatformSession(tabId, entry.token).catch(()=>{}), 90000);
++}
++
++chrome.debugger.onDetach.addListener(({tabId}) => {
++  clearTimeout(platformSessions.get(tabId)?.timer);
++  platformSessions.delete(tabId);
++});
++
+ async function platformCommand(p) {
+   const origin = PLATFORM_ORIGINS[p.platform];
+   if (!origin) throw new Error('不支持的平台');
+@@ -711,15 +780,49 @@ async function platformCommand(p) {
+   if (p.action === 'tabs') {
+     return (await chrome.tabs.query({})).filter(owns).map(t=>({id:t.id,url:t.url.split('?')[0],title:t.title,active:t.active}));
+   }
+-  if (p.action === 'open') {
++  if (p.action === 'open' || p.action === 'open_background') {
+     const url = p.url || origin;
+     if (new URL(url).origin !== origin) throw new Error('发布地址不属于所选平台');
+-    const tab = await chrome.tabs.create({url,active:true});
++    const tab = await chrome.tabs.create({url,active:p.action === 'open'});
+     await waitForTabComplete(tab.id,null,30000);
+     return {id:tab.id};
+   }
+   const tab = await chrome.tabs.get(Number(p.tab_id));
++  if (p.action === 'background_end') {
++    await releasePlatformSession(tab.id, p.session);
++    return true;
++  }
+   if (!owns(tab)) throw new Error('官方标签页已经关闭或切换了平台，请重新连接');
++  const target = {tabId:tab.id};
++  const entry = platformSessions.get(tab.id);
++  if (p.action === 'background_begin') {
++    if (!p.session || entry) throw new Error('官方发布页已有后台操作，请稍后重试');
++    await chrome.debugger.attach(target, '1.3');
++    const session = {token:p.session};
++    platformSessions.set(tab.id, session);
++    keepPlatformSession(tab.id, session);
++    try {
++      await chrome.debugger.sendCommand(target, 'Emulation.setFocusEmulationEnabled', {enabled:true});
++      const measure = () => chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
++        expression:'innerWidth >= 1100 && innerHeight >= 650', returnByValue:true
++      });
++      if (!(await measure()).result.value) {
++        await chrome.debugger.sendCommand(target, 'Emulation.setDeviceMetricsOverride', {
++          width:1440, height:900, deviceScaleFactor:0, mobile:false
++        });
++        if (!(await measure()).result.value) throw new Error('当前官方标签页无法获得足够的后台视口');
++      }
++      return true;
++    } catch (error) {
++      await releasePlatformSession(tab.id, p.session);
++      throw error;
++    }
++  }
++  if (p.session && entry?.token !== p.session) throw new Error('后台标签页会话已中断，请重新核对');
++  if (entry) {
++    if (!p.session) throw new Error('官方发布页正在后台操作');
++    keepPlatformSession(tab.id, entry);
++  }
+   if (p.action === 'focus') {
+     await chrome.tabs.update(tab.id,{active:true});
+     await chrome.windows.update(tab.windowId,{focused:true});
+@@ -733,8 +836,7 @@ async function platformCommand(p) {
+     if (!r || r.error) throw new Error(r?.error || '页面未返回结果');
+     return r.value;
+   }
+-  const target={tabId:tab.id};
+-  await chrome.debugger.attach(target,'1.3');
++  if (!entry) await chrome.debugger.attach(target,'1.3');
+   try {
+     if (p.action === 'click') {
+       const point={x:Number(p.x),y:Number(p.y),button:'left',clickCount:1};
+@@ -765,5 +867,5 @@ async function platformCommand(p) {
+       return true;
+     }
+     throw new Error('不支持的页面操作');
+-  } finally {await chrome.debugger.detach(target).catch(()=>{});}
++  } finally {if (!entry) await chrome.debugger.detach(target).catch(()=>{});}
+ }
+diff --git a/scripts/cli.py b/scripts/cli.py
+index 178800b..d1f5b35 100644
+--- a/scripts/cli.py
++++ b/scripts/cli.py
+@@ -140,6 +140,13 @@ def _connect(args: argparse.Namespace):
+     from xhs.bridge import BridgePage
+ 
+     bridge_url = getattr(args, "bridge_url", "ws://localhost:9333")
++    command = getattr(args, "command", "")
++    new_publish = command in {"publish", "publish-video", "fill-publish", "fill-publish-video", "long-article"}
++    resume_publish = command in {"click-publish", "save-draft", "select-template", "next-step"}
++    if new_publish or resume_publish:
++        expected = os.environ.get("XHS_EXPECTED_PUBLISH_TAB")
++        return _DummyBrowser(), BridgePage(bridge_url, scope="publish", create=new_publish,
++                                           expected_tab=int(expected) if expected else None)
+     _ensure_bridge_ready(bridge_url)
+     return _DummyBrowser(), BridgePage(bridge_url)
+ 
+@@ -571,7 +578,7 @@ def cmd_fill_publish(args: argparse.Namespace) -> None:
+ 
+     browser, page = _connect(args)
+     try:
+-        fill_publish_form(
++        image_refs = fill_publish_form(
+             page,
+             PublishImageContent(
+                 title=title,
+@@ -588,7 +595,7 @@ def cmd_fill_publish(args: argparse.Namespace) -> None:
+                 shooting_location=args.shooting_location or "",
+             ),
+         )
+-        _output({"success": True, "title": title, "images": len(image_paths), "status": "表单已填写，等待确认发布"})
++        _output({"success": True, "title": title, "images": len(image_paths), "native_image_refs": image_refs, "work_tab_id": page.tab_id, "status": "表单已填写，等待确认发布"})
+     finally:
+         browser.close()
+ 
+@@ -616,7 +623,7 @@ def cmd_fill_publish_video(args: argparse.Namespace) -> None:
+                 visibility=args.visibility or "",
+             ),
+         )
+-        _output({"success": True, "title": title, "video": args.video, "status": "视频表单已填写，等待确认发布"})
++        _output({"success": True, "title": title, "video": args.video, "work_tab_id": page.tab_id, "status": "视频表单已填写，等待确认发布"})
+     finally:
+         browser.close()
+ 
+diff --git a/scripts/xhs/bridge.py b/scripts/xhs/bridge.py
+index 8e89d99..ecadbb5 100644
+--- a/scripts/xhs/bridge.py
++++ b/scripts/xhs/bridge.py
+@@ -24,16 +24,37 @@ BRIDGE_URL = "ws://localhost:9333"
+ class BridgePage:
+     """与 CDP Page 接口兼容的 Extension Bridge 实现。"""
+ 
+-    def __init__(self, bridge_url: str = BRIDGE_URL) -> None:
++    def __init__(self, bridge_url: str = BRIDGE_URL, *, scope="browse", create=True, expected_tab=None) -> None:
+         self._bridge_url = bridge_url
++        self.scope = scope
++        self.create = create
++        self.tab_id = None
++        self.expected_tab = expected_tab
++        self.client_id = os.environ.get("XHS_BRIDGE_CLIENT")
+ 
+     # ─── 内部通信 ───────────────────────────────────────────────
+ 
+     def _call(self, method: str, params: dict | None = None) -> Any:
++        if method == "get_cookies":
++            return self._request(method, params)
++        if self.tab_id is None:
++            status = self._request("ping_server") or {}
++            clients = status.get("clients") or []
++            self.client_id = self.client_id or status.get("selected_client") or (clients[0] if len(clients) == 1 else None)
++            if "xhs_background_tabs" not in (status.get("capabilities") or {}).get(self.client_id, []):
++                raise CDPError("请在对应 Chrome 用户资料的 chrome://extensions 重新加载 XHS Bridge，连接新版后台工作页")
++            binding = self._request("xhs_owned_tab", {"scope": self.scope, "create": self.create})
++            self.tab_id = binding["id"]
++            if self.expected_tab is not None and self.tab_id != self.expected_tab:
++                self.tab_id = None
++                raise CDPError("小红书核对过的后台标签已变化，请重新填写并核对")
++        return self._request(method, {**(params or {}), "scope": self.scope, "tabId": self.tab_id})
++
++    def _request(self, method: str, params: dict | None = None) -> Any:
+         """向 bridge server 发送一条命令并等待结果。"""
+         msg: dict[str, Any] = {"role": "cli", "method": method}
+-        if os.environ.get("XHS_BRIDGE_CLIENT"):
+-            msg["client_id"] = os.environ["XHS_BRIDGE_CLIENT"]
++        if self.client_id:
++            msg["client_id"] = self.client_id
+         if params:
+             msg["params"] = params
+         try:
+diff --git a/scripts/xhs/image_previews.js b/scripts/xhs/image_previews.js
+new file mode 100644
+index 0000000..497f4b2
+--- /dev/null
++++ b/scripts/xhs/image_previews.js
+@@ -0,0 +1,20 @@
++(() => {
++  const rows = [...document.querySelectorAll('.img-preview-area .pr')].filter(
++    row => row.getBoundingClientRect().width && getComputedStyle(row).visibility !== 'hidden'
++  );
++  return rows.map(row => {
++    const image = row.querySelector('img:not([class*="icon"])');
++    let source = image?.currentSrc || image?.src;
++    if (!source) {
++      for (const el of [row, ...row.querySelectorAll('[style*="background"]')]) {
++        const match = /^url\(["']?(.*?)["']?\)$/.exec(getComputedStyle(el).backgroundImage);
++        if (match) { source = match[1]; break; }
++      }
++    }
++    if (!source) return '';
++    // Keep long data URLs and signed media URLs inside the page.
++    const ids = window.__xhsAssistantPreviewIds ||= new Map();
++    if (!ids.has(source)) ids.set(source, crypto.randomUUID());
++    return ids.get(source);
++  });
++})()
+diff --git a/scripts/xhs/publish.py b/scripts/xhs/publish.py
+index 2171746..c16667f 100644
+--- a/scripts/xhs/publish.py
++++ b/scripts/xhs/publish.py
+@@ -56,7 +56,7 @@ def publish_image_content(page: Page, content: PublishImageContent) -> None:
+     click_publish_button(page)
+ 
+ 
+-def fill_publish_form(page: Page, content: PublishImageContent) -> None:
++def fill_publish_form(page: Page, content: PublishImageContent) -> list[str]:
+     """填写图文发布表单，不点击发布按钮。
+ 
+     Args:
+@@ -78,16 +78,16 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
+     # 导航到发布页
+     _navigate_to_publish_page(page)
+ 
+-    # 清空可能残留的草稿/上一次发布内容，保证这次填表是从干净状态开始
+-    _clear_publish_page(page)
++    require_empty_publish_page(page)
+ 
+     # 点击"上传图文" TAB
+     _click_publish_tab(page, "上传图文")
+     sleep_random(700, 1400)
++    require_empty_publish_page(page)
+     pacer.checkpoint("tab")
+ 
+     # 上传图片
+-    _upload_images(page, content.image_paths, pacer)
++    image_refs = _upload_images(page, content.image_paths, pacer)
+     pacer.checkpoint("images")
+ 
+     # 标签截取
+@@ -127,6 +127,7 @@ def fill_publish_form(page: Page, content: PublishImageContent) -> None:
+         pacer,
+     )
+     pacer.finish()
++    return image_refs
+ 
+ 
+ def _publish_page_state(page: Page, initial_url: str) -> dict:
+@@ -251,6 +252,11 @@ def save_as_draft(page: Page) -> None:
+ 
+ def _navigate_to_publish_page(page: Page) -> None:
+     """导航到发布页面。"""
++    if getattr(page, "scope", None) == "publish":
++        editing = page.evaluate("""location.origin === 'https://creator.xiaohongshu.com'
++            && location.pathname.startsWith('/publish/') && new URL(location.href).searchParams.get('published') !== 'true'""")
++        if editing:
++            require_empty_publish_page(page)
+     page.navigate(PUBLISH_URL)
+     page.wait_for_load(timeout=300)
+     sleep_random(2400, 3800)
+@@ -258,106 +264,18 @@ def _navigate_to_publish_page(page: Page) -> None:
+     sleep_random(1600, 2600)
+ 
+ 
+-def _clear_publish_page(page: Page) -> None:
+-    """Clear any pre-existing content on the creator publish page so that
+-    a fresh fill never collides with drafts or carry-over state from the
+-    previous submission."""
+-    logger.info("清理发布页残留内容")
+-    try:
+-        # 1. Close any lingering modal / popover dialog first.
+-        page.evaluate(
+-            """
+-            (() => {
+-                const closeKeys = ['暂存', '离开', '取消', '关闭'];
+-                const realClick = (el) => {
+-                    el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+-                    el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+-                    el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+-                };
+-                const candidates = Array.from(document.querySelectorAll('button, [role="button"], span'));
+-                for (const key of ['暂存离开', '离开', '保存并离开', '取消']) {
+-                    const match = candidates.find(el => (el.innerText || '').trim() === key);
+-                    if (match) { realClick(match); return 'modal-closed'; }
+-                }
+-                // dismiss any visible popovers / toasts by clicking outside
+-                return 'no-modal';
+-            })()
+-            """
+-        )
+-        sleep_random(400, 800)
+-
+-        # 2. Remove all uploaded images (click the × on each preview).
+-        removed = 0
+-        for _ in range(30):
+-            clicked = page.evaluate(
+-                """
+-                (() => {
+-                    const previews = Array.from(document.querySelectorAll('.img-preview-area .pr, .img-preview-area .img-preview-item, .pr.img-preview-item'));
+-                    for (const p of previews) {
+-                        const del = p.querySelector('button[aria-label*="删除"], button[class*="delete"], .icon-delete, [class*="close"], [class*="remove"]');
+-                        if (del) {
+-                            del.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+-                            del.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+-                            del.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+-                            return true;
+-                        }
+-                    }
+-                    return false;
+-                })()
+-                """
+-            )
+-            if clicked:
+-                removed += 1
+-                sleep_random(200, 400)
+-            else:
+-                break
+-        logger.info("已清理 %d 张残留图片", removed)
+-
+-        # 3. Clear title input.
+-        page.evaluate(
+-            f"""
+-            (() => {{
+-                const el = document.querySelector({json.dumps(TITLE_INPUT)});
+-                if (el) {{
+-                    const proto = Object.getPrototypeOf(el);
+-                    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+-                    if (desc && desc.set) {{ desc.set.call(el, ''); }} else {{ el.value = ''; }}
+-                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+-                }}
+-            }})()
+-            """
+-        )
+-
+-        # 4. Clear content editable.
+-        page.evaluate(
+-            """
+-            (() => {
+-                const el = document.querySelector('.ql-editor, [contenteditable="true"][class*="editor"], .publish-content-editor');
+-                if (el) { el.innerHTML = ''; el.dispatchEvent(new InputEvent('input', {bubbles: true, data: ''})); }
+-            })()
+-            """
+-        )
+-
+-        # 5. Turn off schedule toggle if it's on (we'll re-enable it below if needed).
+-        try:
+-            page.evaluate(
+-                """
+-                (() => {
+-                    const sw = document.querySelector('.post-time-wrapper .d-switch, [class*="post-time"] .d-switch');
+-                    if (sw && sw.querySelector('input[type="checkbox"]')?.checked) {
+-                        sw.click();
+-                    }
+-                })()
+-                """
+-            )
+-        except Exception:
+-            pass
+-
+-        sleep_random(300, 600)
+-        logger.info("发布页清理完成")
+-    except Exception as exc:
+-        logger.warning("清理发布页时出错，继续执行填表: %s", exc)
++def require_empty_publish_page(page: Page) -> None:
++    """Stop when the official page has restored an existing draft."""
++    occupied = page.evaluate(r"""(() => {
++        const title = document.querySelector('input[placeholder*="标题"], .d-input input');
++        const body = document.querySelector('.ql-editor,.tiptap.ProseMirror,.publish-content-editor');
++        const media = document.querySelector('.img-preview-area .pr,.img-preview-item,.video-preview video[src],video[src^="blob:"]');
++        const dialog = [...document.querySelectorAll('[role=dialog],.d-modal,.d-dialog')]
++            .some(e => e.getClientRects().length && /恢复草稿|离开编辑|暂存离开/.test(e.innerText));
++        return Boolean(title?.value.trim() || body?.innerText.replace(/[\s\u200b\ufeff]/g,'') || media || dialog);
++    })()""")
++    if occupied is not False:
++        raise PublishError("小红书工作页已有草稿或素材，请手动核对并打开空白发布页")
+ 
+ 
+ def _click_publish_tab(page: Page, tab_name: str) -> None:
+@@ -453,7 +371,26 @@ def _remove_pop_cover(page: Page) -> None:
+ # ========== 图片上传 ==========
+ 
+ 
+-def _upload_images(page: Page, image_paths: list[str], pacer=None) -> None:
++def _image_input_selector(page: Page, first: bool) -> str:
++    # The creator replaces the initial input after the first upload. Only the
++    # gallery accepts multiple images; the separate cover input accepts one.
++    selector = page.evaluate(r"""(() => {
++        const inputs = [...document.querySelectorAll('input[type="file"]:not(:disabled)')];
++        const acceptsImages = e => /image\/|\.(?:jpe?g|png|webp)(?:\s*,|$)/i.test(e.accept);
++        const batch = inputs.filter(e => e.multiple && acceptsImages(e));
++        const initial = inputs.filter(e => e.matches('.upload-input') && (!e.accept || acceptsImages(e)));
++        const matches = batch.length ? batch : (FIRST ? initial : []);
++        if (matches.length !== 1) return '';
++        const token = crypto.randomUUID();
++        matches[0].setAttribute('data-xhs-gallery-input', token);
++        return '[data-xhs-gallery-input="' + token + '"]';
++    })()""".replace('FIRST', 'true' if first else 'false'))
++    if not selector:
++        raise PublishError("无法确认唯一的图文上传控件，请检查官方页面")
++    return selector
++
++
++def _upload_images(page: Page, image_paths: list[str], pacer=None) -> list[str]:
+     """逐张上传图片。
+ 
+     一次性把整组文件塞进 input 会留下很明显的机器特征：平台看到的是"瞬间选完
+@@ -462,32 +399,32 @@ def _upload_images(page: Page, image_paths: list[str], pacer=None) -> None:
+     import os
+ 
+     valid_paths = [p for p in image_paths if os.path.exists(p)]
+-    if not valid_paths:
++    if not valid_paths or len(valid_paths) != len(image_paths):
+         raise PublishError("没有有效的图片文件")
+ 
+-    find_input_js = """
+-        (() => {
+-            const preferred = document.querySelector('.upload-input');
+-            const inputs = Array.from(document.querySelectorAll('input[type="file"]'))
+-                .filter(el => !el.disabled && (!el.accept || /image|jpg|jpeg|png|webp/i.test(el.accept)));
+-            const target = preferred || inputs[0];
+-            if (!target) return 0;
+-            return target.multiple ? 2 : 1;
+-        })()
+-    """
+-
+-    multiple = page.evaluate(find_input_js)
+-    if not multiple:
+-        raise PublishError("上传区域未找到可用的文件输入框，请检查发布页是否加载完整")
+-
++    from pathlib import Path
++    read_refs = Path(__file__).with_name("image_previews.js").read_text(encoding="utf-8")
++    image_refs = []
+     for i, path in enumerate(valid_paths):
+         logger.info("上传第 %d 张图片: %s", i + 1, path)
+-        page.set_file_input(".upload-input", [path])
++        page.set_file_input(_image_input_selector(page, first=i==0), [path])
+         _wait_for_upload_complete(page, i + 1)
++        deadline = time.monotonic() + 15
++        while True:
++            refs = page.evaluate(read_refs)
++            if isinstance(refs, list) and len(refs) == i + 1 and all(refs):
++                if refs[:-1] != image_refs:
++                    raise PublishError("已上传的小红书图片或顺序发生变化")
++                image_refs = refs
++                break
++            if time.monotonic() >= deadline:
++                raise PublishError("无法逐张识别小红书图片预览，请检查上传结果")
++            time.sleep(.3)
+         # 看完上一张的缩略图再选下一张
+         sleep_random(1200, 3000)
+         if pacer is not None and i and i % 3 == 0:
+             pacer.checkpoint(f"upload-{i}", weight=0.5)
++    return image_refs
+ 
+ 
+ def _wait_for_upload_complete(page: Page, expected_count: int) -> None:
+diff --git a/scripts/xhs/publish_video.py b/scripts/xhs/publish_video.py
+index 387c0d3..d895b82 100644
+--- a/scripts/xhs/publish_video.py
++++ b/scripts/xhs/publish_video.py
+@@ -6,6 +6,7 @@ import logging
+ import json
+ import os
+ import time
++from pathlib import Path
+ 
+ from .cdp import Page
+ from .errors import PublishError, UploadTimeoutError
+@@ -14,6 +15,7 @@ from .publish import (
+     _find_content_element,
+     _input_tags,
+     _navigate_to_publish_page,
++    require_empty_publish_page,
+     _set_schedule_publish,
+     _set_visibility,
+ )
+@@ -59,10 +61,12 @@ def fill_publish_video_form(page: Page, content: PublishVideoContent) -> None:
+ 
+     # 导航到发布页
+     _navigate_to_publish_page(page)
++    require_empty_publish_page(page)
+ 
+     # 点击"上传视频" TAB
+     _click_publish_tab(page, "上传视频")
+     time.sleep(1)
++    require_empty_publish_page(page)
+ 
+     # 上传视频
+     _upload_video(page, content.video_path)
+@@ -101,14 +105,15 @@ def _upload_video(page: Page, video_path: str) -> None:
+ 
+     # The publish button can stay disabled until title/body/cover are filled.
+     # Upload readiness must not depend on that final submission control.
++    preview_js = Path(__file__).with_name("video_preview.js").read_text(encoding="utf-8").strip()
+     start = time.monotonic()
+     while time.monotonic() - start < 180:
+         state = page.evaluate("""(() => {
+           const visible=e=>e&&e.getBoundingClientRect().width>0;
+-          const v=[...document.querySelectorAll('video')].find(e=>visible(e)&&e.readyState>=1&&e.duration>0);
++          const v=VIDEO_PREVIEW;
+           const errors=[...document.querySelectorAll('[role=alert],.d-toast,.d-message')].filter(visible).map(e=>e.innerText).filter(t=>/上传失败|视频格式|转码失败|安全验证|请先登录/.test(t));
+           return {ready:!!v&&!!document.querySelector('div.d-input input'),errors};
+-        })()""")
++        })()""".replace("VIDEO_PREVIEW", preview_js))
+         if state.get('errors'):raise PublishError('视频上传异常：'+'；'.join(state['errors']))
+         if state.get('ready'):break
+         time.sleep(1)
+diff --git a/scripts/xhs/video_preview.js b/scripts/xhs/video_preview.js
+new file mode 100644
+index 0000000..45d8f3e
+--- /dev/null
++++ b/scripts/xhs/video_preview.js
+@@ -0,0 +1,7 @@
++(() => {
++  const inEditor = [...document.querySelectorAll('.publish-video-container video.exact-video')];
++  const candidates = inEditor.length ? inEditor : [...document.querySelectorAll('video')].filter(v => v.getBoundingClientRect().width > 0);
++  const ready = candidates.filter(v => (v.currentSrc || v.src) && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0 && v.videoWidth > 0);
++  if (ready.length !== 1) return null;
++  return {src: ready[0].currentSrc || ready[0].src, duration: ready[0].duration};
++})()

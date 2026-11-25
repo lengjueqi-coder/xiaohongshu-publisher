@@ -55,6 +55,29 @@ class DurableBatches(unittest.TestCase):
         first=self.create();self.image.write_bytes(b'changed by editor')
         second=self.create()
         self.assertEqual(first['id'],second['id']);frozen=Path(first['steps'][0]['payload']['files'][0]);self.assertEqual(frozen.read_bytes(),b'original')
+
+    def test_sync_preserves_reviewed_files_through_directory_alias(self):
+        import server
+        from PIL import Image
+        alias=self.root/'alias'
+        stage=self.root/'staging'
+        stage.mkdir()
+        alias.symlink_to(stage,target_is_directory=True)
+        self.app.APP_ROOT=alias
+        self.app.require_active_profile=lambda draft:'profile'
+        self.app.account_identity=lambda profile:{'user_id':'xhs-one'}
+        self.app.validate_note_image_count=server.validate_note_image_count
+        self.app.freeze_payload=server.freeze_payload
+        Image.new('RGB',(8,8),'white').save(self.image)
+        draft={'images':[str(self.image)],'title':'标题','content':'正文','tags':[]}
+        with patch.object(server,'account_setting',side_effect=lambda key,default=None,profile_dir=None:default):
+            result=self.service.create({'request_id':'aliased','sync_from':'xhs','prepare_only':True,
+                'targets':{'xhs':{'media_type':'image','payload':draft},'douyin':self.payload}})
+        xhs,dy=result['batches'][0]['steps']
+        frozen=xhs['payload']['payload']
+        server.verify_frozen_images(frozen)
+        self.assertEqual(frozen['images'],dy['payload']['files'])
+        self.assertEqual(list((alias/'data'/'distribution'/xhs['batch_id']).glob('*.jpg')),[])
     def test_restart_does_not_repeat_inflight_click(self):
         item=self.create(paused=False);self.service.set_step(item['id'],'douyin','submitting')
         restarted=DistributionService(self.app,self.pub)
@@ -97,10 +120,17 @@ class DurableBatches(unittest.TestCase):
         self.assertEqual(self.service.snapshot(batch_id=item['id'])['batches'][0]['state'],'attention')
 
     def test_official_reconciliation_retains_work_id_and_completes_batch(self):
-        item=self.create();self.service.set_step(item['id'],'douyin','submitted')
+        item=self.create();self.service.set_step(item['id'],'douyin','submitted',receipt='attempt')
+        with self.app.db_connection() as db:
+            db.execute('CREATE TABLE platform_attempts (receipt TEXT, created_at REAL)')
+        with self.assertRaisesRegex(ValueError,'实际提交时间'):
+            self.service.reconcile(item['id'],'douyin')
+        with self.app.db_connection() as db:
+            db.execute('INSERT INTO platform_attempts VALUES (?,?)',('attempt',123456))
         self.pub.read_result.return_value={'status':'published','message':'official match','work_id':'actual-work-id'}
         r=self.service.reconcile(item['id'],'douyin')['batches'][0]
         self.assertEqual(r['state'],'published');self.assertEqual(r['steps'][0]['result']['work_id'],'actual-work-id')
+        self.assertEqual(self.pub.read_result.call_args.args[2],123456)
         self.pub.submit.assert_not_called()
 
 class VisionProtocols(unittest.TestCase):
@@ -231,6 +261,13 @@ class DailyPlanChecks(unittest.TestCase):
 
 
 class XHSReadbackChecks(unittest.TestCase):
+    def test_title_cannot_prove_review_state_or_privacy(self):
+        from publish_checks import match_receipt
+        for title in ['已发布','审核中','仅自己可见','定时发布','草稿']:
+            card={'title':title,'text':title+'\n2026-11-18 23:50','time':'2026-11-18 23:50'}
+            result=match_receipt([card],{'title':title,'receipt_reference_time':'2026-11-18T23:50'})
+            self.assertEqual(result['status'],'unconfirmed')
+
     def test_published_filter_and_stable_note_id_confirm_private_publication(self):
         from publish_checks import match_receipt
         row={'title':'视频验证','text':'仅自己可见\n视频验证\n2026-11-18 23:50\n0','private':True,'time':'2026-11-18 23:50','note_id':'a'*24,'published_context':True}

@@ -62,14 +62,15 @@
       }
       if(action==='publish'){
         const targets=[...s.targets];if(!targets.length){s.message='请选择分发平台。';render();return;}
+        const profile=state.activeProfile;
         const frozen=Object.fromEntries(targets.map(t=>[t,payload(t)]));
         run(async()=>{
           const accounts=await call('tabs');if(accounts.bindings)s.bindings=accounts.bindings;
-          const summary=targets.map(t=>{const d=t==='xhs'?frozen[t].payload:frozen[t];const visibility=t==='xhs'?d.visibility:({public:'公开',private:'仅自己可见',friends:'好友可见'}[d.visibility]);const b=s.bindings[t];return names[t]+' · '+(t==='xhs'?(state.accountIdentity?.nickname||d.profile_dir):(b?.account||'尚未连接'))+' · '+(b?.account_id||'')+' · '+visibility+(d.publish_mode==='scheduled'?' · 北京时间 '+d.schedule_time:' · 立即发布');});
+          if(profile!==state.activeProfile)throw Error('账号已切换，请重新核对这份稿件。');
+          const reviewed=reviewAccounts(targets,s.bindings,profile);
+          const summary=targets.map(t=>{const d=t==='xhs'?frozen[t].payload:frozen[t];const visibility=t==='xhs'?d.visibility:({public:'公开',private:'仅自己可见',friends:'好友可见'}[d.visibility]);return [names[t],reviewed[t].account,reviewed[t].account_id,visibility,d.publish_mode==='scheduled'?'北京时间 '+d.schedule_time:'立即发布'].join(' · ');});
           if(!window.confirm('确认发布这一份内容？\n'+summary.join('\n')+'\n\n确认后由后台执行；关闭工作台可在分发记录恢复查看。'))return;
-          const requestId=crypto.randomUUID();
-          const r=await fetch('/api/distribution/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile_dir:state.activeProfile,request_id:requestId,targets:frozen})});
-          const result=await r.json();if(!r.ok)throw Error(result.error||'分发任务创建失败');
+          const result=await createReviewed({profile_dir:profile,targets:frozen,expected_accounts:accountIds(reviewed)},false);
           s.message='已保存后台分发任务 '+result.batches[0].id.slice(0,8)+'，请在分发记录查看逐个平台的结果。';
           window.distributionUI?.showRecords();
         });return;
@@ -93,7 +94,29 @@
   function suspend(){$('pagePlatforms').hidden=true;$('appShell').classList.remove('platform-view');}
   function select(platform){if(s.busy)return;document.body.dataset.publishingPlatform=platform;if(platform==='xhs'){s.active='';suspend();$('platformBtn').querySelector('.xhs-badge').textContent='小红书';showView('publish');}else{const previous=s.active;s.active=platform;if(s.targets.size===1&&(!previous||s.targets.has(previous)))s.targets=new Set([platform]);$('platformBtn').querySelector('.xhs-badge').textContent=names[platform];show();refresh().then(render).catch(e=>{s.message=e.message;render();});}$('platformMenu').style.display='none';document.querySelectorAll('[data-platform]').forEach(e=>e.classList.toggle('active',e.dataset.platform===platform));}
   let xhsVideo = '';
-  let pendingRequest = null;
+  function reviewAccounts(targets,bindings,profile){
+    const identity=state.accounts.find(a=>a.dir===profile)?.identity;
+    return Object.fromEntries(targets.map(t=>{
+      const account=t==='xhs'?{account:identity?.nickname,account_id:identity?.user_id}:bindings[t];
+      if(!account?.account_id)throw Error('请先核实'+names[t]+'的发布账号');
+      return [t,{account:account.account,account_id:account.account_id}];
+    }));
+  }
+  function accountIds(reviewed){
+    return Object.fromEntries(Object.entries(reviewed).map(([t,b])=>[t,b.account_id]));
+  }
+  async function createReviewed(body,prepareOnly){
+    const bytes=new TextEncoder().encode(JSON.stringify(body));
+    const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),n=>n.toString(16).padStart(2,'0')).join('');
+    const key='distribution-confirmation:'+hash;
+    const id=sessionStorage.getItem(key)||crypto.randomUUID();
+    sessionStorage.setItem(key,id);
+    const response=await fetch('/api/distribution/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,prepare_only:prepareOnly,request_id:id})});
+    const result=await response.json();
+    if(!response.ok||result.error)throw Error(result.error||'分发任务创建失败');
+    if(result.batches[0].state==='cancelled')sessionStorage.removeItem(key);
+    return result;
+  }
   const declarationsFromXhs = {
     '笔记含AI合成内容': ['内容由AI生成','含AI生成内容'],
     '虚构演绎，仅供娱乐': ['虚构演绎，仅供娱乐','内容为虚构剧情，仅供娱乐'],
@@ -122,7 +145,8 @@
       const visibility={'公开可见':'public','仅自己可见':'private','仅互关好友可见':'friends'}[x.visibility];
       if(!visibility)throw Error('请重新选择小红书可见范围');
       const {bindings}=await call('tabs');
-      const summary=['小红书 · '+(state.accountIdentity?.nickname||x.profile_dir)+' · '+x.visibility];
+      const reviewed=reviewAccounts(['xhs',...targetNames],bindings,x.profile_dir);
+      const summary=[['小红书',reviewed.xhs.account,reviewed.xhs.account_id,x.visibility].join(' · ')];
       for(const platform of targetNames){
         const binding=bindings[platform];
         if(!binding?.account_id)throw Error('请在'+names[platform]+'工作台连接已登录的官方页面');
@@ -146,25 +170,20 @@
         }
         if(x.declaration&&!declarationsFromXhs[x.declaration]?.[dy?0:1])warnings.push(names[platform]+'没有对应的“'+x.declaration+'”选项。');
         targets[platform]=d;
-        summary.push([names[platform],binding.account,dy?{'public':'公开','private':'仅自己可见','friends':'好友可见'}[visibility]:'公开',
+        summary.push([names[platform],binding.account,binding.account_id,dy?{'public':'公开','private':'仅自己可见','friends':'好友可见'}[visibility]:'公开',
           d.collection,d.location,d.declaration,dy&&d.declaration==='内容为转载信息'?'取材站外':'',d.activity,d.music,d.hotspot,dy?(d.allow_download?'允许下载':'禁止下载'):'',video&&!dy?'短标题：'+(d.short_title||'留空'):''].filter(Boolean).join(' · '));
       }
       if(targetNames.length&&(x.mentions.length||x.activities.length||x.original||!x.allow_copy))warnings.push('小红书的 @、关联活动、原创和正文复制设置仅用于小红书。');
       const caption=[(prepareOnly?'填写并停在提交前':'确认发布')+'《'+x.title+'》',x.schedule_time||'立即发布',...summary,...warnings].join('\n');
       if(!window.confirm(caption))return;
       const body={profile_dir:x.profile_dir,sync_from:'xhs',targets,
-        expected_accounts:Object.fromEntries(targetNames.map(t=>[t,bindings[t].account_id]))};
-      const signature=JSON.stringify(body);
-      if(pendingRequest?.signature!==signature)pendingRequest={signature,id:crypto.randomUUID()};
-      const response=await fetch('/api/distribution/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,prepare_only:prepareOnly,request_id:pendingRequest.id})});
-      const result=await response.json();
-      if(!response.ok||result.error)throw Error(result.error||'分发任务创建失败');
+        expected_accounts:accountIds(reviewed)};
+      const result=await createReviewed(body,prepareOnly);
       const batch=result.batches[0];
       if(!prepareOnly&&batch.prepare_only&&batch.state==='paused'){
         const resume=await fetch('/api/distribution/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:batch.id,remaining_only:true})});
         if(!resume.ok)throw Error((await resume.json()).error||'恢复分发失败');
       }
-      if(batch.state==='cancelled')pendingRequest=null;
       await window.distributionUI.showRecords();
     } finally{s.busy=false;}
   }

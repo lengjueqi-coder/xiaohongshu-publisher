@@ -20,7 +20,8 @@ def prepare(app,payload):
         if payload.get('schedule_time'):args+=['--schedule-at',payload['schedule_time']]
         result=app.run_xhs_cli(args,timeout=720,extra_env=app.pace_environment())
     if not result.get('ok'):raise ValueError('小红书视频填写失败：'+str(result.get('stderr') or result.get('stdout') or '')[-1000:])
-    page=page_for(app.XHS_SKILL_DIR)
+    payload = {**payload, 'work_tab_id': (result.get('json') or {}).get('work_tab_id')}
+    page=page_for(app.XHS_SKILL_DIR, expected_tab=payload['work_tab_id'])
     from xhs.publish import _set_original,_set_album_best_effort,_set_location_best_effort
     _set_original(page,bool(payload.get('original',True)))
     if payload.get('album'):_set_album_best_effort(page,payload['album'])

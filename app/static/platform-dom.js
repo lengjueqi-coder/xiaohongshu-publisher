@@ -221,7 +221,7 @@ async function officialPage(p) {
         if(p.platform==='douyin'&&post.share_url){
           try{const share=new URL(post.share_url);if(share.protocol==='https:'&&/\/(?:video|share\/(?:video|note))\/\d+\/?$/.test(share.pathname))url=share.origin+share.pathname;}catch{}
         }
-        return {title,text:text(e),id:String(post.objectId||post.aweme_id||e.getAttribute('data-id')||''),created_at:Number(post.createTime||post.create_time||0),native_status:p.platform==='channels'?post.status:undefined,status_text:p.platform==='douyin'?text(e.querySelector('[class^=info-status-]')):text(e).replace(title,''),url};
+        return {title,description:clean(post.desc),text:text(e),id:String(post.objectId||post.aweme_id||e.getAttribute('data-id')||''),created_at:Number(post.createTime||post.create_time||0),native_status:p.platform==='channels'?post.status:undefined,status_text:p.platform==='douyin'?text(e.querySelector('[class^=info-status-]')):text(e).replace(title,''),url};
       });
     }
     case 'select_editor': {

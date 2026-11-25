@@ -1,9 +1,10 @@
 """Explicitly bound Chrome tabs for the multi-platform publisher (no cookie export)."""
 from __future__ import annotations
 import json
-import subprocess
-import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 import time
+import uuid
 from pathlib import Path
 from websockets.sync.client import connect
 import browser_profiles
@@ -14,12 +15,37 @@ URLS = {
     'channels': {'image': 'https://channels.weixin.qq.com/platform/post/finderNewLifeCreate', 'video': 'https://channels.weixin.qq.com/platform/post/create'},
 }
 
+_sessions = ContextVar('platform_background_sessions', default=None)
+
+
+@contextmanager
+def background_session():
+    if _sessions.get() is not None:
+        yield
+        return
+    sessions = {}
+    context = _sessions.set(sessions)
+    try:
+        yield
+    finally:
+        _sessions.reset(context)
+        for (client, platform, tab_id), token in sessions.items():
+            try:
+                rpc(client, platform, 'background_end', tab_id=tab_id, session=token)
+            except Exception:
+                # The extension also releases idle sessions after a lost connection.
+                pass
+
 
 def rpc(client, platform, action, **params):
     if platform not in URLS:
         raise ValueError('不支持的平台')
     if not client:
         raise ValueError('请先连接官方页面')
+    if action in ('open_background','background_begin'):
+        capabilities = browser_profiles.control('ping_server').get('capabilities', {})
+        if 'platforms_background_v1' not in capabilities.get(client, []):
+            raise ValueError('请在对应 Chrome 用户资料的扩展管理页重新加载新版 XHS Bridge，再继续后台发布')
     with connect(browser_profiles.BRIDGE_URL, open_timeout=3, close_timeout=1, proxy=None, max_size=32*1024*1024) as ws:
         ws.send(json.dumps({'role':'cli', 'client_id':client, 'method':'platform', 'params':dict(platform=platform, action=action, **params)}))
         response = json.loads(ws.recv(timeout=90))
@@ -47,23 +73,21 @@ class Page:
         self.tab_id = int(binding['tab_id'])
 
     def call(self, action, **params):
-        result=rpc(self.client, self.platform, action, tab_id=self.tab_id, **params)
-        if action=='focus':self.ensure_viewport()
-        return result
+        sessions = _sessions.get()
+        key = (self.client, self.platform, self.tab_id)
+        if sessions and key in sessions:
+            params['session'] = sessions[key]
+        return rpc(self.client, self.platform, action, tab_id=self.tab_id, **params)
 
-    def ensure_viewport(self):
-        expression='({width:innerWidth,height:innerHeight})'
-        size=rpc(self.client,self.platform,'evaluate',tab_id=self.tab_id,expression=expression)
-        if size['width']>=1100 and size['height']>=650:return
-        if sys.platform=='darwin':
-            # Focus has selected this exact Chrome tab/window. Official desktop
-            # forms can place their fixed publish button outside narrow windows.
-            try:
-                subprocess.run(['osascript','-e','tell application "Google Chrome" to set bounds of front window to {20, 50, 1460, 1000}'],capture_output=True,timeout=5,check=True)
-            except (OSError,subprocess.SubprocessError):pass
-            size=rpc(self.client,self.platform,'evaluate',tab_id=self.tab_id,expression=expression)
-        if size['width']<1100 or size['height']<650:
-            raise ValueError('官方发布页窗口过窄，请加宽 Chrome 窗口并收起侧边栏后重新核对；尚未点击发布')
+    def background_input(self):
+        sessions = _sessions.get()
+        if sessions is None:
+            raise RuntimeError('后台页面操作缺少会话')
+        key = (self.client, self.platform, self.tab_id)
+        if key not in sessions:
+            token = uuid.uuid4().hex
+            rpc(self.client, self.platform, 'background_begin', tab_id=self.tab_id, session=token)
+            sessions[key] = token
 
     def dom(self, action, **params):
         source = DOM_PATH.read_text('utf-8')
@@ -97,7 +121,7 @@ class Page:
                 if str(exc)!='官方话题尚未成为有效节点' or attempt:raise
 
     def _editor_once(self, content, tags):
-        self.call('focus')
+        self.background_input()
         self.dom('dismiss_guidance')
         self.click(field='content')
         self.call('key', key='SelectAll')
@@ -154,7 +178,7 @@ class Page:
             return
         if self.dom('read_field', field=field) == value and value not in ('内容为自行拍摄','内容为转载'):
             return
-        self.call('focus')
+        self.background_input()
         if (self.platform == 'douyin' and (field,value) in [('music','不添加音乐'),('location','不显示位置'),('hotspot','不关联热点')]) or (self.platform=='channels' and field=='collection' and value=='不选择合集'):
             if field in ('location','hotspot'):self.click(field=field)
             self.dom('clear_field',field=field)
@@ -193,11 +217,11 @@ class Page:
         if not self.dom('radio_checked', value=value):
             raise ValueError('官方页面未选中：' + value)
 
-    def snapshot(self):
+    def snapshot(self, fresh_identity=False):
         snapshot = self.dom('snapshot')
         # Read the authenticated account, never infer identity from old draft keys.
         cached = getattr(self, '_identity_cache', None)
-        if not cached or time.monotonic() - cached[0] > 15:
+        if fresh_identity or not cached or time.monotonic() - cached[0] > 15:
             identity = self.dom('identity')
             self._identity_cache = (time.monotonic(), identity)
         else:
@@ -213,7 +237,7 @@ class Page:
         """
         from datetime import datetime
         when = datetime.strptime(value, '%Y-%m-%d %H:%M')
-        self.call('focus')
+        self.background_input()
         self.radio('定时发布' if self.platform == 'douyin' else '定时')
         self.click(field='schedule_time')
         time.sleep(.6)
@@ -252,7 +276,7 @@ class Page:
             raise ValueError(f'定时读回不一致：期望 {value}，官方页面为 {actual}')
 
     def verify_repost_origin(self):
-        self.call('focus')
+        self.background_input()
         self.click(field='declaration')
         try:
             self.wait_repost_origin()
@@ -268,7 +292,7 @@ class Page:
 
     def declaration(self, payload):
         if self.platform=='douyin' and payload['declaration']=='内容为转载信息':
-            self.call('focus')
+            self.background_input()
             self.click(field='declaration')
             self.dom('activate', option='内容为转载信息', field='declaration')
             self.click(radio='取材站外')

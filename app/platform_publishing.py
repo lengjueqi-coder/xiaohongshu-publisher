@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from platform_bridge import Page, URLS, rpc, tabs
+from platform_bridge import Page, URLS, background_session, rpc, tabs
 
 NAMES={'douyin':'抖音','channels':'视频号'}
 TZ=ZoneInfo('Asia/Shanghai')
@@ -191,6 +191,8 @@ class Publisher:
         binding['account_id']=snapshot.get('account_id','')
         if not binding['account_id'] or not binding['account']:
             raise ValueError('无法识别官方账号，请等待登录完成后重新连接')
+        if request.get('expected_account_id') and binding['account_id']!=request['expected_account_id']:
+            raise ValueError('新发布页的账号与已绑定账号不同，请检查 Chrome 登录账号')
         self.init()
         with self.app.db_connection() as db:
             db.execute('INSERT OR REPLACE INTO platform_bindings VALUES (?,?)',(platform,json.dumps(binding)))
@@ -230,10 +232,12 @@ class Publisher:
                     # empty form or manager. A fresh tab may require a QR login.
                     from urllib.parse import urlsplit
                     page.dom('navigate_empty_channels',path=urlsplit(URLS[platform][kind]).path)
-                    return self.bind(binding)
-        new=rpc(client,platform,'open',url=URLS[platform][kind]);time.sleep(.5)
-        return self.bind({'platform':platform,'client_id':client,'tab_id':new['id']})
+                    return self.bind({**binding,'expected_account_id':binding['account_id']})
+        new=rpc(client,platform,'open_background',url=URLS[platform][kind]);time.sleep(.5)
+        return self.bind({'platform':platform,'client_id':client,'tab_id':new['id'],
+                          'expected_account_id':request.get('expected_account_id')})
 
+    @background_session()
     def upload(self, request):
         platform=request['platform'];kind=request['media_type'];files=request['files']
         # Reuse strict media validation without requiring a finished caption.
@@ -242,7 +246,7 @@ class Publisher:
         old=self.uploads.get((platform,page.tab_id))
         resume=bool(old and old['files']==checked['files'] and old['stats']==file_stats(checked['files']) and pending_upload(old))
         if not resume and snapshot['ready'] and (snapshot['image_count'] or snapshot.get('video')):raise ValueError('当前官方页面已有素材。请点击“新建发布页”后再上传，避免覆盖现有草稿')
-        page.call('focus')
+        page.background_input()
         prefix="document.querySelector('wujie-app').shadowRoot" if platform=='channels' else 'document'
         expr=prefix+f'.querySelector(\'input[type="file"][accept*="{kind}"]\')'
         if not resume:
@@ -276,8 +280,9 @@ class Publisher:
                 return {'snapshot':public_snapshot(s),'files':checked['files'],'binding':self.binding(platform)}
         raise ValueError('素材上传尚未完成，请查看官方页面；软件不会继续点击发布')
 
+    @background_session()
     def fill(self, request):
-        d=validate(request);platform=d['platform'];page=self.page(platform);page.call('focus')
+        d=validate(request);platform=d['platform'];page=self.page(platform);page.background_input()
         before=page.snapshot()
         if not before['ready']:raise ValueError('请先上传素材，等待官方发布表单加载')
         if before['media_type']!=d['media_type']:raise ValueError('官方页面的图文/视频类型与工作台不一致，请新建对应发布页')
@@ -315,7 +320,7 @@ class Publisher:
                 if not any(x in str(exc).lower() for x in ('no tab','tab not found','标签页已','invalid tab')):raise
                 page=None
             if page is None:
-                self.open(dict(platform=platform,media_type=d['media_type'],client_id=binding['client_id']))
+                self.open(dict(platform=platform,media_type=d['media_type'],client_id=binding['client_id'],expected_account_id=binding['account_id']))
                 page=self.page(platform)
             manifest=self.uploads.get((platform,page.tab_id))
             if manifest and manifest['files']==d['files'] and manifest['stats']==file_stats(d['files']) and pending_upload(manifest):
@@ -329,7 +334,7 @@ class Publisher:
             # native editor versions handle select-all differently; never append.
             if ready and snapshot.get('fields',{}).get('content'):ready=False
         if not ready:
-            self.open(dict(platform=platform,media_type=d['media_type'],client_id=(binding or {}).get('client_id')))
+            self.open(dict(platform=platform,media_type=d['media_type'],client_id=(binding or {}).get('client_id'),expected_account_id=(binding or {}).get('account_id')))
             self.upload(dict(platform=platform,media_type=d['media_type'],files=d['files']))
         result=self.fill(d)
         result['binding']=self.binding(platform)
@@ -349,6 +354,7 @@ class Publisher:
             row=db.execute('SELECT receipt FROM platform_attempts WHERE fingerprint=?',(self.submission_key(payload,binding),)).fetchone()
         if row:raise ValueError('这份内容已经尝试提交过，请到官方作品管理核对；不会整批重发')
 
+    @background_session()
     def verify(self, request):
         d=validate(request);page=self.page(d['platform']);snapshot=page.snapshot()
         uploaded=self.uploads.get((d['platform'],page.tab_id))
@@ -364,6 +370,7 @@ class Publisher:
                 db.execute('INSERT INTO platform_receipts (id,platform,payload,binding,checks,media,status,created_at) VALUES (?,?,?,?,?,?,?,?)',(token,d['platform'],json.dumps(d,ensure_ascii=False),json.dumps(self.binding(d['platform'])),json.dumps(checks,ensure_ascii=False),json.dumps(uploaded['media']),'verified',time.time()))
         return {'verified':ok,'receipt':token,'checks':checks,'snapshot':public_snapshot(snapshot)}
 
+    @background_session()
     def submit(self, request):
         token=request.get('receipt','')
         self.init()
@@ -377,9 +384,12 @@ class Publisher:
             raise ValueError('素材在核对后发生变化，请重新上传核对')
         if self.binding(row[0])!=binding:raise ValueError('连接已变化，请重新核对')
         if request.get('payload_digest') and request['payload_digest']!=digest(d):raise ValueError('文案或设置已修改，请重新填写核验')
-        page.call('focus')
+        page.background_input()
         if d.get('repost_origin')=='external':page.verify_repost_origin()
-        s=page.snapshot();checks=compare(d,s,json.loads(row[3]))
+        s=page.snapshot(fresh_identity=True)
+        if s.get('account_id')!=binding.get('account_id'):
+            raise ValueError('点击前核对发现官方页面账号已经变化，请重新连接确认')
+        checks=compare(d,s,json.loads(row[3]))
         if not all(c['ok'] for c in checks):raise ValueError('官方页面在校验后发生变化，已阻止提交：'+','.join(c['field'] for c in checks if not c['ok']))
         # Claim BEFORE the click. If the process dies after clicking, never submit again.
         with self.app.db_connection() as db:
@@ -406,10 +416,11 @@ class Publisher:
         with self.app.db_connection() as db:db.execute('UPDATE platform_receipts SET status=?,message=? WHERE id=?',(status,message,token))
         return {'status':status,'message':message,'receipt':token}
 
+    @background_session()
     def options(self, request):
         field=request.get('field');platform=request['platform']
         if field not in ('location','collection','activity','music','hotspot'):raise ValueError('不支持的选项')
-        page=self.page(platform);page.call('focus')
+        page=self.page(platform);page.background_input()
         if platform=='douyin' and page.dom('close_music_picker'):
             time.sleep(.4)
         if not (platform=='douyin' and field=='activity'):
@@ -449,15 +460,33 @@ class Publisher:
         rows=page.dom('management')
         compact=lambda value:re.sub(r'\s+','',str(value or ''))
         title=compact(payload.get('title'))
-        content=compact(payload.get('content'))
+        raw_content=payload.get('content') or ''
+        tags=''.join('#'+tag for tag in payload.get('tags',[]))
+        captions=set()
+        # The Douyin manager can render a caption line break as " *".
+        for content in (compact(raw_content),compact(raw_content.replace('\n',' *'))):
+            if not content:continue
+            for suffix in ('',tags):
+                captions.update((content+suffix,title+content+suffix,title+'。'+content+suffix))
+        references=[created_at] if created_at else []
+        if references and payload.get('publish_mode')=='scheduled' and payload.get('schedule_time'):
+            scheduled=datetime.fromisoformat(payload['schedule_time']).replace(tzinfo=TZ)
+            references.append(scheduled.timestamp())
         def matches_work(row):
+            timestamp=row.get('created_at')
+            if not row.get('id') or not timestamp or not any(abs(timestamp-t)<=300 for t in references):
+                return False
             actual=compact(row.get('title'))
-            # Douyin image titles are displayed as the prefix of its combined
-            # description. Require the native work ID and a title delimiter.
-            combined=bool(row.get('id') and title and actual.startswith(title+'。'))
-            return ((title and title==actual) or combined or (content and content in compact(row['text']))) and (not row.get('created_at') or row['created_at']>=created_at-120)
+            if platform=='channels' and payload['media_type']=='image':
+                return bool(title and actual==title)
+            if platform=='douyin' and title and actual!=title and actual not in captions:
+                return False
+            if not raw_content:return bool(title and actual==title)
+            visible=[actual,compact(row.get('description'))]
+            visible.extend(compact(line) for line in row['text'].splitlines())
+            return any(value in captions for value in visible)
         if path!=manager and not any(matches_work(row) for row in rows):
-            opened=rpc(binding['client_id'],platform,'open',url=manager)
+            opened=rpc(binding['client_id'],platform,'open_background',url=manager)
             page=Page({**binding,'tab_id':opened['id']})
             rows=[]
         elif platform=='douyin' and path==manager and not any(matches_work(row) for row in rows):

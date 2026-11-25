@@ -61,6 +61,27 @@ class StabilityTests(unittest.TestCase):
         with patch.object(publish_checks, "verify"), self.assertRaisesRegex(ValueError, "1 小时"):
             server.verify_prepared_publish({"payload": payload}, payload)
 
+    def test_legacy_click_requires_reviewed_manual_draft_and_single_use(self):
+        draft = {"profile_dir": "Default", "title": "标题", "content": "正文", "expected_user_id": "owner"}
+        history_id = server.record_history(draft, "prefilled")
+        with patch.object(server, "select_profile_connection"), patch.object(server, "check_task_identity") as identity, \
+                patch.object(server, "verify_prepared_publish") as verify, patch.object(server, "click_publish", return_value={"ok":True}) as click:
+            with self.assertRaisesRegex(server.PublishError, "核对凭证"):
+                server.submit_manual_pending(history_id, {})
+            server.db_set_setting("manual_pending:Default", {"history_id":history_id, "verification_payload":draft})
+            with self.assertRaisesRegex(server.PublishError, "核对凭证"):
+                server.submit_manual_pending(history_id + 1, {})
+            verify.side_effect = ValueError("官方表单发生变化")
+            with self.assertRaisesRegex(ValueError, "发生变化"):
+                server.submit_manual_pending(history_id, {})
+            click.assert_not_called()
+            verify.side_effect = None
+            self.assertTrue(server.submit_manual_pending(history_id, {})["ok"])
+            with self.assertRaises(server.PublishError):
+                server.submit_manual_pending(history_id, {})
+            click.assert_called_once_with(history_id)
+            identity.assert_called_with(draft)
+
     def test_queue_rejects_short_lead_before_touching_browser(self):
         scheduled = (datetime.now() + timedelta(minutes=40)).isoformat(timespec="minutes")
         job = server.enqueue_job({"title": "测试", "publish_mode": "scheduled"}, scheduled)

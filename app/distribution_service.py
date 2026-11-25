@@ -68,6 +68,9 @@ class DistributionService:
                 self.app.require_active_profile(d)
                 identity=self.app.account_identity(profile)
                 if not identity.get('user_id'):raise ValueError('请在小红书模块先识别当前账号')
+                expected=(request.get('expected_accounts') or {}).get('xhs')
+                if expected and expected!=identity['user_id']:
+                    raise ValueError('小红书账号已切换，请重新确认')
                 if raw['media_type']=='image':self.app.validate_note_image_count(d.get('images',[]),require_one=True)
                 else:
                     video=Path(d.get('video_path',''))
@@ -105,7 +108,7 @@ class DistributionService:
                     targets['xhs']['payload'] = source
                     for platform in targets.keys() - {'xhs'}:
                         targets[platform] = validate({**targets[platform], 'files':source['images'], 'tags':source['tags']})
-                    frozen.update((path,path) for path in source['images'])
+                    frozen.update((str(Path(path).resolve()),path) for path in source['images'])
                 for platform,raw in targets.items():
                     d=raw['payload'] if platform=='xhs' else raw
                     if platform=='xhs':
@@ -308,15 +311,20 @@ class DistributionService:
             self.check_binding(platform,step['binding'])
             if platform=='xhs':
                 from datetime import datetime
-                with self.app.db_connection() as db:row=db.execute('SELECT prepared,created_at FROM platform_xhs_receipts WHERE id=?',(step['receipt'],)).fetchone()
-                if not row:raise ValueError('找不到小红书核验凭证，请人工到笔记管理核对')
+                platform_xhs.init(self.app)
+                with self.app.db_connection() as db:row=db.execute('SELECT prepared,attempted_at FROM platform_xhs_receipts WHERE id=?',(step['receipt'],)).fetchone()
+                if not row or not row[1]:raise ValueError('缺少小红书实际提交时间，请人工到笔记管理核对')
                 native=self.app.verify_history_published(json.loads(row[0])['history_id'],datetime.fromtimestamp(row[1]).isoformat())
                 if native['status']=='unconfirmed':
                     from publish_checks import read_management,match_receipt
                     d=step['payload']['payload']
                     native=match_receipt(read_management(self.app.XHS_SKILL_DIR,published_only=True),{**d,'receipt_reference_time':datetime.fromtimestamp(row[1]).isoformat()})
                 result={'status':{'published':'published','scheduled':'scheduled','reviewing':'submitted'}.get(native['status'],'unknown'),'message':native.get('reason','请到笔记管理确认最终状态'),'work_id':native.get('note_id',''),'url':native.get('url',''),'checked_at':time.time()}
-            else:result=self.publisher.read_result(platform,step['payload'],item[0]['created_at'])
+            else:
+                with self.app.db_connection() as db:
+                    attempt=db.execute('SELECT created_at FROM platform_attempts WHERE receipt=?',(step['receipt'],)).fetchone()
+                if not attempt:raise ValueError('缺少实际提交时间，请人工到官方作品管理核对')
+                result=self.publisher.read_result(platform,step['payload'],attempt[0])
         with self.app.db_connection() as db:db.execute('INSERT OR REPLACE INTO distribution_results VALUES (?,?,?)',(batch,platform,json.dumps(result,ensure_ascii=False)))
         if result['status']!='unknown':self.set_step(batch,platform,result['status'],result['message'])
         self.aggregate(batch)

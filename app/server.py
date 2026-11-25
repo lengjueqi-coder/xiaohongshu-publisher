@@ -56,7 +56,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_IMPORT_IMAGE_BYTES = 100 * 1024 * 1024
 MAX_NOTE_IMAGES = 18
-APP_VERSION = "2026.11.19"
+APP_VERSION = "2026.11.25"
 
 
 COPY_STYLES = {
@@ -212,6 +212,7 @@ def init_db() -> None:
             "profile_dir": "ALTER TABLE publish_history ADD COLUMN profile_dir TEXT NOT NULL DEFAULT 'Default'",
             "archive_info": "ALTER TABLE publish_history ADD COLUMN archive_info TEXT",
             "archive_result": "ALTER TABLE publish_history ADD COLUMN archive_result TEXT",
+            "work_tab_id": "ALTER TABLE publish_history ADD COLUMN work_tab_id INTEGER",
         }.items():
             if col not in existing_cols:
                 db.execute(ddl)
@@ -2121,10 +2122,10 @@ def record_history(payload: dict[str, Any], status: str, warnings: list[str] | N
                 platform, folder_path, folder_name, image_paths, title, content, tags,
                 copy_style, model_name, album, location, original, visibility, status, created_at,
                 image_manifest, material_signature, schedule_time, schedule_window,
-                topic_template, shooting_date, shooting_location, warnings, profile_dir, archive_info
+                topic_template, shooting_date, shooting_location, warnings, profile_dir, archive_info, work_tab_id
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -2153,6 +2154,7 @@ def record_history(payload: dict[str, Any], status: str, warnings: list[str] | N
                 json.dumps(warnings or [], ensure_ascii=False),
                 payload.get("profile_dir") or active_profile_dir(),
                 json.dumps(payload.get("archive_info") or {}, ensure_ascii=False),
+                payload.get("work_tab_id"),
             ),
         )
         db.commit()
@@ -2416,7 +2418,7 @@ def select_profile_connection(profile_dir: str | None = None) -> str:
     return _select_profile_connection(profile_dir)[0]
 
 
-def switch_chrome_profile(profile_dir: str) -> dict[str, Any]:
+def switch_chrome_profile(profile_dir: str, *, allow_pair: bool = True) -> dict[str, Any]:
     """Pair/select exactly one extension, retaining other Chrome windows."""
     profile_dir = str(profile_dir or "Default").strip()
     if profile_dir not in {p["dir"] for p in chrome_profiles()}:
@@ -2427,6 +2429,8 @@ def switch_chrome_profile(profile_dir: str) -> dict[str, Any]:
             try:
                 client, bound = _select_profile_connection(profile_dir)
             except Exception:
+                if not allow_pair:
+                    raise PublishError(f"Chrome「{profile_dir}」未连接，请在工作台连接该账号后继续")
                 client = browser_profiles.pair(profile_dir, XHS_SKILL_DIR)
                 db_set_setting(f"profile_bridge_client:{profile_dir}", client)
                 bound = True
@@ -2627,6 +2631,7 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
         if "WARNING" in line or "警告" in line:
             warnings.append(line[-300:])
     from publish_checks import apply_extra_settings
+    payload = {**payload, "work_tab_id": (result.get("json") or {}).get("work_tab_id")}
     apply_extra_settings(XHS_SKILL_DIR,payload)
     history_id = record_history({**payload, "tags": tags[:10], "profile_dir": profile_dir}, "prefilled", warnings)
     return {
@@ -2635,7 +2640,8 @@ def prepare_publish(payload: dict[str, Any], reservation_job_id: int | None = No
         "result": result,
         "warnings": warnings,
         "payload": payload,
-        "verification_payload": {**payload, "images": upload_images, "tags": tags[:10]},
+        "verification_payload": {**payload, "images": upload_images, "tags": tags[:10],
+                                 "native_image_refs": (result.get("json") or {}).get("native_image_refs")},
         "manual_fields": {
             "album": payload.get("album") or "",
             "location": payload.get("location") or "",
@@ -2653,7 +2659,11 @@ def click_publish(history_id: int | None = None) -> dict[str, Any]:
     with BROWSER_LOCK:
         try:
             time.sleep(random.uniform(2.2, 5.5))
-            result = run_xhs_cli(["click-publish"], timeout=90)
+            with db_connection() as db:
+                binding = db.execute("SELECT work_tab_id FROM publish_history WHERE id=?", (history_id,)).fetchone()
+            # A legacy history entry has no reviewed background tab to submit.
+            expected_tab = str(binding[0] if binding and binding[0] else -1)
+            result = run_xhs_cli(["click-publish"], timeout=90, extra_env={"XHS_EXPECTED_PUBLISH_TAB": expected_tab})
         except subprocess.TimeoutExpired as exc:
             if history_id:
                 update_history_status(history_id, "unknown")
@@ -2673,6 +2683,35 @@ def click_publish(history_id: int | None = None) -> dict[str, Any]:
     if history_id:
         update_history_status(history_id, "unknown")
     return {"ok": False, "result": result}
+
+
+def submit_manual_pending(history_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    with BROWSER_LOCK:
+        profile = require_active_profile(payload)
+        pending = manual_pending(profile) or {}
+        reviewed = pending.get("verification_payload")
+        if pending.get("history_id") != history_id or not reviewed or not reviewed.get("expected_user_id"):
+            raise PublishError("当前账号没有对应的手动核对凭证，请从工作台重新填写")
+        with db_connection() as db:
+            row = db.execute("SELECT status FROM publish_history WHERE id=? AND profile_dir=?", (history_id, profile)).fetchone()
+        if not row or row[0] != "prefilled":
+            raise PublishError("这条记录已尝试提交或状态发生变化，请到官方作品管理核对")
+        select_profile_connection(profile)
+        check_task_identity(reviewed)
+        verify_prepared_publish({"verification_payload": reviewed}, reviewed)
+        with db_connection() as db:
+            claimed = db.execute("UPDATE publish_history SET status='submitting' WHERE id=? AND profile_dir=? AND status='prefilled'",
+                                 (history_id, profile)).rowcount
+        if not claimed:
+            raise PublishError("这条记录已有提交尝试，请核对官方结果")
+        try:
+            result = click_publish(history_id)
+        except Exception:
+            update_history_status(history_id, "unknown")
+            raise
+        if result["ok"]:
+            clear_manual_pending(history_id, profile)
+        return result
 
 
 def submit_publish(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2861,7 +2900,7 @@ def _process_queue_job(job: dict[str, Any]) -> bool:
                 raise PublishError("任务发布时间已过或不足 1 小时，已停止补发，请重新排期")
             if defer_for_rate_limit(job):
                 return True
-        switch_chrome_profile(str(job.get("profile_dir") or active_profile_dir()))
+        switch_chrome_profile(str(job.get("profile_dir") or active_profile_dir()), allow_pair=False)
         if payload.get("strict_fields"):
             check_task_identity(payload)
         for attempt in range(2):
@@ -4017,7 +4056,7 @@ class Handler(BaseHTTPRequestHandler):
             if history_id <= 0:
                 error_response(self, "缺少有效的历史记录 ID", 400)
                 return
-            result = click_publish(history_id)
+            result = submit_manual_pending(history_id, payload)
             if result["ok"]:
                 json_response(self, result)
             else:
@@ -4064,9 +4103,11 @@ class Handler(BaseHTTPRequestHandler):
                 profile = str(payload.get("profile_dir") or active_profile_dir())
                 if profile != active_profile_dir():
                     raise PublishError("账号已切换，请重新填入")
+                identity = account_identity(profile)
                 result = prepare_publish(payload)
                 db_set_setting(f"manual_pending:{profile}", {"history_id": result["history_id"],
-                    "title": payload.get("title"), "created_at": now_iso()})
+                    "title": payload.get("title"), "created_at": now_iso(),
+                    "verification_payload": {**result["verification_payload"], "expected_user_id":identity.get("user_id")}})
             json_response(self, result)
         except PublishError as exc:
             error_response(self, str(exc), 400)
